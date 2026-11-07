@@ -5,7 +5,7 @@ import CryptoKit
 /// Exact journal provenance, never a directory-name scan. Optional identities
 /// preserve incomplete legacy records without granting permission to delete.
 public struct SiblingCleanupCandidate: Codable, Equatable, Sendable {
-    enum Kind: String, Codable, Sendable { case original, restoreStage }
+    enum Kind: String, Codable, Sendable { case original, fsKitOriginal, restoreStage }
     var kind: Kind
     var path: String
     var device: UInt64?
@@ -48,17 +48,17 @@ enum SiblingCleanup {
         func append(_ kind: SiblingCleanupCandidate.Kind, _ path: String, _ device: UInt64?, _ inode: UInt64?) {
             let candidate = SiblingCleanupCandidate(kind: kind, path: path, device: device, inode: inode,
                 parentDevice: identity?.device, parentInode: identity?.inode, fsid: fsid,
-                initialRevision: kind == .original ? journal.initialRevision : nil,
+                initialRevision: kind == .original || kind == .fsKitOriginal ? journal.initialRevision : nil,
                 completedRevision: journal.restoreRevision ?? (folder.options.sync ? journal.revision : journal.initialRevision),
-                emptyOnly: kind == .restoreStage || !folder.options.sync || !journal.populationVerified,
-                dataDevice: kind == .restoreStage ? journal.restoreDataDevice : nil,
-                dataInode: kind == .restoreStage ? journal.restoreDataInode : nil)
+                emptyOnly: kind == .restoreStage || (kind == .fsKitOriginal ? journal.fsKitLink?.restoration == .original : !folder.options.sync || !journal.populationVerified),
+                dataDevice: kind == .fsKitOriginal ? journal.fsKitLink?.source.device : kind == .restoreStage ? journal.restoreDataDevice : nil,
+                dataInode: kind == .fsKitOriginal ? journal.fsKitLink?.source.inode : kind == .restoreStage ? journal.restoreDataInode : nil)
             var queue = journal.siblingCleanup ?? []
             if !queue.contains(where: { $0.path == path && $0.device == device && $0.inode == inode }) { queue.append(candidate) }
             journal.siblingCleanup = queue
         }
         if let path = journal.evacuation {
-            append(.original, path, journal.evacuationDevice, journal.evacuationInode)
+            append(journal.fsKitLink?.holding != nil ? .fsKitOriginal : .original, path, journal.evacuationDevice, journal.evacuationInode)
             journal.evacuation = nil; journal.evacuationDevice = nil; journal.evacuationInode = nil
         }
         if let path = journal.restoreStage {
@@ -71,7 +71,7 @@ enum SiblingCleanup {
     // Writes are checked against the same durable journal and owned repository.
     // Publish the deletion plan before unlinking; retain it across partial errors.
     private static func checkpoint(_ next: Journal, previous: Journal, store: Store, folder: Folder) throws {
-        let current = try store.managedVolume(folder.id).readJSON(Journal.self, "journal.json")
+        let current = try store.managedVolume(folder.id).readJSON(Journal.self, "journal.json", decoder: store.journalDecoder)
         var expected = previous; expected.updated = current.updated
         guard current == expected else { throw NestError("Cleanup journal changed; siblings retained.", code: 6) }
         try store.write(next, for: folder.id)
@@ -110,14 +110,27 @@ enum SiblingCleanup {
                 if try parent.exists(path.lastPathComponent) {
                     let root = try parent.child(path.lastPathComponent)
                     try root.requireCleanupRoot(device: device, inode: inode, fsid: fsid)
+                    if candidate.kind == .fsKitOriginal { try FSKitLinks.requirePrivateDirectory(root, device: device, checkACL: false) }
                     let inventory = try root.cleanupInventory(matching: candidate.plan?.manifest)
                     if let plan = candidate.plan {
                         try root.validateCleanupRemainder(inventory, plan: plan)
                     } else {
-                        if candidate.kind == .original {
+                        if candidate.kind == .original || candidate.kind == .fsKitOriginal {
                             guard let initial = candidate.initialRevision else { throw NestError("Missing initial snapshot; original holding retained.", code: 6) }
                             let (_, original) = try Snapshot.verified(store: store, id: folder.id, revision: initial)
-                            guard inventory.manifest.contentsMatchExpected(candidate.emptyOnly ? Manifest(entries: []) : original) else {
+                            var expected = original
+                            if candidate.kind == .fsKitOriginal, !candidate.emptyOnly {
+                                guard let dataDevice = candidate.dataDevice, let dataInode = candidate.dataInode,
+                                      var dataRoot = original.publicRoot,
+                                      try root.child("data").identity() == (dataDevice, dataInode) else { throw NestError("Missing FSKit original data authority; retained.", code: 6) }
+                                dataRoot.path = "data"
+                                expected = Manifest(entries: [dataRoot] + original.entries.map { entry in
+                                    var projected = entry; projected.path = "data/" + entry.path
+                                    projected.hardlink = entry.hardlink.map { "data/" + $0 }; return projected
+                                })
+                                expected.entries.sort { $0.path < $1.path }
+                            }
+                            guard inventory.manifest.contentsMatchExpected(candidate.emptyOnly ? Manifest(entries: []) : expected) else {
                                 throw NestError("Original holding changed or contains unknown entries; retained.", code: 6)
                             }
                         } else {
@@ -138,6 +151,7 @@ enum SiblingCleanup {
                     guard try refreshed.identity() == parent.identity(), try selected.identity() == DirectoryHandle.open(URL(fileURLWithPath: folder.path)).identity() else { throw NestError("Cleanup paths changed; retained.", code: 6) }
                     try root.removeCleanupTree(from: parent, name: path.lastPathComponent, plan: candidate.plan!, device: device, inode: inode, fsid: fsid, validateAnchor: {
                         try validateSource()
+                        if candidate.kind == .fsKitOriginal { try FSKitLinks.requirePrivateDirectory(root, device: device, checkACL: false) }
                         guard try DirectoryHandle.open(parentURL).identity() == (parentDevice, parentInode) else { throw NestError("Sibling parent path changed; stopped.", code: 6) }
                     }, beforeUnlink: beforeUnlink)
                 }

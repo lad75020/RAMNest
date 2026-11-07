@@ -64,6 +64,7 @@ public struct Journal: Codable, Equatable, Sendable {
     var publicationReceipt: PublicationReceipt?
     public var mountedDevice: UInt64?
     public var populationVerified = false
+    public var fsKitLink: FSKitLinkLayout?
     // Only absence of all three keys selects the legacy recovery contract.
     // A negotiated pre-mount helper must be sealed + retired before rollback,
     // including after a coordinator crash when its OS mount is still absent.
@@ -79,7 +80,7 @@ public struct Journal: Codable, Equatable, Sendable {
         case retiringRevisions, cleanupWarning, siblingCleanup, evacuation, evacuationDevice, evacuationInode
         case evacuatedEntries, restoredEntries, restoreRevision, restoreStage, restoreStageDevice, restoreStageInode
         case restoreDataDevice, restoreDataInode, publicationReceipt, mountedDevice, populationVerified
-        case startupProtocol, startupHelperPID, startupRetired, lastError, updated
+        case startupProtocol, startupHelperPID, startupRetired, lastError, updated, fsKitLink
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -134,6 +135,58 @@ public struct Journal: Codable, Equatable, Sendable {
         startupRetired = try values.decodeIfPresent(Bool.self, forKey: .startupRetired)
         lastError = try values.decodeIfPresent(String.self, forKey: .lastError)
         updated = try values.decode(Date.self, forKey: .updated)
+        // Presence is authority, including explicit null. Never downgrade a
+        // malformed new layout into the legacy physical-path recovery branch.
+        fsKitLink = values.contains(.fsKitLink) ? try values.decode(FSKitLinkLayout.self, forKey: .fsKitLink) : nil
+        if let layout = fsKitLink {
+            try layout.validate()
+            let allowedRoot = (decoder.userInfo[FSKitLinkLayout.decoderRootKey] as? URL) ?? FSKitLinks.productionRoot
+            guard layout.mountRoot == allowedRoot.path else {
+                throw DecodingError.dataCorruptedError(forKey: .fsKitLink, in: values,
+                    debugDescription: "FSKit journal names an unauthorized mount root; recovery blocked.")
+            }
+            for key in [CodingKeys.evacuation, .evacuationDevice, .evacuationInode, .restoreStage,
+                        .restoreStageDevice, .restoreStageInode, .restoreDataDevice, .restoreDataInode, .restoreRevision] {
+                if values.contains(key), try values.decodeNil(forKey: key) {
+                    throw DecodingError.dataCorruptedError(forKey: key, in: values,
+                        debugDescription: "Null FSKit transaction authority; originals retained.")
+                }
+            }
+            guard backend == .fskit, session == layout.session else {
+                throw DecodingError.dataCorruptedError(forKey: .fsKitLink, in: values,
+                    debugDescription: "FSKit layout backend/session mismatch; all data retained.")
+            }
+            if let stage = restoreStage {
+                let url = URL(fileURLWithPath: stage)
+                let prefix = ".ramnest-\(layout.folderID.uuidString)-restore-"
+                guard stage.hasPrefix("/"), url.standardizedFileURL.path == stage,
+                      url.deletingLastPathComponent() == URL(fileURLWithPath: layout.originalPath).deletingLastPathComponent(),
+                      url.lastPathComponent.hasPrefix(prefix),
+                      UUID(uuidString: String(url.lastPathComponent.dropFirst(prefix.count))) != nil,
+                      restoreStageDevice == layout.parent.device, (restoreStageInode ?? 0) > 0 else {
+                    throw DecodingError.dataCorruptedError(forKey: .restoreStage, in: values,
+                        debugDescription: "Invalid FSKit staging authority; all data retained.")
+                }
+            } else if restoreStageDevice != nil || restoreStageInode != nil || restoreDataDevice != nil || restoreDataInode != nil {
+                throw DecodingError.dataCorruptedError(forKey: .restoreStage, in: values,
+                    debugDescription: "Partial FSKit staging authority; all data retained.")
+            }
+            guard phase != .mounted || (layout.stage == .linked && populationVerified),
+                  phase != .idle || (layout.stage == .restored && layout.mountReleased),
+                  !populationVerified || [.linked, .restoring, .publishing, .restored].contains(layout.stage),
+                  !populationVerified || layout.link != nil,
+                  evacuation == nil || (layout.holding != nil && evacuation == layout.holdingPath && evacuationDevice == layout.holding?.device && evacuationInode == layout.holding?.inode),
+                  ![.evacuating, .evacuated, .linking, .linked, .restoring, .publishing].contains(layout.stage) || evacuation == layout.holdingPath,
+                  layout.stage != .publishing || restoreRevision != nil,
+                  layout.restoration != .checkpoint || phase == .idle || restoreRevision != nil,
+                  layout.stage != .restoring || (restoreStage != nil && layout.restoration == .checkpoint),
+                  layout.stage != .publishing || layout.restoration != .checkpoint ||
+                    (restoreStage != nil && restoreStageDevice == layout.parent.device && restoreStageInode != nil &&
+                     restoreDataDevice == layout.restored?.device && restoreDataInode == layout.restored?.inode) else {
+                throw DecodingError.dataCorruptedError(forKey: .fsKitLink, in: values,
+                    debugDescription: "Incoherent FSKit transaction stage; all data retained.")
+            }
+        }
     }
 }
 public struct Configuration: Codable, Sendable {
@@ -143,7 +196,7 @@ public struct Configuration: Codable, Sendable {
             switch self { case .nfs: "NFS"; case .fskit: "FSKit"; case .smb: "SMB3" }
         }
         var mountFailureMessage: String {
-            let setup = self == .fskit ? " Open /Applications/fuse-t.app and follow its instructions to enable the FSKit extension; registration alone does not prove it is enabled. External-volume permission failures remain unresolved." : ""
+            let setup = self == .fskit ? " Open /Applications/fuse-t.app and follow its instructions to enable the FSKit extension; registration alone does not prove it is enabled. New FSKit sessions require RAMNest's writable internal mount directory and use a symlink at the original folder path." : ""
             return "FUSE-T \(displayName) did not mount." + setup + " Sandbox may also prohibit mounts. Original data is retained; run recover before retrying. RAMNest does not retry using another backend."
         }
     }

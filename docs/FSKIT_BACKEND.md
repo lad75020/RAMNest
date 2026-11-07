@@ -33,7 +33,7 @@ OS-assigned port and no advertising. No global `fuse-t.ini`, LAN advertising,
 permissions, extension registration, installation, or macFUSE configuration is
 changed. RAMNest never retries a failed mount using another backend.
 
-## FSKit prerequisite and unresolved behavior
+## FSKit prerequisite and mount layout
 
 The [FUSE-T 1.1.0 release](https://github.com/macos-fuse-t/fuse-t/releases/tag/1.1.0)
 documents `-o backend=fskit`, FSKit support on macOS 26+, and manual extension
@@ -42,14 +42,19 @@ continues using the private FUSE-T 1.2.9 headers and dylib.
 
 Before an authorized FSKit mount check, open `/Applications/fuse-t.app` and follow
 its instructions to enable the extension. Registration alone does not establish
-activation. The existing external-volume `EPERM` remains unresolved; providing a
-selector does not fix it. Settings and FSKit failure messages retain this
-warning. Parser/SDK checks do not demonstrate a successful FSKit mount.
+activation. New FSKit sessions avoid a direct mount on an external source volume:
+they reserve `/Users/Shared/RAMNest-Mounts-<uid>/<original basename>` and publish
+the original path as a journal-owned symlink. This uses an internal, current-user
+0700 root without elevation. Existing live/pending FSKit sessions without a layout
+record keep their direct mount path. See [the symlink layout](FSKIT_SYMLINK_LAYOUT.md)
+for restoration, crash behavior, tested scope and remaining limits.
 
 ## Preserved mount behavior
 
-The original full mountpoint, escaped original folder `volname`, session/volume
-identifiers, `noattrcache,namedattr,use_ino`, and optional `nobrowse` remain.
+NFS/SMB and absent-layout FSKit sessions retain the original full mountpoint.
+New FSKit sessions use the persisted internal physical path. The escaped original
+folder `volname`, session/volume identifiers, `noattrcache,namedattr,use_ino`, and
+optional `nobrowse` remain.
 Production still omits `renamex` for the existing wire-decoder workaround,
 independently of backend selection. Ordinary rename, native extended rename,
 stack handling, progress, metadata/decmpfs normalization, freeze, and root read
@@ -86,11 +91,13 @@ Verify selection persists after reopening Settings, a live mount keeps its
 recorded caption/helper after a preference change, a subsequent mount uses the
 new preference, and a legacy live journal remains unknown. For SMB verify the
 actual listener is loopback only and no Bonjour service is advertised. For
-FSKit verify extension activation independently and report the actual result or
-external-volume EPERM. Check fixture population, read/write, ordinary rename,
-hardlinks/xattrs, and eject/restore with the selected backend.
+FSKit verify extension activation independently, the physical internal mount and
+the exact original-path symlink. Check fixture population, read/write, supported
+topology/xattrs, eject/restore, basename collisions, link replacement and repeated
+internal/external-source cycles. Do not treat older direct-mount or NFS evidence
+as proof of this layout.
 
 The [historical host report](VERIFICATION_RESULTS.md) and prior NFS artifacts
 remain historical; their results must not be relabeled as FSKit or SMB3
-validation. No actual mount, activation command or app packaging is part of this
-sandbox implementation.
+validation. The current host verification and remaining baseline test failure
+are recorded in [the symlink-layout report](FSKIT_SYMLINK_LAYOUT.md).

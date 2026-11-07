@@ -3,6 +3,13 @@ import Darwin
 
 public final class Store: @unchecked Sendable {
     var beforeJournalWrite: ((Journal, UUID) throws -> Void)?
+    // Internal fixture injection only; no environment or public API override.
+    var fsKitFixtureRoot: URL?
+    var journalDecoder: JSONDecoder {
+        let decoder = JSONDecoder()
+        if let root = fsKitFixtureRoot { decoder.userInfo[FSKitLinkLayout.decoderRootKey] = root }
+        return decoder
+    }
     public let root: URL
     private let rootIdentity: (device: UInt64, inode: UInt64)
     public static var defaultRoot: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/RAMNest", isDirectory: true) }
@@ -68,7 +75,7 @@ public final class Store: @unchecked Sendable {
     }
     public func journal(_ id: UUID) throws -> Journal {
         let url = try volume(id).appendingPathComponent("journal.json")
-        return FileManager.default.fileExists(atPath: url.path) ? try Self.read(Journal.self, url) : Journal()
+        return FileManager.default.fileExists(atPath: url.path) ? try Self.read(Journal.self, url, decoder: journalDecoder) : Journal()
     }
     public func write(_ journal: Journal, for id: UUID) throws {
         try beforeJournalWrite?(journal, id)
@@ -82,11 +89,14 @@ public final class Store: @unchecked Sendable {
         return folder
     }
     public static func read<T: Decodable>(_ type: T.Type, _ url: URL) throws -> T {
+        try read(type, url, decoder: JSONDecoder())
+    }
+    static func read<T: Decodable>(_ type: T.Type, _ url: URL, decoder: JSONDecoder) throws -> T {
         let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw NestError("Cannot read \(url.lastPathComponent).", code: 6) }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         let data = try handle.readToEnd() ?? Data()
-        return try JSONDecoder().decode(type, from: data)
+        return try decoder.decode(type, from: data)
     }
     public static func atomicJSON<T: Encodable>(_ value: T, _ url: URL) throws {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

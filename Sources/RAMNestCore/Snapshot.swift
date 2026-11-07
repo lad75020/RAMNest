@@ -647,7 +647,7 @@ enum SnapshotRetention {
         // Do not overwrite a newer journal or its recovery error while reporting
         // a secondary cleanup problem. stderr still reports an unwritable store.
         if let volume = try? store.managedVolume(folder.id),
-           let current = try? volume.readJSON(Journal.self, "journal.json") {
+           let current = try? volume.readJSON(Journal.self, "journal.json", decoder: store.journalDecoder) {
             var expected = journal; expected.updated = current.updated
             if expected == current {
                 journal.cleanupWarning = warning
@@ -670,7 +670,7 @@ enum SnapshotRetention {
             try revisions.requireOwnedDirectory(device: volume.identity().device, privateMode: true)
             let path = store.root.path
             guard !Paths.mounts().contains(where: { $0.path == path || $0.path.hasPrefix(path + "/") }) else { throw NestError("Nested mount in snapshot storage; cleanup skipped.", code: 6) }
-            var durable = try volume.readJSON(Journal.self, "journal.json")
+            var durable = try volume.readJSON(Journal.self, "journal.json", decoder: store.journalDecoder)
             var expected = journal; expected.updated = durable.updated
             guard durable == expected else { throw NestError("Committed journal changed; cleanup skipped.", code: 6) }
             SiblingCleanup.rememberCompleted(folder, &durable)

@@ -165,7 +165,7 @@ struct AppSettingsView: View {
             }.disabled(model.busy || model.engine == nil)
             Text("Applies to the next new mount for all folders. Changing this setting leaves running mounts and their helpers unchanged.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if model.backend == .fskit {
-                Text("FSKit requires the FUSE-T extension to be enabled through /Applications/fuse-t.app. External-volume permission failures remain unresolved. RAMNest does not fall back to another backend.").font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                Text("FSKit requires the FUSE-T extension to be enabled through /Applications/fuse-t.app. New mounts use a private internal location and a symlink at your folder’s original path, including for external-volume folders. RAMNest does not fall back to another backend.").font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
             if let error = model.backendError { Text(error).foregroundStyle(.red).textSelection(.enabled) }
             Toggle("Show in menu bar instead of Dock", isOn: Binding(get: { model.menuBarMode }, set: { model.setMenuMode($0) }))
