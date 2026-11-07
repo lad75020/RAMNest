@@ -1,0 +1,26 @@
+# Independent review resolution
+
+This maps the nine read-only review findings plus the confirmed parent-host fsid crash to implemented corrections and regressions. The original report is `artifacts/independent-review.txt`. Tests listed here are executable and included in `scripts/test.sh`.
+
+| Finding | Correction | Regression evidence |
+|---|---|---|
+| Signed fsid traps during CLI create | Preserve Int32 filesystem-ID bit pattern; signed dev_t conversions use a consistent nontrapping representation. | Swift negative-fsid/dev_t assertions, saturating near-Int64.max source estimate regression and real getmntinfo enumeration; real CLI creation tests. |
+| Buffer callbacks suppress read/write | Leave read_buf/write_buf unregistered, preserving real libfuse fallback. | Installed `fuse_fs_read`/`fuse_fs_write` dispatcher tests and registration coverage checker. |
+| Short export pwrite appears successful | Loop positive short writes, retry EINTR, fail zero/invalid counts with EIO; read back bytes against held RAM before success. | Injected half-length writer with errno=0, initial EINTR, zero-write failure and retained readable sentinel. |
+| Exceptions terminate helper | Every registered callback goes through noexcept CallbackBoundary, translating bad_alloc to ENOMEM and other exceptions to EIO. | Direct throwing-boundary regression, namespace quota exhaustion with intact unsaved sentinel; checker verifies all registrations. |
+| Rename check races overwrite new files | Descriptor-relative renameatx_np with RENAME_EXCL for evacuation/rollback/restore. | Competing destination sentinel remains unchanged after failed move. |
+| Recovery follows substituted ancestors | Open every directory-chain component nofollow, fstat selected identities, keep descriptors for mutations; journal/check stage identities. Snapshot copying also uses anchored descriptors. | Substitute selected path with a symlink after opening its descriptor; move reaches original inode only and substitute remains untouched. |
+| Extended setattr blocks fallback | Implement validated atomic compound setattr_x/fsetattr_x directly, including handle-only resize. | Real installed libfuse dispatcher resize before/after unlink; callback permission/timestamp/flag tests. |
+| Metadata allocation unbounded | Bound namespace/attributes/handles/directory snapshots separately from logical content; fixed node/handle caps and controlled errors. | Long-name hardlinks exhaust namespace quota, directory open returns EMFILE, unsaved file remains readable. |
+| Supported flags lost | Preserve UF_HIDDEN/UF_NODUMP in native import/export and copyfile; manifest includes and verifies st_flags. Unsupported immutable/append flags are rejected. | Native flags export/import regression and real Swift snapshot roundtrip including flags/xattrs. |
+| Apple exchange implemented pathname swap | exchange returns ENOTSUP. Native renamex RENAME_SWAP remains a distinct pathname operation. Production NFS omits renamex because of confirmed bridge wire corruption. | Hardlinked identity native swap test, explicit unsupported exchange assertion, bridge registration test/checker. |
+
+Parent host probing additionally established `namedattr,use_ino` as required for provenance xattrs and exposed hardlink inodes. Those exact options are enabled; no metadata verification was weakened. The parent-provided frozen-probe report has 19 passing real mounted checks. The final packaged artifact still requires the parent's rerun of mounted memory/lifecycle/GUI checks; these native regressions do not substitute for that evidence.
+
+## GUI launch follow-up
+
+The parent reported 62 passing real-host checks (19 operations, 17 memory/lifecycle, 11 compression, 15 failure/recovery) on the previous frozen release, plus an Xcode build and 1/1 XCTest with 11 internal scenarios. Those establish core behavior; the GUI still crashed before opening a window. The crash moved to `DiagnosticReports/Retired/RAMNest-2026-11-05-223708.ips` and shows recursive AppGraph/window-host transactions while rebuilding Scene.commands.
+
+The GUI correction moves the single model's ownership and launch into the application delegate, defers launch work until after applicationDidFinishLaunching, makes startup idempotent, and extracts nonobserving named commands. Menu-bar mode is now a native NSStatusItem managed outside SwiftUI Scene insertion. The model no longer calls NSApp.setActivationPolicy, and ContentView appearance no longer starts the application. Headless regression tests construct command metadata, start/refresh the real empty repository, verify one refresh task across repeated starts, and persist mode choices without an NSApplication or a scene mutation. A source-level guard prevents the known feedback paths from being reintroduced. These tests do not replace the parent's actual Debug/Release window-launch verification.
+
+The apparent new-file ENOSPC report was corrected by the parent: 404226048 bytes had been written before capacity was reached, and NFS repeated the delayed error during Python context-manager close. The parent fixed exception handling around the entire with/fsync/close. No quota, statfs, native filesystem, or shared-core changes were made for this report. Parent fixture, Xcode test settings and integration-harness changes are preserved.

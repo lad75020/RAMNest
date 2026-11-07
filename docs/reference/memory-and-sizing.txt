@@ -1,0 +1,92 @@
+Source: https://less-software.sh/ram-folder/help-center/memory-and-sizing
+
+Memory and Sizing — RAM Folder Help Center
+RAM Folder
+HELP CENTER
+📖 All topics
+Less Software›RAM Folder›Help Center›Memory and Sizing
+Help Center
+Memory and Sizing
+If I
+create an 8 GB RAM folder, is 8 GB of my RAM gone?
+No. The size is a ceiling, not a reservation. An 8
+GB RAM folder holding 300 MB of files uses about 300 MB of memory.
+Memory is used as files are written, and given back as soon as they are
+deleted. It is fine to size a RAM folder generously “just in case”, as
+long as you don’t actually fill it.
+This is a key difference from classic disk-image RAM disks made with
+hdiutil or diskutil, which keep every block
+they have ever written: see our macOS
+RAM Disks guide.
+The flip side: a RAM folder that does fill up really uses
+that much memory. Filling a large one can put your Mac under memory
+pressure, which is why RAM Folder shows a memory bar.
+What are the size limits?
+- Minimum: 16 MB.
+- Maximum: 75% of your Mac’s physical memory. That is
+a guardrail, not a recommendation: macOS, your apps and the file cache
+need memory too.
+The limit applies to each RAM folder. Several RAM folders can add up
+to more than your memory, as long as their contents don’t.
+Watch the memory bar.
+How do I read the memory bar?
+The bar at the bottom of the main window shows how much memory your
+Mac has left. It counts as available what Activity Monitor counts as
+available: free memory, plus memory macOS can reclaim instantly
+(inactive file cache, purgeable memory), minus compressed memory, minus
+a 512 MB safety margin. It refreshes every few seconds, and right after
+each mount and eject.
+macOS deliberately keeps memory full of caches, so “used” memory in
+Activity Monitor is no reason to worry. That cache is handed back when
+your RAM folder needs it.
+What happens when a RAM
+folder is full?
+It behaves like a full disk: writes fail with a “disk full” error
+until you delete files or increase its
+size. The rest of your Mac is not affected, except through the
+memory the RAM folder itself uses.
+The
+folder is larger than my RAM folder’s size. What happens at mount?
+The files can’t all fit, so the mount is refused: RAM Folder unmounts
+the half-filled volume and reports that the folder is too large. Nothing
+is lost: the folder is untouched. Increase the RAM folder’s size, then
+mount again.
+This can happen when files were added to the folder while the RAM
+folder was unmounted.
+Can I
+resize a RAM folder? What happens to its files?
+Yes, from its detail
+view:
+- While unmounted, the new size is used at the next
+mount.
+- While mounted, RAM Folder unmounts and remounts the
+RAM folder at its new size. With Sync RAM folder on,
+your files are saved and restored around the remount. With it off, the
+remount empties the RAM folder.
+- You can’t shrink a RAM folder below the space its files
+use. RAM Folder shows the minimum size and blocks the
+change.
+Does an unmounted RAM
+folder use memory?
+No. Unmounting gives all of its memory back to macOS immediately. A
+mounted RAM folder keeps its files in memory even when nobody uses them,
+so the simple rule is: keep mounted what you use, eject what you don’t.
+With Sync RAM folder on, ejecting is cheap and safe,
+since the next mount brings everything back.
+Is a RAM folder
+always faster than my SSD?
+For work that reads and writes many files (builds, caches, temporary
+files), it is much faster, and it causes no SSD wear. For a single large
+sequential copy, the gain is smaller, because a fast SSD already streams
+large files quickly.
+Mounting and saving take a little time, since files are copied
+between your folder and RAM. For a folder with many gigabytes of data,
+expect the mount and the eject to take a few seconds or more.
+Trustpilot
+Fewer apps, made with more care.
+Post
+© 2026 Less Software SASU. All rights reserved.
+RAM Folder
+macOS RAM disk guide
+Help Center
+Privacy

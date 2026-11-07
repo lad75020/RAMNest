@@ -1,0 +1,114 @@
+Source: https://less-software.sh/ram-folder/help-center/remote-storage
+
+Remote Storage — RAM Folder Help Center
+RAM Folder
+HELP CENTER
+📖 All topics
+Less Software›RAM Folder›Help Center›Remote Storage
+Help Center
+Remote Storage
+By default, a RAM folder is saved into its folder on your Mac. With
+remote storage, the same save goes to an S3-compatible
+bucket you own instead: an off-machine copy that survives even
+if the Mac itself is lost.
+Which providers are
+supported?
+Any S3-compatible object storage. These providers are preconfigured
+in the app:
+AWS S3, Cloudflare R2, Synology C2 Object Storage, Alibaba Cloud OSS,
+DigitalOcean Spaces, IONOS Object Storage, Scaleway Object Storage,
+Wasabi, Google Cloud Storage, Linode Object Storage, Minio, Ceph,
+Hetzner Object Storage, OVHcloud Object Storage, Tencent Cloud COS,
+Huawei OBS, IBM Cloud Object Storage, Storj, Dreamhost DreamObjects,
+IDrive e2, Fastly Object Storage, Qiniu Object Storage (Kodo), Selectel
+Object Storage and Leviia Object Storage.
+All of them work the same way: a bucket, an
+Access Key ID and Secret Access Key
+pair, and for some providers a region or an
+endpoint URL. The app shows only the fields your
+provider needs. ram-folder remote list prints the current
+list, with the fields each provider takes.
+How do I set it up?
+In the RAM folder’s detail view:
+- Open the Advanced tab. Remote storage appears under
+Synchronization, which requires Sync RAM
+folder to be on.
+- Turn on Store data on S3-compatible remote
+storage.
+- Choose your Provider, then fill in the bucket,
+region or endpoint, and the access keys. Optionally set a
+Path: a subfolder inside the bucket.
+- Click Validate connection. RAM Folder checks it can
+actually reach the bucket before accepting the configuration.
+- Click Apply.
+Once validated, the section shows Connected to
+provider with the bucket’s address, and a
+Disconnect button to remove the configuration.
+Apply is blocked while the option is on but no
+connection is validated.
+From the Terminal,
+ram-folder remote setup <ref> <provider> does
+the same: see Command
+line.
+Where does my data go when I
+eject?
+The save works exactly as described in Synchronization, with your bucket in
+place of the local snapshot:
+- At eject or quit: RAM contents are saved to the
+bucket, the RAM folder is unmounted, and the bucket’s contents are
+copied back into your folder on the Mac.
+- Periodic saves (if on) save to the bucket while
+mounted.
+- At mount, the RAM folder is filled from the folder
+and the bucket.
+When a save to the bucket succeeds, RAM Folder deletes any local
+fallback copy: the bucket is then the only snapshot.
+What happens without
+a network connection?
+RAM Folder falls back to local storage rather than losing your
+work:
+- Saving without network: the save goes to the local
+snapshot on your Mac instead
+(~/Library/Application Support/RAM Folder/sync/…), and RAM
+Folder records that the last save was local.
+- Mounting after a local fallback: the RAM folder is
+restored from that local snapshot, so it mounts normally, even
+offline.
+- Mounting when the latest save is in the bucket
+only: RAM Folder needs the network to restore it. Without one,
+the mount fails rather than presenting a RAM folder with missing files.
+Reconnect, then mount again.
+In other words, a local copy exists only when the last save had to
+fall back to it.
+Is my data
+private? How are my credentials stored?
+- RAM Folder writes objects as private on the
+providers that support it.
+- Your secrets (Access Key ID, Secret Access Key) are stored
+encrypted, in a file tied to your Mac:
+~/Library/Application Support/RAM Folder/storage-credentials.json.
+They are never written to the RAM folder’s settings or to the bucket,
+and the app never shows them in plain text.
+- Non-secret settings (provider, bucket, region, endpoint, path) are
+kept with the RAM folder’s configuration.
+Your files travel only between your Mac and the bucket you
+configured. Less Software never receives them.
+Does
+remote storage keep Finder tags and permissions?
+No. Object storage holds file contents, names and modification dates.
+Permissions and extended attributes (Finder tags and labels) are not
+kept: see Synchronization.
+What happens if I
+turn Sync RAM folder off?
+Remote storage is used only with Sync RAM folder on.
+With it off, the RAM folder is temporary: nothing is saved, so the
+remote configuration is ignored and its form is hidden. The
+configuration is kept and used again if you turn sync back on.
+Trustpilot
+Fewer apps, made with more care.
+Post
+© 2026 Less Software SASU. All rights reserved.
+RAM Folder
+macOS RAM disk guide
+Help Center
+Privacy

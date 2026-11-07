@@ -1,0 +1,61 @@
+# macOS metadata and filesystem noise
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+.TemporaryItems/
+.VolumeIcon.icns
+
+# Swift, Xcode, and CMake build products
+.build/
+.swiftpm/
+/DerivedData/
+/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.xcodeproj/
+*.xcworkspace/
+*.xcuserstate
+xcuserdata/
+*.xcresult/
+*.dSYM/
+*.dSYM.zip
+*.xcarchive/
+*.ipa
+*.profdata
+
+# Generated test/package artifacts and local agent/tool state
+artifacts/
+.codebase-memory/
+.hermes/
+
+# Local credentials and signing material; keep example templates trackable
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+*.certSigningRequest
+*.key
+
+# Logs, editor swap files, and temporary backups
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*.orig
+*.rej
+*~
+/.specify
+
+# Python bytecode and interpreter caches
+__pycache__/
+*.py[cod]

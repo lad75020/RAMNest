@@ -1,0 +1,141 @@
+Source: https://less-software.sh/ram-folder/help-center/ram-folder-options
+
+RAM Folder Options — RAM Folder Help Center
+RAM Folder
+HELP CENTER
+📖 All topics
+Less Software›RAM Folder›Help Center›RAM Folder Options
+Help Center
+RAM Folder Options
+Select a RAM folder in the sidebar: its detail view opens on the
+right. The Options section has two tabs:
+Normal, with the settings most people change, and
+Advanced, with the ones you rarely need.
+How do I change an option?
+Change it, then click Apply at the bottom right of
+the detail view. An option you changed but haven’t applied is marked
+with an asterisk (*). Discard reverts all pending
+changes.
+If you select another RAM folder, mount or eject with changes still
+pending, RAM Folder asks you to apply or discard them first. Changing an
+option never touches the RAM folder’s files, except for a resize while
+mounted (see Capacity).
+What are the default options?
+Option
+Tab
+Default
+Mount at launch
+Normal
+On
+Hide from Desktop and Finder sidebar
+Normal
+On
+Sync RAM folder
+Normal
+On
+Save RAM folder periodically
+Normal
+Off (every 15 min when turned on)
+Disable Filesystem Events (FSEvents)
+Advanced
+Off
+File comparison method
+Advanced
+Size & Modification time
+Store data on S3-compatible remote storage
+Advanced
+Off
+How do I rename a RAM folder?
+Click its name at the top of the detail view and type a new one.
+Names must be unique among your RAM folders, ignoring case. A RAM folder
+without a custom name shows its folder’s name, so renaming the folder in
+Finder renames it too.
+How do I change the capacity?
+Click the Total: label beside the capacity bar (with
+the pencil icon), enter the new size, and confirm with the checkmark
+(Apply size change). On a mounted RAM folder, RAM
+Folder warns that “The volume will be unmounted and remounted with
+its new size”:
+- with Sync RAM folder on, your data is saved and
+restored around the remount (“Your data will be automatically
+synchronized”);
+- with it off, the remount empties the RAM folder (“All your data
+will be lost”).
+You can’t shrink a RAM folder below the space its files use: RAM
+Folder shows the minimum size and blocks the change. See Memory & sizing.
+Normal options
+Mount at launch
+Mounts the RAM folder automatically each time RAM Folder starts.
+Combined with Open at login (settings popover), your
+RAM folders are ready at every login. It works only while the app runs:
+the command line alone never mounts
+anything automatically.
+Hide from Desktop and
+Finder sidebar
+Keeps the RAM folder from appearing like a separate disk on the
+Desktop and in Finder’s sidebar (it uses the nobrowse mount
+option). It stays fully usable as a normal folder through its path. Turn
+it off if you’d like the RAM folder to appear as an ejectable volume in
+Finder. The change applies at the next mount.
+Sync RAM folder
+The most important switch: it decides whether your work survives an
+eject.
+- On (default): changes made in RAM are saved back
+into the folder when the RAM folder is unmounted: eject, quit, shutdown,
+or an eject from Finder or diskutil.
+- Off: the RAM folder is temporary.
+It still starts from the folder’s files at each mount, but
+everything written while mounted is discarded at
+unmount. Use it for caches and scratch files.
+If a RAM folder holds anything you care about, keep “Sync RAM
+folder” on. Even then, the folder is updated only at unmount: a
+power cut or a kernel panic while mounted saves nothing. Turn on
+Save RAM folder periodically to narrow that window, and
+read Data safety.
+The (Learn more…) link next to the
+Synchronization heading opens the Synchronization page, which explains the
+whole mechanism. Once you have clicked it, an eye icon lets you hide the
+link for good.
+Save RAM folder periodically
+Available when Sync RAM folder is on. Saves the RAM
+contents into RAM Folder’s snapshot at the interval chosen in
+Sync every (5 min, 15 min, 30 min, 1 hour, 6 hours, 12
+hours or 24 hours), to reduce what a crash or a forced unmount can cost
+you. It refreshes the snapshot, not your folder: see Synchronization.
+Periodic saves are scheduled by the app, so they run only while RAM
+Folder is open.
+Advanced options
+Disable Filesystem Events
+(FSEvents)
+Turns off macOS’s file-change journal on the RAM folder, which saves
+a little I/O on write-heavy volumes. But apps that watch folders for
+changes rely on it: build watchers, sync clients, editors that reload
+changed files, git fsmonitor. Leave it off unless you know
+none of them watch this folder. The change applies at the next
+mount.
+File comparison method
+Available when Sync RAM folder is on. Decides how a
+save tells which files changed:
+- Size & Modification time (default): fast, and
+right for almost every workload. It can miss an edit that keeps both the
+size and the modification date unchanged.
+- File contents (checksum): compares a hash of every
+file, so it catches every edit. It reads every file in full, so saves
+are slower, and modification dates are not copied over.
+Store data on
+S3-compatible remote storage
+Available when Sync RAM folder is on. Saves the RAM
+folder’s contents to a cloud bucket you own instead of your local disk.
+Choose a Provider, fill in its fields, then click
+Validate connection. Once validated, the section shows
+the bucket the RAM folder is connected to, and a
+Disconnect button. Apply stays blocked
+while the option is on but no connection is validated. See Remote storage.
+Trustpilot
+Fewer apps, made with more care.
+Post
+© 2026 Less Software SASU. All rights reserved.
+RAM Folder
+macOS RAM disk guide
+Help Center
+Privacy

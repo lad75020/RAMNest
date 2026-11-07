@@ -1,0 +1,52 @@
+[
+  {
+    "page": "getting-started",
+    "url": "https://less-software.sh/ram-folder/help-center/getting-started",
+    "characters": 5000
+  },
+  {
+    "page": "creating-a-ram-folder",
+    "url": "https://less-software.sh/ram-folder/help-center/creating-a-ram-folder",
+    "characters": 4889
+  },
+  {
+    "page": "ram-folder-options",
+    "url": "https://less-software.sh/ram-folder/help-center/ram-folder-options",
+    "characters": 5469
+  },
+  {
+    "page": "synchronization",
+    "url": "https://less-software.sh/ram-folder/help-center/synchronization",
+    "characters": 11142
+  },
+  {
+    "page": "data-safety",
+    "url": "https://less-software.sh/ram-folder/help-center/data-safety",
+    "characters": 7314
+  },
+  {
+    "page": "mounting-and-ejecting",
+    "url": "https://less-software.sh/ram-folder/help-center/mounting-and-ejecting",
+    "characters": 5739
+  },
+  {
+    "page": "memory-and-sizing",
+    "url": "https://less-software.sh/ram-folder/help-center/memory-and-sizing",
+    "characters": 3837
+  },
+  {
+    "page": "remote-storage",
+    "url": "https://less-software.sh/ram-folder/help-center/remote-storage",
+    "characters": 4545
+  },
+  {
+    "page": "command-line",
+    "url": "https://less-software.sh/ram-folder/help-center/command-line",
+    "characters": 6792
+  },
+  {
+    "page": "troubleshooting",
+    "url": "https://less-software.sh/ram-folder/help-center/troubleshooting",
+    "characters": 5770
+  }
+]

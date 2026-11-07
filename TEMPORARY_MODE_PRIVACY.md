@@ -1,0 +1,7 @@
+# Final local privacy regression to fix with bookmark retry
+
+Observed static path: Engine.unmount(sync=false) still sends `quiesce\t<stage-UUID>`. Helper quiesce calls tree.exportTree(stage,true), writing ALL temporary RAM changes to SSD even though they are discarded from selected folder afterward. These stage dirs remain. This contradicts the useful temporary/sync-disabled behavior and needlessly persists volatile working content. Original-folder startup snapshots may remain, but NEW RAM-only data must not be written on a temporary eject.
+
+Add a freeze-only helper command (no export, no payload I/O) and use it in temporary unmount. Continue restoring original folder objects and skipping periodic saves when sync is off; explicit live export remains opt-in rescue. Keep save/eject atomic/freeze semantics and failure-thaw paths. Test actual command boundary plus a local host fixture: create original, mount temporary, write unique RAM-only sentinel, eject; original unchanged and sentinel absent from ALL retained snapshot/stage/original-holding data files. Do not delete recovery storage as a way to hide a write; prove no stage/payload export occurred. Existing original source snapshot behavior okay.
+
+Keep changes narrowly to helper command, temporary Engine route, regression/tests/docs. Bookmark transient retry fix remains active; do both together, then run tests/package. Parent confirmed Debug + Release GUI and normal quit; don't refactor GUI. No S3; macOS27+. Core is otherwise passing host ops/compression/recovery.

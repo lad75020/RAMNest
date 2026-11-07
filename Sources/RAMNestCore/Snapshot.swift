@@ -1,0 +1,739 @@
+import Foundation
+import CryptoKit
+import Darwin
+
+public struct Entry: Codable, Equatable, Sendable {
+    public var path: String
+    public var kind: String
+    public var size: Int64
+    public var mode: UInt16
+    public var mtimeSeconds: Int64
+    public var mtimeNanos: Int64
+    public var checksum: String
+    public var attributes: [String: String]
+    public var hardlink: String?
+    public var flags: UInt32
+    public var attributeBytes: UInt64
+    public var allocatedBytes: UInt64? = nil
+    // Directional compatibility is allowed only when the EXPECTED old record
+    // predates allocatedBytes. Equatable itself is exact (synthesized).
+    func matchesExpected(_ expected: Entry) -> Bool {
+        var observed = self
+        if expected.allocatedBytes == nil { observed.allocatedBytes = nil }
+        return observed == expected
+    }
+
+}
+public struct Manifest: Codable, Equatable, Sendable {
+    public var entries: [Entry]
+    // Absent in legacy manifests: their contract remains exactly the entry list.
+    // The data root carries public metadata; its enclosing revision stays 0700.
+    public var publicRoot: Entry? = nil
+    public func matchesExpected(_ expected: Manifest) -> Bool {
+        contentsMatchExpected(expected) && (expected.publicRoot == nil || publicRoot == expected.publicRoot)
+    }
+    // Holding directories have private root permissions, separately from their
+    // original public root. Only callers that verify that container use this.
+    func contentsMatchExpected(_ expected: Manifest) -> Bool {
+        entries.count == expected.entries.count && zip(entries, expected.entries).allSatisfy { $0.matchesExpected($1) }
+    }
+    // Re-anchor each hardlink class when a restore has moved only some top-level
+    // entries. This preserves equality of inode partitions within each remainder.
+    func selecting(topNames: Set<String>) -> Manifest {
+        var selected = entries.filter { topNames.contains(String($0.path.split(separator: "/")[0])) }
+        var anchors: [String: String] = [:]
+        let walkOrder = selected.indices.sorted { selected[$0].path.split(separator: "/").lexicographicallyPrecedes(selected[$1].path.split(separator: "/")) }
+        for i in walkOrder where selected[i].kind == "file" {
+            let group = selected[i].hardlink ?? selected[i].path
+            selected[i].hardlink = anchors[group]
+            if anchors[group] == nil { anchors[group] = selected[i].path }
+        }
+        return Manifest(entries: selected, publicRoot: publicRoot)
+    }
+    public var metadataEstimate: UInt64 {
+        entries.reduce(1024 + UInt64((publicRoot?.attributes.count ?? 0) * 256)) { bytes, entry in
+            bytes + UInt64(entry.hardlink == nil ? 2048 : 512) + UInt64((entry.path as NSString).lastPathComponent.utf8.count) + UInt64(entry.attributes.count * 256)
+        }
+    }
+    static func metadataBudget(capacity: UInt64) -> UInt64 { max(65536, capacity / 4) }
+    public func preflight(capacity: UInt64) throws {
+        guard entries.lazy.filter({ $0.hardlink == nil }).count < 100000 else { throw NestError("Native node limit is 100000 including the root. No files were moved.", code: 6) }
+        let logicalRequired = allocatedEstimate, metadataRequired = metadataEstimate
+        let metadataAllowed = Self.metadataBudget(capacity: capacity)
+        guard logicalRequired > capacity || metadataRequired > metadataAllowed else { return }
+        let files = entries.lazy.filter { $0.kind == "file" }.count
+        let attributes = entries.reduce(0) { $0 + $1.attributes.count }
+        let detail = "\(entries.count) entries, \(files) regular files, \(attributes) extended attributes"
+        if logicalRequired > capacity {
+            throw NestError("Source exceeds logical capacity: requires \(logicalRequired) bytes; allowed \(capacity) bytes (\(detail)). Files round up to 64 KiB; compression does not reduce this quota. Increase capacity before mounting; no files were moved.", code: 6)
+        }
+        throw NestError("Source exceeds metadata budget: estimated required \(metadataRequired) bytes; allowed \(metadataAllowed) bytes at capacity \(capacity) bytes (\(detail)). Metadata budget is max(64 KiB, capacity / 4). Increase capacity or reduce entry/attribute count before mounting; no files were moved.", code: 6)
+    }
+    public var allocatedEstimate: UInt64 {
+        var total: UInt64 = publicRoot?.attributeBytes ?? 0
+        for entry in entries {
+            guard entry.size >= 0 else { return UInt64.max }
+            if entry.hardlink != nil { continue }
+            var amount = entry.attributeBytes
+            if entry.kind == "file" && entry.hardlink == nil {
+                let size = UInt64(entry.size)
+                amount = entry.allocatedBytes ?? ((size + 65535) / 65536) * 65536
+                let extra = amount.addingReportingOverflow(entry.attributeBytes)
+                if extra.overflow { return UInt64.max }; amount = extra.partialValue
+            } else if entry.kind == "symlink" {
+                let extra = amount.addingReportingOverflow(UInt64(entry.size))
+                if extra.overflow { return UInt64.max }; amount = extra.partialValue
+            }
+            let sum = total.addingReportingOverflow(amount)
+            if sum.overflow { return UInt64.max }; total = sum.partialValue
+        }
+        return total
+    }
+}
+// Snapshot/reload policy only. Runtime filesystem callbacks and quota accounting
+// still include Trash. A no-follow stat is the only permitted subtree access.
+enum SnapshotExclusion {
+    static func directory(_ name: String, _ mode: mode_t) -> Bool {
+        name == ".Trashes" && mode & S_IFMT == S_IFDIR
+    }
+    static func directory(_ path: String, kind: String) -> Bool {
+        path.split(separator:"/").last == ".Trashes" && kind == "directory"
+    }
+}
+extension Manifest {
+    // Validate the complete old namespace before projecting. Names alone never
+    // establish managed authority, storage version, or directory kind.
+    func excludingTrashDirectories() throws -> Manifest {
+        var kinds: [String:String] = [:]
+        for e in entries {
+            guard !e.path.isEmpty, StorageModes.validPath(e.path), ["directory","file","symlink"].contains(e.kind),
+                  e.mode <= 0o7777, kinds.updateValue(e.kind,forKey:e.path) == nil else { throw NestError("Malformed snapshot namespace.",code:6) }
+        }
+        var excluded = Set<String>()
+        for e in entries {
+            let parent = e.path.split(separator:"/").dropLast().joined(separator:"/")
+            guard parent.isEmpty || kinds[parent] == "directory" else { throw NestError("Invalid snapshot namespace parent.",code:6) }
+            if let link = e.hardlink { guard e.kind == "file", kinds[link] == "file", link != e.path else { throw NestError("Invalid snapshot hardlink anchor.",code:6) } }
+            if SnapshotExclusion.directory(e.path,kind:e.kind) { excluded.insert(e.path) }
+        }
+        func ignored(_ path: String) -> Bool {
+            var parts = path.split(separator:"/")
+            while !parts.isEmpty { if excluded.contains(parts.joined(separator:"/")) { return true };parts.removeLast() }
+            return false
+        }
+        var result = Manifest(entries:entries.filter { !ignored($0.path) },publicRoot:publicRoot)
+        var anchors: [String:String] = [:]
+        let order = result.entries.indices.sorted { result.entries[$0].path.split(separator:"/").lexicographicallyPrecedes(result.entries[$1].path.split(separator:"/")) }
+        for i in order where result.entries[i].kind == "file" {
+            let group = result.entries[i].hardlink ?? result.entries[i].path
+            result.entries[i].hardlink = anchors[group]
+            if anchors[group] == nil { anchors[group] = result.entries[i].path }
+        }
+        return result
+    }
+}
+public enum Snapshot {
+    // Only callers reading an explicitly selected Store revision may request
+    // logical projection. User-controlled path/sibling names confer no authority.
+    public enum SourceContext { case original, managedRevision }
+    public static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+    static let readOperationErrorKey = "RAMNestReadOperation"
+    private static func readFailure(_ operation: String, _ code: Int32, _ url: URL? = nil, syscall: String? = nil) -> NSError {
+        var info: [String: Any] = [NSLocalizedDescriptionKey: "\(operation) (errno \(code))."]
+        if let url { info[NSFilePathErrorKey] = url.path }
+        if let syscall { info[readOperationErrorKey] = syscall }
+        return NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: info)
+    }
+    static func attributes(_ url: URL, list: ((UnsafeMutablePointer<CChar>?, Int) -> Int)? = nil) throws -> [String: String] {
+        let listing = list ?? { listxattr(url.path, $0, $1, XATTR_NOFOLLOW) }
+        let count = listing(nil, 0)
+        if count < 0 { let code = errno; if code == ENOTSUP || code == ENOATTR { return [:] }; throw readFailure("Cannot list extended attributes", code, url, syscall: "listxattr") }
+        if count == 0 { return [:] }
+        var names = [CChar](repeating: 0, count: count)
+        let listed = listing(&names, count)
+        if listed < 0 { throw readFailure("Cannot list extended attributes", errno, url, syscall: "listxattr") }
+        guard listed == count else { throw NestError("Attributes changed during snapshot.", code: 6) }
+        var result: [String: String] = [:]; var index = 0
+        while index < count {
+            let name = names.withUnsafeBufferPointer { String(cString: $0.baseAddress!.advanced(by: index)) }; index += name.utf8.count + 1
+            // decmpfs describes filesystem storage, not logical user metadata.
+            // fcopyfile may clone or decompress it; never reattach it to plain data.
+            // Keep the normal xattr view (no XATTR_SHOWCOMPRESSION), so macOS
+            // hides compression resource forks while visible user forks are hashed.
+            if name == "com.apple.decmpfs" { continue }
+            let size = getxattr(url.path, name, nil, 0, 0, XATTR_NOFOLLOW)
+            if size < 0 { throw readFailure("Cannot read extended attribute size", errno, url, syscall: "getxattr") }
+            guard size <= 1024 * 1024 else { throw NestError("Unsupported attribute size.", code: 6) }
+            var data = Data(count: size)
+            let got = data.withUnsafeMutableBytes { getxattr(url.path, name, $0.baseAddress, size, 0, XATTR_NOFOLLOW) }
+            if got < 0 { throw readFailure("Cannot read extended attribute", errno, url, syscall: "getxattr") }
+            guard got == size else { throw NestError("Attribute changed during snapshot.", code: 6) }
+            result[name] = digest(data)
+        }
+        return result
+    }
+    static func supportedSecurity(_ url: URL, _ st: stat) throws {
+        guard st.st_uid == getuid(), st.st_gid == getgid() else {
+            throw NestError("Unsupported ownership at \(url.lastPathComponent). RAMNest requires the current uid and primary gid; no files were moved.", code: 4)
+        }
+        errno = 0
+        if let acl = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) {
+            defer { acl_free(UnsafeMutableRawPointer(acl)) }
+            var entry: acl_entry_t?
+            let result = acl_get_entry(acl, Int32(ACL_FIRST_ENTRY.rawValue), &entry)
+            guard result != 0, errno == EINVAL else { throw NestError("ACL-bearing entries are unsupported: \(url.lastPathComponent). No files were moved.", code: 4) }
+        } else if errno != ENOENT && errno != ENOTSUP {
+            throw readFailure("Cannot inspect ACL", errno, url)
+        }
+    }
+    static func storedMetadata(_ data: URL) throws -> StoredManifest? {
+        let revision = data.deletingLastPathComponent()
+        let container = try DirectoryHandle.open(revision)
+        let metadata = try container.readJSON(StoredManifest.self,"manifest.json")
+        if metadata.storageFormat == 2 {
+            let st = try container.entryStat("manifest.json")
+            guard st.st_mode & 0o7777 == 0o600, st.st_uid == getuid(), st.st_gid == getgid(), st.st_nlink == 1 else { throw NestError("Invalid private manifest inode/physical policy.", code: 6) }
+        }
+        return metadata
+    }
+    static func checkedModes(_ data: URL, _ metadata: StoredManifest) throws -> StorageModes? {
+        guard metadata.storageFormat != nil else { return nil }
+        let container = try DirectoryHandle.open(data.deletingLastPathComponent())
+        var st = stat()
+        guard fstat(container.fd,&st) == 0, st.st_mode & 0o7777 == 0o700, st.st_uid == getuid(), st.st_gid == getgid(),
+              try container.names() == ["data","manifest.json","modes.bin"] else { throw NestError("Invalid format-2 private container policy/namespace.", code: 6) }
+        let bytes = try StorageModes.read(data.deletingLastPathComponent().appendingPathComponent("modes.bin"))
+        guard digest(bytes) == metadata.modeMapDigest else { throw NestError("Snapshot logical mode map digest mismatch.", code: 6) }
+        let modes = try StorageModes(data:bytes)
+        guard modes.records == (try StorageModes(metadata.logical)).records else { throw NestError("Snapshot logical modes disagree with authenticated mode map.", code: 6) }
+        return modes
+    }
+    public static func manifest(_ root: URL, maximumLogical: UInt64? = nil, matching expected: Manifest? = nil, phase: String = "manifest", context: SourceContext = .original) throws -> Manifest {
+        let metadata = context == .managedRevision ? try storedMetadata(root) : nil
+        let modes = try metadata.flatMap { try checkedModes(root,$0) }
+        let observed = try scanManifest(root,maximumLogical:maximumLogical,matching:expected,phase:phase,containedHardlinks:modes != nil)
+        // Observation remains distinct from authentication. Callers can inspect
+        // a damaged checksum; verified/copy/capture must compare all fields.
+        return try modes?.projecting(observed) ?? observed
+    }
+    static func scanManifest(_ root: URL, maximumLogical: UInt64? = nil, matching expected: Manifest? = nil, phase: String = "manifest", containedHardlinks: Bool = false) throws -> Manifest {
+        try Paths.rejectSymlinks(root.path)
+        var rootStat = stat(); guard lstat(root.path, &rootStat) == 0 else { throw NestError("Snapshot root is missing.", code: 6) }
+        try supportedSecurity(root, rootStat)
+        let started = ProcessInfo.processInfo.systemUptime
+        var bytesRead: UInt64 = 0, aliasesReused = 0
+        var expectedByPath: [String: Entry] = [:]
+        for entry in expected?.entries ?? [] {
+            guard expectedByPath.updateValue(entry, forKey: entry.path) == nil else { throw NestError("Duplicate path in snapshot manifest.", code: 6) }
+        }
+        var digestCache: [String: (stat, SparseContent.Result)] = [:]
+        var entries: [Entry] = []; var links: [String: String] = [:]
+        var identities: [(URL,stat)] = [], linkCounts: [String:Int] = [:], expectedLinks: [String:Int] = [:]
+        var pending = try children(root,path:".").sorted { $0.lastPathComponent > $1.lastPathComponent }.map { ($0, $0.lastPathComponent) }
+        while let (child, path) = pending.popLast() {
+                var st = stat(); guard lstat(child.path, &st) == 0 else { throw NestError("Source changed at \(diagnosticLabel(path)).",code:6) }
+                if SnapshotExclusion.directory(child.lastPathComponent,st.st_mode) { identities.append((child,st));continue }
+                guard st.st_dev == rootStat.st_dev else { throw NestError("Source changed or contains a nested mount: \(path)", code: 6) }
+                try supportedSecurity(child, st)
+                let type = st.st_mode & S_IFMT
+                // Regular reads and hashes use kernel-decoded logical bytes.
+                // RAMNest's own compression must not claim APFS decmpfs storage.
+                let logicalFlags = type == S_IFREG ? st.st_flags & ~UInt32(UF_COMPRESSED) : st.st_flags
+                var entry = Entry(path: path, kind: "", size: 0, mode: UInt16(st.st_mode & 0o7777), mtimeSeconds: 0, mtimeNanos: 0, checksum: "", attributes: try relativeAttributes(child,path), hardlink: nil, flags: logicalFlags, attributeBytes: 0)
+                guard logicalFlags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else { throw NestError("Unsupported file flags on \(path). Clear immutable/append/system flags before conversion.", code: 4) }
+                for name in entry.attributes.keys { let bytes = getxattr(child.path, name, nil, 0, 0, XATTR_NOFOLLOW); guard bytes >= 0 else { throw readFailure("Cannot read extended attribute size", errno) }; entry.attributeBytes += UInt64(bytes + name.utf8.count) }
+                if type == S_IFDIR { entry.kind = "directory" }
+                else if type == S_IFLNK {
+                    guard st.st_nlink == 1 else { throw NestError("Hardlinked symbolic links cannot be preserved; no files were moved.", code: 4) }
+                    entry.kind = "symlink"
+                    let target = try FileManager.default.destinationOfSymbolicLink(atPath: child.path)
+                    entry.size = Int64(target.utf8.count); entry.checksum = digest(Data(target.utf8))
+                } else if type == S_IFREG {
+                    guard st.st_size >= 0 else { throw NestError("Invalid negative file size.", code: 6) }
+                    entry.kind = "file"; entry.size = st.st_size; entry.mtimeSeconds = Int64(st.st_mtimespec.tv_sec); entry.mtimeNanos = Int64(st.st_mtimespec.tv_nsec)
+                    let key = "\(st.st_dev):\(st.st_ino)"
+                    linkCounts[key,default:0] += 1;expectedLinks[key] = Int(st.st_nlink)
+                    if st.st_nlink > 1 { entry.hardlink = links[key]; if links[key] == nil { links[key] = path } }
+                    let fd = open(child.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                    guard fd >= 0 else { throw readFailure("Cannot read snapshot at \(diagnosticLabel(path)) (open)",errno,syscall:"open") }
+                    let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                    var before = stat(); guard fstat(fd, &before) == 0, before.st_ino == st.st_ino, before.st_dev == st.st_dev, before.st_size == st.st_size, before.st_mtimespec == st.st_mtimespec, before.st_ctimespec == st.st_ctimespec else { throw NestError("Source identity/metadata changed.", code: 6) }
+                    let result: SparseContent.Result
+                    if let (cached, digest) = digestCache[key], cached.st_size == before.st_size,
+                       cached.st_mtimespec == before.st_mtimespec, cached.st_ctimespec == before.st_ctimespec {
+                        result = digest; aliasesReused += 1
+                    } else {
+                        let legacy = expectedByPath[path].map { !$0.checksum.hasPrefix("sparse64-v1:") } ?? false
+                        result = try SparseContent.scan(fd, size: before.st_size, legacy: legacy)
+                        bytesRead += result.bytesRead
+                    }
+                    var after = stat(); guard fstat(fd, &after) == 0, before.st_size == after.st_size, before.st_mtimespec == after.st_mtimespec, before.st_ctimespec == after.st_ctimespec else { throw NestError("Source is being written. Close writers and retry.", code: 6) }
+                    digestCache[key] = (after, result)
+                    entry.checksum = result.checksum
+                    entry.allocatedBytes = result.allocated
+                    _ = handle // retain the descriptor through final identity validation
+
+                } else { throw NestError("Special files (socket/device/FIFO) cannot be put in RAMNest: \(path)", code: 4) }
+                entries.append(entry)
+                identities.append((child,st))
+                guard entries.count < StorageModes.maximumRecords, pending.count < StorageModes.maximumRecords else { throw NestError("Snapshot namespace bound exceeded.", code: 6) }
+                if type == S_IFDIR {
+                    let descendants = try children(child,path:path).sorted { $0.lastPathComponent > $1.lastPathComponent }
+                    pending += descendants.map { ($0, path + "/" + $0.lastPathComponent) }
+                }
+        }
+        if let trace = ProcessInfo.processInfo.environment["RAMNEST_HASH_TRACE"] {
+            let event: [String: Any] = ["phase": phase, "bytesRead": bytesRead, "hardlinkDigestsReused": aliasesReused, "seconds": ProcessInfo.processInfo.systemUptime-started]
+            let data = try JSONSerialization.data(withJSONObject: event, options: [.sortedKeys]) + Data([10])
+            let fd = open(trace, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0o600)
+            if fd >= 0 { _ = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }; close(fd) }
+        }
+        var rootEntry = Entry(path: "", kind: "directory", size: 0, mode: UInt16(rootStat.st_mode & 0o7777), mtimeSeconds: 0, mtimeNanos: 0, checksum: "", attributes: try relativeAttributes(root,"."), hardlink: nil, flags: rootStat.st_flags, attributeBytes: 0)
+        for name in rootEntry.attributes.keys { let bytes = getxattr(root.path, name, nil, 0, 0, XATTR_NOFOLLOW); guard bytes >= 0 else { throw readFailure("Root attributes changed", errno) }; rootEntry.attributeBytes += UInt64(bytes + name.utf8.count) }
+        guard rootEntry.flags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else { throw NestError("Unsupported root flags.", code: 4) }
+        if containedHardlinks { guard linkCounts == expectedLinks else { throw NestError("Private snapshot has a cross-boundary hardlink.", code: 6) } }
+        for (url,before) in identities + [(root,rootStat)] {
+            var after = stat()
+            guard lstat(url.path,&after) == 0, after.st_dev == before.st_dev, after.st_ino == before.st_ino, after.st_mode == before.st_mode,
+                  after.st_size == before.st_size, after.st_mtimespec == before.st_mtimespec, after.st_ctimespec == before.st_ctimespec else { throw NestError("Snapshot source changed during independent readback.", code: 6) }
+        }
+        return Manifest(entries: entries.sorted { $0.path < $1.path }, publicRoot: rootEntry)
+    }
+    static func relativeAttributes(_ url: URL, _ path: String) throws -> [String:String] {
+        do { return try attributes(url) }
+        catch {
+            let e = error as NSError
+            if e.domain == NSPOSIXErrorDomain {
+                let operation = e.userInfo[readOperationErrorKey] as? String ?? "xattr"
+                throw NSError(domain:e.domain,code:e.code,userInfo:[NSLocalizedDescriptionKey:"Cannot inspect snapshot source at \(diagnosticLabel(path)) (\(operation), errno \(e.code)). Source permissions were not changed; data is retained.",readOperationErrorKey:operation])
+            }
+            throw error
+        }
+    }
+    static func children(_ url: URL, path: String) throws -> [URL] {
+        do { return try FileManager.default.contentsOfDirectory(at:url,includingPropertiesForKeys:nil) }
+        catch {
+            var e = error as NSError
+            for _ in 0..<8 { guard let underlying = e.userInfo[NSUnderlyingErrorKey] as? NSError else { break };e = underlying }
+            throw readFailure("Cannot enumerate snapshot at \(diagnosticLabel(path)) (readdir)",e.domain == NSPOSIXErrorDomain ? Int32(e.code) : EIO,syscall:"readdir")
+        }
+    }
+    static func diagnosticLabel(_ value: String) -> String {
+        value.unicodeScalars.prefix(160).map { CharacterSet.controlCharacters.contains($0) ? "?" : String($0) }.joined()
+    }
+    static func mismatchDetail(_ actual: Manifest, _ expected: Manifest) -> String {
+        func detail(_ path: String, _ field: String) -> String { "at \(diagnosticLabel(path)) (\(field))" }
+        for (a, e) in zip(actual.entries, expected.entries) where a != e {
+            if a.path != e.path { return detail(min(a.path, e.path), "field path") }
+            let fields: [(Bool, String)] = [
+                (a.kind != e.kind, "kind"), (a.size != e.size, "size"), (a.mode != e.mode, "mode"),
+                (a.mtimeSeconds != e.mtimeSeconds, "mtimeSeconds"), (a.mtimeNanos != e.mtimeNanos, "mtimeNanos"),
+                (a.checksum != e.checksum, "checksum"), (a.hardlink != e.hardlink, "hardlink"), (a.flags != e.flags, "flags")
+            ]
+            if let field = fields.first(where: { $0.0 }) { return detail(e.path, "field " + field.1) }
+            for name in Set(a.attributes.keys).union(e.attributes.keys).sorted() where a.attributes[name] != e.attributes[name] {
+                return detail(e.path, "xattr " + diagnosticLabel(name))
+            }
+            return detail(e.path, "field attributeBytes")
+        }
+        if actual.entries == expected.entries { return detail(".", "field publicRoot") }
+        let index = min(actual.entries.count, expected.entries.count)
+        let extra = actual.entries.count > index ? actual.entries[index] : expected.entries[index]
+        return detail(extra.path, "field path")
+    }
+    // fcopyfile handles quarantine via qtn APIs, which can change its flags.
+    // Replay only manifest-validated source bytes, using the already-opened
+    // no-follow descriptors. Never synthesize flags or remove an attribute.
+    private static func preserveQuarantine(from source: Int32, to destination: Int32, entry: Entry) throws {
+        let name = "com.apple.quarantine"
+        guard let expected = entry.attributes[name] else { return }
+        func failure(_ reason: String) -> NestError {
+            NestError("Cannot preserve snapshot metadata at \(diagnosticLabel(entry.path)) (xattr \(name); \(reason)). No source files were removed.", code: 6)
+        }
+        func read(_ descriptor: Int32) throws -> Data? {
+            let size = fgetxattr(descriptor, name, nil, 0, 0, 0)
+            if size < 0 && errno == ENOATTR { return nil }
+            guard size >= 0 else { throw failure("read failed, errno \(errno)") }
+            guard size <= 1024 * 1024 else { throw failure("unsupported size") }
+            var data = Data(count: size)
+            guard data.withUnsafeMutableBytes({ fgetxattr(descriptor, name, $0.baseAddress, size, 0, 0) }) == size else {
+                throw failure("attribute changed or read failed")
+            }
+            return data
+        }
+        guard let bytes = try read(source), digest(bytes) == expected else { throw failure("source changed") }
+        if try read(destination) == bytes { return }
+        // fcopyfile may already have made this newly created private copy
+        // read-only. Finish its metadata before restoring that exact mode;
+        // never change the source, ACLs, or any global permission setting.
+        var copied = stat()
+        guard fstat(destination, &copied) == 0, copied.st_uid == getuid() else { throw failure("cannot inspect owned destination") }
+        let mode = copied.st_mode & 0o7777
+        let needsWrite = mode & 0o200 == 0 && (copied.st_mode & S_IFMT == S_IFREG || copied.st_mode & S_IFMT == S_IFDIR)
+        if needsWrite && fchmod(destination, mode | 0o200) != 0 { throw failure("cannot finish private copy metadata, errno \(errno)") }
+        let written = bytes.withUnsafeBytes { fsetxattr(destination, name, $0.baseAddress, bytes.count, 0, 0) }
+        let writeError = errno
+        if needsWrite && fchmod(destination, mode) != 0 { throw failure("cannot restore copied mode, errno \(errno)") }
+        guard written == 0 else {
+            throw failure("exact preservation denied, errno \(writeError)")
+        }
+        guard try read(destination) == bytes else { throw failure("exact preservation not retained") }
+    }
+    // Both copy and recovery finish public-root metadata from already-verified,
+    // no-follow directory descriptors. Darwin's quarantine copy API can rewrite
+    // bytes; replay only the value authenticated by this manifest, then sync.
+    // Rootless historical manifests retain their original metadata contract.
+    static func restorePublicRootMetadata(from source: DirectoryHandle, to destination: DirectoryHandle, manifest: Manifest) throws {
+        guard let rootEntry = manifest.publicRoot else { return }
+        guard fcopyfile(source.fd, destination.fd, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR)) == 0 else {
+            throw NestError("Cannot preserve public root metadata.", code: 6)
+        }
+        try preserveQuarantine(from: source.fd, to: destination.fd, entry: rootEntry)
+        guard fchmod(destination.fd,mode_t(rootEntry.mode)) == 0 else { throw NestError("Cannot finalize public root mode.", code: 6) }
+        try destination.sync()
+    }
+    static func preparePublicRoot(from source: DirectoryHandle, to destination: DirectoryHandle, selected: URL, manifest: Manifest) throws {
+        guard let root = manifest.publicRoot else { throw NestError("Missing public root metadata.", code: 6) }
+        guard fcopyfile(source.fd,destination.fd,nil,copyfile_flags_t(COPYFILE_XATTR)) == 0 else { throw NestError("Cannot copy public root attributes.", code: 6) }
+        try preserveQuarantine(from:source.fd,to:destination.fd,entry:root)
+        guard fchflags(destination.fd,root.flags) == 0, try relativeAttributes(selected,".") == root.attributes else { throw NestError("Public root attribute/flag readback failed.", code: 6) }
+        try destination.sync()
+    }
+    // A legacy manifest that omitted root metadata authenticates only entries.
+    // Observe the readable physical root for THIS new materialization; never
+    // invent historical metadata or rewrite/relabel the legacy revision.
+    static func materializationManifest(_ source: URL, expected: Manifest, context: SourceContext) throws -> Manifest {
+        guard expected.publicRoot == nil else { return expected }
+        let observed = try manifest(source,matching:expected,phase:"legacy-materialization-root",context:context)
+        guard observed.matchesExpected(expected) else { throw NestError("Legacy materialization source changed.", code: 6) }
+        var result = expected;result.publicRoot = observed.publicRoot
+        return result
+    }
+    public static func copyTree(from source: URL, to destination: URL, manifest expected: Manifest, previous: URL? = nil, comparison: Comparison = .checksum, privateStorage: Bool = false, publicationStaging: Bool = false, sourceContext: SourceContext = .original, previousContext: SourceContext = .original) throws {
+        let manifest = try materializationManifest(source,expected:expected.excludingTrashDirectories(),context:sourceContext)
+        if privateStorage { try copyAccessibleTree(from:source,to:destination,manifest:manifest,previous:previous,comparison:comparison,sourceContext:sourceContext,previousContext:previousContext);return }
+        if publicationStaging {
+            try copyAccessibleTree(from:source,to:destination,manifest:manifest,previous:previous,comparison:comparison,sourceContext:sourceContext,previousContext:previousContext)
+            _ = try finalizeModes(destination,manifest:manifest,destination:destination.lastPathComponent)
+            return
+        }
+        let parent = try DirectoryHandle.open(destination.deletingLastPathComponent())
+        guard try !parent.exists(destination.lastPathComponent) else { throw NestError("Export destination already exists.", code: 6) }
+        let name = ".ramnest-materialize-" + UUID().uuidString
+        let container = try parent.createDirectory(name)
+        let staging = destination.deletingLastPathComponent().appendingPathComponent(name).appendingPathComponent("data")
+        try copyAccessibleTree(from:source,to:staging,manifest:manifest,previous:previous,comparison:comparison,sourceContext:sourceContext,previousContext:previousContext)
+        let privateName = ".ramnest-publish-" + UUID().uuidString
+        var intent = PublicationReceipt(manifest:manifest,destination:destination.lastPathComponent,phase:"verified-accessible")
+        intent.privateName = privateName
+        try Store.atomicJSON(intent,staging.deletingLastPathComponent().appendingPathComponent("publication.json"))
+        let pinned = try container.child("data").identity()
+        // Darwin requires owner write on a directory moved between parents.
+        // Transfer the verified 0700 object first, then finalize and publish by
+        // same-parent rename. The random temporary root is itself private 0700.
+        try container.renameNoReplace("data",to:parent,as:privateName)
+        try container.sync();try parent.sync()
+        let privateURL = destination.deletingLastPathComponent().appendingPathComponent(privateName)
+        guard try parent.child(privateName).identity() == pinned else { throw NestError("Publication materialization identity changed.", code: 6) }
+        var receipt = try finalizeModes(privateURL,manifest:manifest,destination:destination.lastPathComponent)
+        receipt.privateName = privateName
+        try Store.atomicJSON(receipt,staging.deletingLastPathComponent().appendingPathComponent("publication.json"))
+        try container.sync()
+        guard try DirectoryHandle.open(destination.deletingLastPathComponent()).identity() == parent.identity() else { throw NestError("Publication parent identity changed; materialization and receipt retained.", code: 6) }
+        try parent.renameNoReplace(privateName,to:parent,as:destination.lastPathComponent)
+        try container.sync();try parent.sync()
+        let published = try parent.entryStat(destination.lastPathComponent)
+        guard Paths.deviceID(published.st_dev) == pinned.device, published.st_ino == pinned.inode,
+              try DirectoryHandle.open(destination.deletingLastPathComponent()).identity() == parent.identity() else { throw NestError("Published materialization identity changed; receipt retained.", code: 6) }
+        receipt.phase = "published"
+        try Store.atomicJSON(receipt,staging.deletingLastPathComponent().appendingPathComponent("publication.json"))
+    }
+    static func copyAccessibleTree(from source: URL, to destination: URL, manifest: Manifest, previous: URL? = nil, comparison: Comparison = .checksum, sourceContext: SourceContext = .original, previousContext: SourceContext = .original, freshExportModes: StorageModes? = nil) throws {
+        // Only adoptExport supplies this capability, after full native receipt
+        // or fresh-normalization validation. It confers no authority on a path.
+        func observe(_ phase: String) throws -> Manifest {
+            if let modes = freshExportModes { return try modes.projecting(scanManifest(source,matching:manifest,phase:phase,containedHardlinks:true)) }
+            return try self.manifest(source,matching:manifest,phase:phase,context:sourceContext)
+        }
+        let before = try observe("copy-source-before")
+        guard before.matchesExpected(manifest) else { throw NestError("Copy source changed \(mismatchDetail(before,manifest)). No source files were removed.", code: 6) }
+        let sourceRoot = try DirectoryHandle.open(source)
+        let previousRoot = try previous.map { try DirectoryHandle.open($0) }
+        let previousManifest = try previous.map { try self.manifest($0,context:previousContext) }
+        let previousEntries = Dictionary(uniqueKeysWithValues: (previousManifest?.entries ?? []).map { ($0.path, $0) })
+        let destinationParent = try DirectoryHandle.open(destination.deletingLastPathComponent())
+        let destinationRoot = try destinationParent.createDirectory(destination.lastPathComponent)
+        let sourceCursor = DirectoryCursor(sourceRoot), destinationCursor = DirectoryCursor(destinationRoot)
+        let previousCursor = previousRoot.map(DirectoryCursor.init)
+        for entry in manifest.entries.sorted(by: { a, b in
+            let ap = a.kind == "directory" ? 0 : a.hardlink == nil ? 1 : 2
+            let bp = b.kind == "directory" ? 0 : b.hardlink == nil ? 1 : 2
+            return ap == bp ? a.path < b.path : ap < bp
+        }) {
+            let (srcParent, srcName) = try sourceCursor.parent(of: entry.path)
+            let (dstParent, dstName) = try destinationCursor.parent(of: entry.path)
+            if entry.kind == "directory" { _ = try dstParent.createDirectory(dstName); continue }
+            if let first = entry.hardlink {
+                let (firstParent, firstName) = try destinationCursor.parent(of: first)
+                guard linkat(firstParent.fd, firstName, dstParent.fd, dstName, 0) == 0 else { throw NestError("Hardlink copy failed.", code: 6) }
+                continue
+            }
+            if entry.kind == "symlink" {
+                var target = [CChar](repeating: 0, count: 4097)
+                let size = readlinkat(srcParent.fd, srcName, &target, 4096)
+                guard size >= 0, size < 4096 else { throw NestError("Cannot copy symlink.", code: 6) }
+                target[size] = 0
+                guard target.withUnsafeBufferPointer({ symlinkat($0.baseAddress!, dstParent.fd, dstName) }) == 0 else { throw NestError("Symlink copy failed.", code: 6) }
+                let src = openat(srcParent.fd, srcName, O_RDONLY | O_SYMLINK | O_CLOEXEC)
+                let dst = openat(dstParent.fd, dstName, O_RDONLY | O_SYMLINK | O_CLOEXEC)
+                guard src >= 0, dst >= 0 else { if src >= 0 { close(src) }; if dst >= 0 { close(dst) }; throw NestError("Cannot preserve symlink metadata.", code: 6) }
+                defer { close(src); close(dst) }
+                let copied = fcopyfile(src, dst, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR))
+                guard copied == 0 else { throw NestError("Symlink metadata copy failed.", code: 6) }
+                guard fchmod(dst,0o700) == 0 else { throw NestError("Cannot set private symlink storage policy.", code: 6) }
+                try preserveQuarantine(from: src, to: dst, entry: entry)
+            } else {
+                var chosenParent = srcParent; var chosenName = srcName
+                // A content digest from this transaction is mandatory in both
+                // comparison modes. Size/mtime alone never authenticates reuse.
+                if let previousCursor, let old = previousEntries[entry.path],
+                   old.kind == "file", old.size == entry.size, old.checksum == entry.checksum,
+                   let (oldParent, oldName) = try? previousCursor.parent(of: entry.path) {
+                    chosenParent = oldParent; chosenName = oldName
+                }
+                let src = openat(chosenParent.fd, chosenName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                let dst = openat(dstParent.fd, dstName, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                guard src >= 0, dst >= 0 else { if src >= 0 { close(src) }; if dst >= 0 { close(dst) }; throw NestError("Cannot open snapshot file.", code: 6) }
+                defer { close(src); close(dst) }
+                try SparseContent.copy(src, to: dst, size: entry.size)
+                let current = openat(srcParent.fd, srcName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                guard current >= 0 else { throw NestError("Cannot read current source metadata.", code: 6) }
+                defer { close(current) }
+                guard fcopyfile(current, dst, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR)) == 0 else { throw NestError("Cannot copy current metadata.", code: 6) }
+                guard fchmod(dst,0o600) == 0 else { throw NestError("Cannot set private file storage policy.", code: 6) }
+                try preserveQuarantine(from: current, to: dst, entry: entry)
+                guard fsync(dst) == 0 else { throw NestError("Snapshot file copy/sync failed: \(entry.path)", code: 6) }
+            }
+        }
+        for entry in manifest.entries.reversed() where entry.kind == "directory" {
+            let (srcParent, name) = try sourceCursor.parent(of: entry.path)
+            let (dstParent, _) = try destinationCursor.parent(of: entry.path)
+            let src = try srcParent.child(name), dst = try dstParent.child(name)
+            guard fcopyfile(src.fd, dst.fd, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR)) == 0 else { throw NestError("Directory metadata copy failed.", code: 6) }
+            guard fchmod(dst.fd,0o700) == 0 else { throw NestError("Cannot set private directory storage policy.", code: 6) }
+            try preserveQuarantine(from: src.fd, to: dst.fd, entry: entry)
+            try dst.sync()
+        }
+        try restorePublicRootMetadata(from: sourceRoot, to: destinationRoot, manifest: manifest)
+        guard fchmod(destinationRoot.fd,0o700) == 0 else { throw NestError("Cannot set private root storage policy.", code: 6) }
+        try destinationRoot.sync(); try destinationParent.sync()
+        let actual = try StorageModes(manifest).projecting(scanManifest(destination, matching: manifest, phase: "copy-readback",containedHardlinks:true))
+        guard actual.matchesExpected(manifest) else { throw NestError("Snapshot verification failed \(mismatchDetail(actual, manifest)). No source files were removed.", code: 6) }
+        try Store.syncDirectory(destination)
+        let after = try observe("copy-source-after")
+        guard after.matchesExpected(manifest) else { throw NestError("Source changed during copy \(mismatchDetail(after,manifest)). No source files were removed.", code: 6) }
+    }
+    public static func dataURL(store: Store, id: UUID, revision: String) throws -> URL {
+        guard UUID(uuidString: revision) != nil else { throw NestError("Invalid snapshot revision.", code: 6) }
+        return try store.volume(id).appendingPathComponent("revisions/\(revision)/data")
+    }
+    public static func verified(store: Store, id: UUID, revision: String) throws -> (URL, Manifest) {
+        let data = try dataURL(store: store, id: id, revision: revision)
+        let revisions = try DirectoryHandle.open(data.deletingLastPathComponent().deletingLastPathComponent())
+        guard try revisions.exists(revision) else { throw NestError("Snapshot revision \(revision) is not retained on disk. RAMNest keeps the latest verified snapshot, with temporary transaction anchors while needed.", code: 6) }
+        let container = try revisions.child(revision)
+        let metadataBefore = try container.entryStat("manifest.json")
+        let containerIdentity = try container.identity()
+        let metadata = try container.readJSON(StoredManifest.self, "manifest.json")
+        try container.requireOwnedDirectory(device:revisions.identity().device,privateMode:true)
+        guard try container.names() == (metadata.storageFormat == 2 ? ["data", "manifest.json", "modes.bin"] : ["data", "manifest.json"]) else { throw NestError("Unexpected snapshot container namespace.", code: 6) }
+        // Keep the full stored record/map immutable; only the returned view is filtered.
+        _ = try checkedModes(data,metadata)
+        let expected = try metadata.logical.excludingTrashDirectories()
+        let actual = try manifest(data, matching: expected, phase: "revision-integrity",context:.managedRevision)
+        guard actual.matchesExpected(expected) else { throw NestError("Snapshot is damaged \(mismatchDetail(actual, expected)). Preserve recovery data and investigate before continuing.", code: 6) }
+        let metadataAfter = try container.entryStat("manifest.json")
+        guard metadataBefore.st_dev == metadataAfter.st_dev, metadataBefore.st_ino == metadataAfter.st_ino,
+              metadataBefore.st_ctimespec == metadataAfter.st_ctimespec, metadataBefore.st_size == metadataAfter.st_size,
+              try revisions.child(revision).identity() == containerIdentity else { throw NestError("Snapshot metadata/container changed during verification.", code: 6) }
+        return (data, expected)
+    }
+    public static func capture(store: Store, folder: Folder, source: URL, previous: String?, sourceContext: SourceContext = .original) throws -> String {
+        let stored = sourceContext == .managedRevision ? try storedMetadata(source) : nil
+        let initial = try manifest(source, maximumLogical: folder.capacity, matching:stored?.logical,phase: "capture-source-before",context:sourceContext)
+        if let stored {
+            let expected = try stored.logical.excludingTrashDirectories()
+            guard initial.matchesExpected(expected) else { throw NestError("Cannot capture a damaged committed source \(mismatchDetail(initial,expected)).", code: 6) }
+        }
+        try initial.preflight(capacity: folder.capacity)
+        let revision = UUID().uuidString
+        let directory = try store.volume(folder.id).appendingPathComponent("revisions/\(revision)")
+        try Store.privateDirectory(directory)
+        let old = try previous.map { try dataURL(store: store, id: folder.id, revision: $0) }
+        try copyTree(from: source, to: directory.appendingPathComponent("data"), manifest: initial, previous: old, comparison: folder.options.comparison, privateStorage: true,sourceContext:sourceContext,previousContext:.managedRevision)
+        let final = try manifest(source, matching: initial, phase: "capture-source-after",context:sourceContext)
+        guard final == initial else { throw NestError("Source changed during snapshot \(mismatchDetail(final, initial)). Close writers and retry. No source files were removed.", code: 6) }
+        let modes = try StorageModes(initial)
+        try modes.write(directory.appendingPathComponent("modes.bin"))
+        try Store.atomicJSON(StoredManifest(initial,modes:modes), directory.appendingPathComponent("manifest.json")); try Store.syncDirectory(directory); try Store.syncDirectory(directory.deletingLastPathComponent())
+        return revision
+    }
+    public static func adoptExport(store: Store, folder: Folder, stage: URL, privateStorage: Bool = false, modeMapDigest: String? = nil) throws -> String {
+        let volume = try store.volume(folder.id)
+        guard stage.deletingLastPathComponent() == volume, stage.lastPathComponent.hasPrefix("stage-"), UUID(uuidString:String(stage.lastPathComponent.dropFirst(6))) != nil else { throw NestError("Invalid fresh export stage.", code: 6) }
+        let modes: StorageModes
+        if privateStorage {
+            let bytes = try StorageModes.read(URL(fileURLWithPath:stage.path+".modes"))
+            guard let modeMapDigest, digest(bytes) == modeMapDigest else { throw NestError("Native original logical-mode receipt is missing or mismatches the fresh export map; stage retained.", code: 6) }
+            modes = try StorageModes(data:bytes)
+        } else {
+            guard modeMapDigest == nil else { throw NestError("Legacy helper/storage receipt mismatch; stage retained.", code: 6) }
+            modes = try StorageModes.normalizeFreshExport(stage,volume:volume)
+        }
+        let manifest = try modes.projecting(scanManifest(stage,phase:"export-independent-readback",containedHardlinks:true))
+        let includedModes = try StorageModes(manifest)
+        let excluded = try excludedDirectoryPaths(stage)
+        let revision = UUID().uuidString
+        let directory = try store.volume(folder.id).appendingPathComponent("revisions/\(revision)")
+        try Store.privateDirectory(directory)
+        let parent = try DirectoryHandle.open(volume), target = try DirectoryHandle.open(directory)
+        if excluded.isEmpty {
+            try parent.renameNoReplace(stage.lastPathComponent,to:target,as:"data")
+            if privateStorage { try parent.renameNoReplace(stage.lastPathComponent+".modes",to:target,as:"modes.bin") }
+            else { try includedModes.write(directory.appendingPathComponent("modes.bin")) }
+        } else {
+            // A running old helper may still export Trash. Copy only the
+            // authenticated included view; leave opaque stage Trash untouched.
+            try copyAccessibleTree(from:stage,to:directory.appendingPathComponent("data"),manifest:manifest,freshExportModes:modes)
+            try includedModes.write(directory.appendingPathComponent("modes.bin"))
+            let warning = "Legacy helper exported excluded RAM Trash. Opaque export retained at " + stage.path
+            try Store.atomicJSON(["stage":stage.path,"reason":warning],URL(fileURLWithPath:stage.path+".trash-retained.json"))
+            FileHandle.standardError.write(Data((warning+"\n").utf8))
+        }
+        guard digest(try StorageModes.read(directory.appendingPathComponent("modes.bin"))) == digest(includedModes.encoded) else { throw NestError("Promoted logical mode map changed; uncommitted revision retained.", code: 6) }
+        try Store.atomicJSON(StoredManifest(manifest,modes:includedModes), directory.appendingPathComponent("manifest.json")); try Store.syncDirectory(directory); try Store.syncDirectory(directory.deletingLastPathComponent());try parent.sync()
+        return revision
+    }
+    // Metadata-only, pinned no-follow walk. Stops at each excluded directory.
+    // Used to preserve opaque disk holdings/legacy stages, never to authenticate
+    // payload or silently classify an unknown filesystem tree as managed.
+    static func excludedDirectoryPaths(_ root: URL) throws -> [String] {
+        let anchor = try DirectoryHandle.open(root), cursor = DirectoryCursor(anchor)
+        let device = try anchor.identity().device
+        var pending = try anchor.names(), result: [String] = []
+        while let path = pending.popLast() {
+            let (parent,name) = try cursor.parent(of:path), st = try parent.entryStat(name)
+            if SnapshotExclusion.directory(name,st.st_mode) { result.append(path);continue }
+            if st.st_mode & S_IFMT == S_IFDIR {
+                guard Paths.deviceID(st.st_dev) == device else { throw NestError("Nested mount in excluded-directory inventory; retained.",code:6) }
+                let child = try parent.child(name)
+                guard try child.identity() == (device,UInt64(st.st_ino)) else { throw NestError("Excluded-directory inventory changed; retained.",code:6) }
+                pending += try child.names().map { path + "/" + $0 }
+            }
+        }
+        return result.sorted()
+    }
+}
+
+enum SnapshotRetention {
+    static func references(_ journal: Journal) -> Set<String> {
+        Set((journal.retiringRevisions ?? []) + [journal.revision, journal.priorRevision, journal.initialRevision, journal.restoreRevision].compactMap { $0 }).union(SiblingCleanup.pins(journal))
+    }
+    static func remember(_ journal: inout Journal) {
+        journal.retiringRevisions = references(journal).sorted()
+    }
+    static func warn(_ error: Error, store: Store, folder: Folder, journal: inout Journal) {
+        let warning = "Snapshot cleanup warning: " + error.localizedDescription
+        // Do not overwrite a newer journal or its recovery error while reporting
+        // a secondary cleanup problem. stderr still reports an unwritable store.
+        if let volume = try? store.managedVolume(folder.id),
+           let current = try? volume.readJSON(Journal.self, "journal.json") {
+            var expected = journal; expected.updated = current.updated
+            if expected == current {
+                journal.cleanupWarning = warning
+                try? store.write(journal, for: folder.id)
+            }
+        }
+        FileHandle.standardError.write(Data((warning + "\n").utf8))
+    }
+    // Caller owns repository.lock and has refreshed the selected/mounted identity.
+    // Deletion is never attempted until both the latest snapshot and the new
+    // durable journal are verified. Failures are reported without failing saves.
+    static func clean(store: Store, folder: Folder, journal: inout Journal, validateSource: () throws -> Void,
+                      beforeSiblingUnlink: ((DirectoryHandle, String) throws -> Void)? = nil) {
+        guard journal.phase == .idle || journal.phase == .mounted,
+              journal.lastError == nil, let latest = journal.revision else { return }
+        do {
+            try validateSource()
+            let volume = try store.managedVolume(folder.id)
+            let revisions = try volume.child("revisions")
+            try revisions.requireOwnedDirectory(device: volume.identity().device, privateMode: true)
+            let path = store.root.path
+            guard !Paths.mounts().contains(where: { $0.path == path || $0.path.hasPrefix(path + "/") }) else { throw NestError("Nested mount in snapshot storage; cleanup skipped.", code: 6) }
+            var durable = try volume.readJSON(Journal.self, "journal.json")
+            var expected = journal; expected.updated = durable.updated
+            guard durable == expected else { throw NestError("Committed journal changed; cleanup skipped.", code: 6) }
+            SiblingCleanup.rememberCompleted(folder, &durable)
+            let completedSource = durable.restoreRevision ?? (folder.options.sync ? latest : nil)
+            var keep = Set([latest])
+            if journal.phase == .mounted {
+                guard journal.populationVerified, let initial = journal.initialRevision else { return }
+                keep.insert(initial)
+                if let restore = journal.restoreRevision { keep.insert(restore) }
+            }
+            var identities: [String: (container: (device: UInt64, inode: UInt64), data: (device: UInt64, inode: UInt64))] = [:]
+            for revision in keep {
+                guard UUID(uuidString: revision)?.uuidString == revision else { throw NestError("Invalid committed revision; cleanup skipped.", code: 6) }
+                let handle = try revisions.child(revision)
+                try handle.requireOwnedDirectory(device: revisions.identity().device, privateMode: true)
+                let data = try handle.child("data")
+                try data.requireOwnedDirectory(device: revisions.identity().device)
+                identities[revision] = try (handle.identity(), data.identity())
+                _ = try Snapshot.verified(store: store, id: folder.id, revision: revision)
+            }
+            let pending = references(durable).subtracting(keep).sorted()
+            durable.retiringRevisions = pending
+            durable.priorRevision = nil
+            if durable.phase == .idle { durable.initialRevision = nil; durable.restoreRevision = nil }
+            if durable.phase == .idle || durable.siblingCleanup == nil { durable.cleanupWarning = nil }
+            try store.write(durable, for: folder.id)
+            journal = durable
+            let current = try store.managedVolume(folder.id).child("revisions")
+            guard try current.identity() == revisions.identity() else { throw NestError("Snapshot storage identity changed; cleanup skipped.", code: 6) }
+            for (revision, identity) in identities {
+                let handle = try revisions.child(revision)
+                guard try handle.identity() == identity.container, try handle.child("data").identity() == identity.data else { throw NestError("Retained snapshot identity changed; cleanup skipped.", code: 6) }
+            }
+            try validateSource()
+            var remaining: [String] = []
+            var warnings = SiblingCleanup.clean(store: store, folder: folder, journal: &journal,
+                sourceRevision: completedSource, validateSource: validateSource, beforeUnlink: beforeSiblingUnlink)
+            let siblingPins = SiblingCleanup.pins(journal)
+            for candidate in pending {
+                if siblingPins.contains(candidate) { remaining.append(candidate); continue }
+                do {
+                    guard UUID(uuidString: candidate)?.uuidString == candidate else { throw NestError("Unrecognized revision reference retained.", code: 6) }
+                    if try revisions.exists(candidate) {
+                        // Verify only journal-linked deletion candidates, never
+                        // scan/hash unrelated history or incomplete captures.
+                        _ = try Snapshot.verified(store: store, id: folder.id, revision: candidate)
+                        try validateSource()
+                        let current = try store.managedVolume(folder.id).child("revisions")
+                        guard try current.identity() == revisions.identity() else { throw NestError("Snapshot storage changed; cleanup skipped.", code: 6) }
+                        try revisions.removeCommittedRevision(candidate)
+                    }
+                } catch { remaining.append(candidate); warnings.append(error.localizedDescription) }
+            }
+            journal.retiringRevisions = remaining.isEmpty ? nil : remaining
+            if !warnings.isEmpty { journal.cleanupWarning = "Snapshot cleanup warning: " + warnings.joined(separator: " ") }
+            try store.write(journal, for: folder.id)
+            if let warning = journal.cleanupWarning { FileHandle.standardError.write(Data((warning + "\n").utf8)) }
+        } catch {
+            warn(error, store: store, folder: folder, journal: &journal)
+        }
+    }
+}
+
+extension timespec: @retroactive Equatable {
+    public static func == (lhs: timespec, rhs: timespec) -> Bool { lhs.tv_sec == rhs.tv_sec && lhs.tv_nsec == rhs.tv_nsec }
+}

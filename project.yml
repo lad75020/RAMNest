@@ -1,0 +1,119 @@
+name: RAMNest
+options:
+  deploymentTarget:
+    macOS: '27.0'
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: '6.0'
+    MACOSX_DEPLOYMENT_TARGET: '27.0'
+    CODE_SIGN_IDENTITY: '-'
+    CODE_SIGN_STYLE: Manual
+    CLANG_MODULE_CACHE_PATH: $(PROJECT_DIR)/.build/xcode-cache
+    SWIFT_MODULE_CACHE_PATH: $(PROJECT_DIR)/.build/xcode-cache
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  RAMNestCore:
+    type: library.static
+    platform: macOS
+    sources: [Sources/RAMNestCore]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: sh.ramnest.core
+        PRODUCT_NAME: RAMNestCore
+        DEFINES_MODULE: YES
+        SWIFT_INSTALL_OBJC_HEADER: NO
+  ramnest:
+    type: tool
+    platform: macOS
+    sources: [Sources/RAMNestCLI]
+    dependencies:
+      - target: RAMNestCore
+  RAMNest:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/RAMNestApp
+      - path: resources/Assets.xcassets
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: sh.ramnest.app
+        INFOPLIST_FILE: resources/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - target: RAMNestCore
+      - target: ramnest
+        link: false
+    preBuildScripts:
+      - name: Rebuild native helper from current source
+        basedOnDependencyAnalysis: false
+        script: |
+          native_config=RelWithDebInfo
+          if [ "$CONFIGURATION" = Debug ]; then native_config=Debug; fi
+          /bin/bash "$PROJECT_DIR/scripts/build-native.sh" "$TEMP_DIR/ramnest-native-$CONFIGURATION" "$native_config" ramnest-helper
+        inputFiles:
+          - $(PROJECT_DIR)/Native
+          - $(PROJECT_DIR)/scripts/native-provenance.py
+          - $(PROJECT_DIR)/Native/MemoryFS.cpp
+          - $(PROJECT_DIR)/Native/MemoryFS.hpp
+          - $(PROJECT_DIR)/Native/StorageModes.hpp
+          - $(PROJECT_DIR)/Native/TrashExclusionTests.cpp
+          - $(PROJECT_DIR)/Native/StorageFormatFixture.cpp
+          - $(PROJECT_DIR)/Native/StorageFormatTests.cpp
+          - $(PROJECT_DIR)/Native/StorageProtocolFixture.cpp
+          - $(PROJECT_DIR)/Native/Helper.cpp
+          - $(PROJECT_DIR)/Native/CMakeLists.txt
+          - $(PROJECT_DIR)/Native/AttributeAbsenceTests.cpp
+          - $(PROJECT_DIR)/Native/CallbackTests.cpp
+          - $(PROJECT_DIR)/Native/CompressionTests.cpp
+          - $(PROJECT_DIR)/Native/ControlSocketFixtures.hpp
+          - $(PROJECT_DIR)/Native/ControlTests.cpp
+          - $(PROJECT_DIR)/Native/EngineProtocolFixture.cpp
+          - $(PROJECT_DIR)/Native/FollowupTests.cpp
+          - $(PROJECT_DIR)/Native/SparseExtentTests.cpp
+          - $(PROJECT_DIR)/Native/FootprintTests.cpp
+          - $(PROJECT_DIR)/Native/IncrementalTests.cpp
+          - $(PROJECT_DIR)/Native/MemoryTests.cpp
+          - $(PROJECT_DIR)/Native/PerformanceContracts.cpp
+          - $(PROJECT_DIR)/Native/ReviewRegressionTests.cpp
+          - $(PROJECT_DIR)/Native/ScalingBench.cpp
+          - $(PROJECT_DIR)/Native/StackTests.hpp
+          - $(PROJECT_DIR)/scripts/build-native.sh
+        outputFiles:
+          - $(TEMP_DIR)/ramnest-native-$(CONFIGURATION)
+          - $(TEMP_DIR)/ramnest-native-$(CONFIGURATION)/ramnest-helper
+          - $(TEMP_DIR)/ramnest-native-$(CONFIGURATION)/provenance.json
+    postBuildScripts:
+      - name: Embed freshly rebuilt private helper and CLI
+        script: |
+          mkdir -p "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers" "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Resources"
+          cp "$TEMP_DIR/ramnest-native-$CONFIGURATION/ramnest-helper" "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers/"
+          cp "$TEMP_DIR/ramnest-native-$CONFIGURATION/provenance.json" "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Resources/native-provenance.json"
+          cp "$BUILT_PRODUCTS_DIR/ramnest" "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers/"
+        inputFiles:
+          - $(TEMP_DIR)/ramnest-native-$(CONFIGURATION)/ramnest-helper
+          - $(TEMP_DIR)/ramnest-native-$(CONFIGURATION)/provenance.json
+          - $(BUILT_PRODUCTS_DIR)/ramnest
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/ramnest-helper
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/ramnest
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/native-provenance.json
+  RAMNestCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [Tests/RAMNestCoreTests]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: sh.ramnest.tests
+    dependencies:
+      - target: RAMNestCore
+schemes:
+  RAMNest:
+    build:
+      targets:
+        RAMNest: all
+        RAMNestCoreTests: [test]
+    test:
+      targets: [RAMNestCoreTests]
