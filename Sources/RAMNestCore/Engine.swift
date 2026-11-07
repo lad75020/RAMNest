@@ -4,6 +4,7 @@ import Darwin
 // A narrow session boundary lets owned fixtures exercise coordinator behavior
 // without mounting a filesystem or launching a native helper.
 struct EngineSession {
+    var fsKitMountRoot: URL = FSKitLinks.productionRoot
     var beforeVolumeLock: ((UUID) throws -> Void)?
     var unmount: (String) throws -> Void = { _ = try Control.run("/sbin/umount", [$0]) }
     var beforeCleanupUnlink: ((DirectoryHandle, String) throws -> Void)?
@@ -15,7 +16,8 @@ struct EngineSession {
     var mountedIdentity: (Folder, Journal) -> Bool = { folder, journal in
         guard let device = journal.mountedDevice else { return false }
         var st = stat()
-        return lstat(folder.path, &st) == 0 && Paths.deviceID(st.st_dev) == device && Paths.mounts().contains { $0.path == folder.path }
+        let path = journal.fsKitLink?.mountPath ?? folder.path
+        return lstat(path, &st) == 0 && Paths.deviceID(st.st_dev) == device && Paths.mounts().contains { $0.path == path }
     }
 }
 
@@ -155,7 +157,7 @@ public final class Engine: @unchecked Sendable {
                 let j = try store.journal(folder.id)
                 let live = try? session.status(j, folder.id)
                 let metrics = j.socket.flatMap { try? Control.request($0, "metrics", timeout: 2) }?.compactMap(UInt64.init) ?? []
-                let mounted = Paths.mounts().contains { $0.path == folder.path } || (live?.mounted == true && mountedIdentity(folder, j))
+                let mounted = Paths.mounts().contains { $0.path == (j.fsKitLink?.mountPath ?? folder.path) } || (live?.mounted == true && mountedIdentity(folder, j))
                 return FolderStatus(folder: folder, journal: j, connected: live != nil, mounted: mounted, used: live?.used ?? 0, contentBytes: metrics.count == 4 ? metrics[1] : 0, payloadBytes: metrics.count == 4 ? metrics[2] : 0, mappedBytes: metrics.count == 4 ? metrics[3] : 0, backingSavingsFraction: metrics.count == 4 && metrics[0] > 0 ? max(0, 1 - Double(metrics[3]) / Double(metrics[0])) : 0, helperActive: live?.active == true && mountedIdentity(folder, j))
         }
     }
@@ -165,7 +167,25 @@ public final class Engine: @unchecked Sendable {
         try session.beforeVolumeLock?(initial.id)
         return try store.volumeLocked(initial.id) {
             let current = try store.locked { try store.resolve(initial.id.uuidString, config: store.load()) }
-            guard current.id == initial.id, current.path == initial.path, current.device == initial.device, current.inode == initial.inode else { throw NestError("Folder configuration changed.", code: 6) }
+            guard current.id == initial.id, current.path == initial.path else { throw NestError("Folder configuration changed.", code: 6) }
+            if current.device != initial.device || current.inode != initial.inode {
+                // A helper can finish restoration while this coordinator waits
+                // for the volume lock. Accept only its durable old-to-new root
+                // receipt, never an arbitrary configuration or path replacement.
+                let receipt = try store.journal(current.id)
+                guard let layout = receipt.fsKitLink,
+                      receipt.backend == .fskit, receipt.session == layout.session,
+                      receipt.populationVerified, layout.folderID == current.id,
+                      layout.originalPath == current.path, layout.stage == .restored,
+                      layout.restoration == .checkpoint,
+                      layout.source.device == initial.device, layout.source.inode == initial.inode,
+                      layout.restored?.device == current.device, layout.restored?.inode == current.inode else {
+                    throw NestError("Folder configuration changed.", code: 6)
+                }
+                _ = try FSKitLinks.parent(layout, folder: current, root: session.fsKitMountRoot)
+                _ = try FSKitLinks.root(layout)
+                try Paths.checkedIdentity(current)
+            }
             return try operation(current)
         }
     }
@@ -221,10 +241,22 @@ public final class Engine: @unchecked Sendable {
         }
     }
     public func mountedIdentity(_ folder: Folder, _ journal: Journal) -> Bool {
-        session.mountedIdentity(folder, journal)
+        if let layout = journal.fsKitLink {
+            guard layout.stage == .linked,
+                  let parent = try? FSKitLinks.parent(layout, folder: folder, root: session.fsKitMountRoot),
+                  (try? FSKitLinks.root(layout)) != nil,
+                  (try? FSKitLinks.verifyLink(layout, parent: parent)) != nil else { return false }
+        }
+        return session.mountedIdentity(folder, journal)
     }
-    private func requireLive(_ folder: Folder, _ j: Journal) throws -> HelperStatus {
+    private func requireLive(_ folder: Folder, _ j: Journal, allowUnpublished: Bool = false) throws -> HelperStatus {
         let status = try session.status(j, folder.id)
+        if allowUnpublished, !j.populationVerified, let layout = j.fsKitLink {
+            _ = try FSKitLinks.parent(layout, folder: folder, root: session.fsKitMountRoot)
+            _ = try FSKitLinks.root(layout)
+            guard status.mounted, !status.active, session.mountedIdentity(folder, j) else { throw NestError("Guarded physical FSKit identity is uncertain; RAM retained.", code: 6) }
+            return status
+        }
         guard status.mounted, mountedIdentity(folder, j) else { throw NestError("Mounted identity is uncertain. Recover or export before continuing.", code: 6) }
         return status
     }
@@ -234,6 +266,10 @@ public final class Engine: @unchecked Sendable {
         SnapshotRetention.clean(store: store, folder: folder, journal: &journal, validateSource: {
             if pinned.phase == .mounted { _ = try self.requireLive(folder, pinned) }
             else {
+                if let layout = pinned.fsKitLink {
+                    _ = try FSKitLinks.parent(layout, folder: folder, root: self.session.fsKitMountRoot)
+                    guard layout.stage == .restored, layout.mountReleased else { throw NestError("FSKit restore cleanup is not committed.", code: 6) }
+                }
                 guard !Paths.mounts().contains(where: { $0.path == folder.path || $0.path.hasPrefix(folder.path + "/") }) else { throw NestError("Selected mount identity changed; cleanup skipped.", code: 6) }
                 try Paths.checkedIdentity(folder)
             }
@@ -241,7 +277,8 @@ public final class Engine: @unchecked Sendable {
     }
     func helperArguments(_ folder: Folder, journal: Journal, source: URL) throws -> [String] {
         guard let backend = journal.backend, let socket = journal.socket else { throw NestError("Missing prepared session backend or socket.", code: 6) }
-        return ["--id", folder.id.uuidString, "--volume", try store.volume(folder.id).path, "--mount", folder.path, "--source", source.path, "--size", String(folder.capacity), "--socket", socket, "--cli", cli.path, "--store", store.root.path, "--nobrowse", String(folder.options.nobrowse), "--compression", String(folder.options.compression), "--backend", backend.rawValue]
+        if let layout = journal.fsKitLink { _ = try FSKitLinks.parent(layout, folder: folder, root: session.fsKitMountRoot); _ = try FSKitLinks.root(layout) }
+        return ["--id", folder.id.uuidString, "--volume", try store.volume(folder.id).path, "--mount", journal.fsKitLink?.mountPath ?? folder.path, "--source", source.path, "--size", String(folder.capacity), "--socket", socket, "--cli", cli.path, "--store", store.root.path, "--nobrowse", String(folder.options.nobrowse), "--compression", String(folder.options.compression), "--backend", backend.rawValue]
     }
     public func mount(_ ref: String) throws {
         try volumeTransaction(ref) { current in
@@ -251,16 +288,29 @@ public final class Engine: @unchecked Sendable {
                 if !status.active {
                     guard let revision = j.initialRevision else { throw NestError("Missing verified population revision.", code: 6) }
                     let (_, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision)
-                    guard try Snapshot.manifest(URL(fileURLWithPath: f.path), matching: expected).matchesExpected(expected) else { throw NestError("Guarded mount changed. Recovery required.", code: 6) }
+                    guard try Snapshot.manifest(URL(fileURLWithPath: j.fsKitLink?.mountPath ?? f.path), matching: expected).matchesExpected(expected) else { throw NestError("Guarded mount changed. Recovery required.", code: 6) }
+                    if let layout = j.fsKitLink {
+                        let parent = try FSKitLinks.parent(layout, folder: f, root: session.fsKitMountRoot)
+                        try layout.source.verify(FSKitLinks.holding(layout, parent: parent).child("data"))
+                        guard try Snapshot.manifest(layout.originalDataURL, matching: expected).matchesExpected(expected) else { throw NestError("Original holding changed before resumed activation; RAM remains guarded.", code: 6) }
+                    }
                     _ = try session.request(j.socket!, "activate")
                 }
                 cleanSnapshots(f, &j)
                 return
             }
             guard j.phase == .idle else { throw NestError("Unclean session requires explicit recovery before mounting. Use recover or export.", code: 6) }
+            // Idle is written only after the new inode/bookmark and internal
+            // reservation cleanup commit. Its old layout must not prevent a
+            // later legitimate bookmark relocation of that restored inode.
+            if let layout = j.fsKitLink {
+                guard layout.stage == .restored, layout.mountReleased,
+                      layout.restored?.device == f.device, layout.restored?.inode == f.inode else { throw NestError("Incomplete FSKit identity transition; recover first.", code: 6) }
+            }
             // Preserve completed-session provenance before resetting any refs,
             // even if cleanup cannot currently validate a missing old snapshot.
             SiblingCleanup.rememberCompleted(f, &j)
+            j.fsKitLink = nil
             try store.write(j, for: f.id)
             cleanSnapshots(f, &j)
             f = try Paths.resolveBookmark(f)
@@ -276,6 +326,12 @@ public final class Engine: @unchecked Sendable {
             j.restoreRevision = nil
             j.phase = .preparing; j.lastError = nil; j.session = UUID(); j.backend = config.backend; j.mountedDevice = nil; j.populationVerified = false; j.initialRevision = nil; j.restoreStage = nil; j.restoredEntries = []; j.evacuatedEntries = []
             j.startupProtocol = nil; j.startupHelperPID = nil; j.startupRetired = nil
+            j.fsKitLink = nil
+            // Collision/reservation failure occurs before source capture or evacuation.
+            if config.backend == .fskit {
+                j.restoreStageDevice = nil; j.restoreStageInode = nil; j.restoreDataDevice = nil; j.restoreDataInode = nil; j.publicationReceipt = nil
+                j.fsKitLink = try FSKitLinks.reserve(f, session: j.session!, root: session.fsKitMountRoot)
+            }
             try store.write(j, for: f.id)
             var helperStarted = false
             var guardedStartup = false
@@ -291,6 +347,7 @@ public final class Engine: @unchecked Sendable {
                     guard try Control.run(helper.path,["--storage-capabilities"]).trimmingCharacters(in:.whitespacesAndNewlines) == "private-storage-v2" else { throw NestError("Helper does not support private snapshot storage format 2. Originals retained.", code: 6) }
                 }
                 guardedStartup = try GuardedPopulationStartup.negotiate { try Control.run(helper.path, ["--startup-capabilities"]) }
+                guard j.fsKitLink == nil || guardedStartup else { throw NestError("Internal FSKit layout requires guarded pre-mount population. Originals retained.", code: 6) }
                 let (sourceHandle,original) = try evacuateOriginal(f,journal:&j,expected:manifest)
                 j.phase = .mounting
                 j.socket = try Paths.socketDirectory(for: store).appendingPathComponent("\(j.session!.uuidString).sock").path
@@ -322,8 +379,8 @@ public final class Engine: @unchecked Sendable {
             } catch {
                 j.lastError = error.localizedDescription; j.phase = .recoveryRequired; try store.write(j, for: f.id)
                 // Roll back a failure before mount; any mounted/uncertain session remains gated.
-                if !Paths.mounts().contains(where: { $0.path == f.path }), !helperStarted { try? rollbackInitial(f, journal: &j) }
-                else if guardedStartup, !j.populationVerified, !Paths.mounts().contains(where: { $0.path == f.path }) {
+                if !Paths.mounts().contains(where: { $0.path == (j.fsKitLink?.mountPath ?? f.path) }), !helperStarted { try? rollbackInitial(f, journal: &j) }
+                else if guardedStartup, !j.populationVerified, !Paths.mounts().contains(where: { $0.path == (j.fsKitLink?.mountPath ?? f.path) }) {
                     // Seal first: an unmounted status alone races fuse_main.
                     // Failure/uncertainty at any step retains originals + guard.
                     do {
@@ -355,9 +412,10 @@ public final class Engine: @unchecked Sendable {
         for _ in 0..<150 {
             if let status = try? session.status(journal, folder.id) {
                 if let pid { guard status.pid == pid, !status.active else { throw NestError("Guarded mount identity/state changed.", code: 6) } }
-                if status.mounted, Paths.mounts().contains(where: { $0.path == folder.path }) {
+                let path = journal.fsKitLink?.mountPath ?? folder.path
+                if status.mounted, Paths.mounts().contains(where: { $0.path == path }) {
                     var st = stat()
-                    if lstat(folder.path, &st) == 0 && Paths.deviceID(st.st_dev) != folder.device { return Paths.deviceID(st.st_dev) }
+                    if lstat(path, &st) == 0 && Paths.deviceID(st.st_dev) != (journal.fsKitLink?.mountpoint.device ?? folder.device) { return Paths.deviceID(st.st_dev) }
                 }
             }
             session.sleep(0.1)
@@ -378,6 +436,7 @@ public final class Engine: @unchecked Sendable {
     }
     // Shared by the real mount coordinator and owned crash/lifecycle tests.
     func evacuateOriginal(_ f: Folder, journal j: inout Journal, expected: Manifest) throws -> (DirectoryHandle,URL) {
+        if j.fsKitLink != nil { return try evacuateLinkedOriginal(f, journal: &j, expected: expected) }
         try Paths.checkedIdentity(f)
         let original = URL(fileURLWithPath: f.path).deletingLastPathComponent().appendingPathComponent(".ramnest-\(f.id.uuidString)-\(j.session!.uuidString).original")
         let parentHandle = try DirectoryHandle.open(original.deletingLastPathComponent())
@@ -407,10 +466,20 @@ public final class Engine: @unchecked Sendable {
     func verifyAndActivatePopulation(_ f: Folder, journal j: inout Journal, expected: Manifest,
                                      source: DirectoryHandle, original: URL) throws {
         do {
-            try PopulationReadiness.verify(expected: expected, read: { if let read = session.populationRead { return try read(URL(fileURLWithPath: f.path)) }; return try Snapshot.manifest(URL(fileURLWithPath: f.path), matching: expected) },
+            let physical = URL(fileURLWithPath: j.fsKitLink?.mountPath ?? f.path)
+            try PopulationReadiness.verify(expected: expected, read: { if let read = session.populationRead { return try read(physical) }; return try Snapshot.manifest(physical, matching: expected) },
                                            sleep: session.sleep, uptime: session.uptime,
                                            missingFlagsMask: (j.backend == .fskit || j.backend == .nfs) ? UInt32(UF_HIDDEN | UF_NODUMP) : 0)
-            guard try source.names().isEmpty, try Snapshot.manifest(original, matching: expected).contentsMatchExpected(expected) else { throw NestError("Original files changed during mount. RAM writes remain guarded; both copies retained for explicit recovery.", code: 6) }
+            if let layout = j.fsKitLink {
+                try layout.source.verify(source)
+                let parent = try FSKitLinks.parent(layout, folder: f, root: session.fsKitMountRoot)
+                try layout.source.verify(FSKitLinks.holding(layout, parent: parent).child("data"))
+                guard original == layout.originalDataURL else { throw NestError("FSKit original data path changed; retained.", code: 6) }
+                try layout.source.verify(DirectoryHandle.open(original))
+            } else if try !source.names().isEmpty { throw NestError("Original namespace changed during mount.", code: 6) }
+            let originalManifest = try Snapshot.manifest(original, matching: expected)
+            guard j.fsKitLink != nil ? originalManifest.matchesExpected(expected) : originalManifest.contentsMatchExpected(expected) else { throw NestError("Original files changed during mount. RAM writes remain guarded; both copies retained for explicit recovery.", code: 6) }
+            if j.fsKitLink != nil { try publishOriginalLink(f, journal: &j) }
             j.populationVerified = true; j.phase = .mounted; try store.write(j, for: f.id)
             _ = try session.request(j.socket!, "activate")
         } catch {
@@ -425,6 +494,7 @@ public final class Engine: @unchecked Sendable {
         guard j.populationVerified || j.startupProtocol == nil || j.startupRetired == true else {
             throw NestError("Guarded startup retirement is unproven. Original files and snapshot retained.", code: 6)
         }
+        if j.fsKitLink != nil { try restoreLinkedOriginal(f, journal: &j, temporary: true); return }
         try Paths.checkedIdentity(f)
         guard let revision = j.initialRevision else { j.phase = .idle; try store.write(j, for: f.id); return }
         let (_, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision)
@@ -536,7 +606,8 @@ public final class Engine: @unchecked Sendable {
     public func busyProcesses(_ ref: String) throws -> String {
         let f = try folder(ref)
         // lsof may return 1 for an empty set. It never terminates anything.
-        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof"); p.arguments = ["-n", "-P", "+f", "--", f.path]
+        let j = try store.journal(f.id)
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof"); p.arguments = ["-n", "-P", "+f", "--", j.fsKitLink?.mountPath ?? f.path]
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
         try p.run(); let data = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
         return String(decoding: data, as: UTF8.self)
@@ -544,9 +615,10 @@ public final class Engine: @unchecked Sendable {
     // A crash after this durable write can only cause another verified export.
     // If publication/sync fails we deliberately leave the helper frozen.
     private func invalidateBeforeThaw(_ f: Folder, journal j: inout Journal, failure: Error) throws {
-        j.quiescedRevision = nil; j.quiescedSession = nil; j.quiescedHelperPID = nil; j.quiescedNativeInstance = nil; j.phase = .mounted; j.lastError = failure.localizedDescription
+        let guardedLink = j.fsKitLink != nil && !j.populationVerified
+        j.quiescedRevision = nil; j.quiescedSession = nil; j.quiescedHelperPID = nil; j.quiescedNativeInstance = nil; j.phase = guardedLink ? .recoveryRequired : .mounted; j.lastError = failure.localizedDescription
         try store.write(j, for: f.id)
-        if let socket = j.socket { _ = try session.request(socket, "thaw") }
+        if !guardedLink, let socket = j.socket { _ = try session.request(socket, "thaw") }
     }
     public func unmount(_ ref: String, ignoreBusy: Bool = false) throws {
         let bound = try folder(ref)
@@ -554,10 +626,16 @@ public final class Engine: @unchecked Sendable {
         let f = try volumeTransaction(bound.id.uuidString) { f in
             var j = try store.journal(f.id)
             if j.phase == .idle { return f }
-            _ = try requireLive(f, j)
+            _ = try requireLive(f, j, allowUnpublished: true)
             guard j.phase == .mounted || j.phase == .recoveryRequired else { throw NestError("Volume has an operation pending; recover first.", code: 6) }
             do {
-                if f.options.sync { _ = try exportRAM(f, &j, quiesce: true); j.restoreRevision = j.revision }
+                if j.fsKitLink != nil, !j.populationVerified {
+                    // requireLive bound an inactive guarded tree. It is already
+                    // frozen; Helper deliberately rejects active-only freeze
+                    // before activation. Eject it without exporting RAM changes.
+                    j.restoreRevision = j.initialRevision
+                }
+                else if f.options.sync { _ = try exportRAM(f, &j, quiesce: true); j.restoreRevision = j.revision }
                 else { _ = try session.request(j.socket!, "freeze"); j.restoreRevision = j.initialRevision }
                 j.phase = .ejecting; try store.write(j, for: f.id)
             } catch {
@@ -568,7 +646,7 @@ public final class Engine: @unchecked Sendable {
         }
         let j = try store.journal(f.id)
         if j.phase == .idle { return }
-        do { try session.unmount(f.path) }
+        do { try session.unmount(j.fsKitLink?.mountPath ?? f.path) }
         catch {
             try volumeTransaction(f.id.uuidString) { currentFolder in
                 var current = try store.journal(currentFolder.id)
@@ -579,7 +657,9 @@ public final class Engine: @unchecked Sendable {
         // The helper also calls finalize after external eject. Both serialize on repository.lock.
         for _ in 0..<100 {
             let current = try store.journal(f.id)
-            if current.phase == .idle { return }
+            // Idle can be published while the helper still owns the volume
+            // lock for cleanup. Finalize below must cross that lock boundary.
+            if current.phase == .idle { break }
             if (try? session.status(current, f.id).mounted) == false { break }
             Thread.sleep(forTimeInterval: 0.1)
         }
@@ -588,8 +668,8 @@ public final class Engine: @unchecked Sendable {
     public func finalize(_ ref: String) throws {
         try volumeTransaction(ref) { f in
             var j = try store.journal(f.id)
-            if j.phase == .idle { if let socket = j.socket { _ = try? session.request(socket, "retire") }; cleanSnapshots(f, &j); return }
-            guard !Paths.mounts().contains(where: { $0.path == f.path }) else { throw NestError("Volume still mounted; restore is blocked.", code: 6) }
+            if j.phase == .idle { if j.fsKitLink != nil { try finishLinkedRestore(f, journal: &j) }; if let socket = j.socket { _ = try? session.request(socket, "retire") }; cleanSnapshots(try refreshedFolder(f), &j); return }
+            guard !Paths.mounts().contains(where: { $0.path == (j.fsKitLink?.mountPath ?? f.path) }) else { throw NestError("Volume still mounted; restore is blocked.", code: 6) }
             do {
                 if !j.populationVerified {
                     if j.startupProtocol != nil, j.startupRetired != true {
@@ -617,10 +697,11 @@ public final class Engine: @unchecked Sendable {
                 if let socket = j.socket { _ = try? session.request(socket, "retire") }
                 j.socket = nil; try store.write(j, for: f.id)
             } catch { j.lastError = error.localizedDescription; try store.write(j, for: f.id); throw error }
-            cleanSnapshots(f, &j)
+            cleanSnapshots(try refreshedFolder(f), &j)
         }
     }
     private func restore(_ f: Folder, journal j: inout Journal) throws {
+        if j.fsKitLink != nil { try restoreLinkedOriginal(f, journal: &j, temporary: false); return }
         try Paths.checkedIdentity(f)
         guard let revision = j.restoreRevision ?? j.revision else { throw NestError("No committed snapshot. Export originals instead.", code: 6) }
         let (source, authenticated) = try Snapshot.verified(store: store, id: f.id, revision: revision)
@@ -841,8 +922,8 @@ public final class Engine: @unchecked Sendable {
         }
         try volumeTransaction(f.id.uuidString) { f in
             var j = try store.journal(f.id)
-            guard !Paths.mounts().contains(where: { $0.path == f.path }) else { throw NestError("An orphaned mount still exists. Unmount it on the host before recovery.", code: 6) }
-            if j.phase == .idle { cleanSnapshots(f, &j); return }
+            guard !Paths.mounts().contains(where: { $0.path == (j.fsKitLink?.mountPath ?? f.path) }) else { throw NestError("An orphaned mount still exists. Unmount it on the host before recovery.", code: 6) }
+            if j.phase == .idle { if j.fsKitLink != nil { try finishLinkedRestore(f, journal: &j) }; cleanSnapshots(try refreshedFolder(f), &j); return }
             if !j.populationVerified || !f.options.sync { try rollbackInitial(f, journal: &j) }
             else {
                 SnapshotRetention.remember(&j)
@@ -851,14 +932,26 @@ public final class Engine: @unchecked Sendable {
                 try store.write(j, for: f.id); try restore(f, journal: &j)
             }
             j.socket = nil; try store.write(j, for: f.id)
-            cleanSnapshots(f, &j)
+            cleanSnapshots(try refreshedFolder(f), &j)
         }
     }
     public func export(_ ref: String, destination: URL, revision: String? = nil, live: Bool = false) throws {
         try volumeTransaction(ref) { f in
             var j = try store.journal(f.id)
             let selected: String
-            if live { _ = try session.status(j, f.id); selected = try exportRAM(f, &j, quiesce: false) }
+            if live {
+                let status = try session.status(j, f.id)
+                if let layout = j.fsKitLink {
+                    // Rescue export mutates only private snapshot storage. A
+                    // disconnected source or replaced public link must not
+                    // prevent exporting an otherwise bound physical helper.
+                    guard layout.folderID == f.id, layout.originalPath == f.path,
+                          layout.mountRoot == session.fsKitMountRoot.path, j.populationVerified else { throw NestError("Unverified FSKit RAM cannot be exported as live data.", code: 6) }
+                    _ = try FSKitLinks.root(layout)
+                    if status.mounted, !session.mountedIdentity(f, j) { throw NestError("Physical FSKit mount identity changed; live export blocked.", code: 6) }
+                }
+                selected = try exportRAM(f, &j, quiesce: false)
+            }
             else if let candidate = revision ?? j.revision { selected = candidate }
             else { throw NestError("No snapshot exists yet.", code: 6) }
             let (data, manifest) = try Snapshot.verified(store: store, id: f.id, revision: selected)
@@ -902,5 +995,219 @@ public final class Engine: @unchecked Sendable {
             }
             try store.locked { var latest = try store.load(); latest.folders.removeAll { $0.id == f.id }; try store.save(latest) }
         }
+    }
+
+    private func refreshedFolder(_ folder: Folder) throws -> Folder {
+        try store.locked { try store.resolve(folder.id.uuidString, config: store.load()) }
+    }
+
+    func evacuateLinkedOriginal(_ f: Folder, journal j: inout Journal, expected: Manifest) throws -> (DirectoryHandle, URL) {
+        guard var layout = j.fsKitLink, layout.stage == .reserved else { throw NestError("Unexpected FSKit evacuation stage.", code: 6) }
+        let parent = try FSKitLinks.parent(layout, folder: f, root: session.fsKitMountRoot)
+        let root = try FSKitLinks.root(layout)
+        try layout.mountpoint.verify(root.child(URL(fileURLWithPath: layout.mountPath).lastPathComponent))
+        let selected = URL(fileURLWithPath: f.path), holding = URL(fileURLWithPath: layout.holdingPath)
+        let source = try parent.child(selected.lastPathComponent)
+        try layout.source.verify(source)
+        guard try Snapshot.manifest(selected, matching: expected).matchesExpected(expected),
+              try !parent.exists(holding.lastPathComponent) else { throw NestError("Source changed or original holding collision; retained.", code: 6) }
+        // The wrapper is private; the original directory is never chmod-ed.
+        // A crash before this identity checkpoint leaves an unknown wrapper
+        // that recovery must retain rather than adopt by its generated name.
+        let wrapper = try parent.createDirectory(holding.lastPathComponent)
+        try FSKitLinks.requirePrivateDirectory(wrapper, device: layout.parent.device)
+        let wrapperIdentity = try FSKitLinkLayout.Identity(wrapper.identity())
+        layout.holding = wrapperIdentity
+        j.evacuation = holding.path; j.evacuationDevice = wrapperIdentity.device; j.evacuationInode = wrapperIdentity.inode
+        j.evacuatedEntries = try source.names()
+        layout.stage = .evacuating; j.fsKitLink = layout; j.phase = .evacuated
+        try wrapper.sync(); try parent.sync()
+        try store.write(j, for: f.id)
+        try layout.parent.verify(DirectoryHandle.open(selected.deletingLastPathComponent()))
+        try layout.source.verify(parent.child(selected.lastPathComponent))
+        _ = try FSKitLinks.holding(layout, parent: parent)
+        try parent.renameNoReplace(selected.lastPathComponent, to: wrapper, as: "data")
+        try wrapper.sync(); try parent.sync()
+        try layout.source.verify(wrapper.child("data"))
+        guard try Snapshot.manifest(layout.originalDataURL, matching: expected).matchesExpected(expected) else { throw NestError("Renamed original changed; retained.", code: 6) }
+        layout.stage = .evacuated; j.fsKitLink = layout; try store.write(j, for: f.id)
+        return (source, layout.originalDataURL)
+    }
+
+    func publishOriginalLink(_ f: Folder, journal j: inout Journal) throws {
+        guard var layout = j.fsKitLink, layout.stage == .evacuated else { throw NestError("Unexpected FSKit link publication stage.", code: 6) }
+        let parent = try FSKitLinks.parent(layout, folder: f, root: session.fsKitMountRoot)
+        _ = try FSKitLinks.root(layout)
+        try layout.source.verify(FSKitLinks.holding(layout, parent: parent).child("data"))
+        let staged = URL(fileURLWithPath: layout.linkStagePath).lastPathComponent
+        let selected = URL(fileURLWithPath: layout.originalPath).lastPathComponent
+        guard try !parent.exists(selected), try !parent.exists(staged),
+              symlinkat(layout.mountPath, parent.fd, staged) == 0 else { throw NestError("Cannot reserve exact original-path symlink; retained.", code: 6) }
+        try parent.sync()
+        let st = try parent.entryStat(staged)
+        layout.link = .init((Paths.deviceID(st.st_dev), UInt64(st.st_ino)))
+        layout.stage = .linking; j.fsKitLink = layout; try store.write(j, for: f.id)
+        try FSKitLinks.verifyLink(layout, parent: parent, name: staged)
+        try layout.parent.verify(DirectoryHandle.open(URL(fileURLWithPath: f.path).deletingLastPathComponent()))
+        try parent.renameNoReplace(staged, to: parent, as: selected)
+        try parent.sync()
+        try FSKitLinks.verifyLink(layout, parent: parent)
+        layout.stage = .linked; j.fsKitLink = layout; try store.write(j, for: f.id)
+    }
+
+    /// The public destination identity is durable before rename/swap and before
+    /// configuration. Either side of either write can be resumed by identity.
+    func restoreLinkedOriginal(_ f: Folder, journal j: inout Journal, temporary: Bool) throws {
+        guard var layout = j.fsKitLink else { throw NestError("Missing FSKit authority.", code: 6) }
+        let parent = try FSKitLinks.parent(layout, folder: f, root: session.fsKitMountRoot)
+        _ = try FSKitLinks.root(layout)
+        guard !Paths.mounts().contains(where: { $0.path == layout.mountPath || $0.path.hasPrefix(layout.mountPath + "/") }) else { throw NestError("Internal FSKit mount remains present; restore blocked.", code: 6) }
+        let selected = URL(fileURLWithPath: f.path)
+        let selectedExists = try parent.exists(selected.lastPathComponent)
+        if layout.stage == .restored { try finishLinkedRestore(f, journal: &j); return }
+        if [.reserved, .evacuating].contains(layout.stage), selectedExists,
+           layout.source.matches(try parent.entryStat(selected.lastPathComponent)) {
+            // Evacuation never happened. Never select this branch after RAM
+            // activation or after a newer committed checkpoint exists.
+            guard !j.populationVerified, j.revision == j.initialRevision || j.initialRevision == nil else { throw NestError("Unexpected committed RAM authority; originals retained.", code: 6) }
+            try layout.source.verify(parent.child(selected.lastPathComponent))
+            layout.restoration = .original; layout.restored = layout.source; layout.stage = .restored; j.fsKitLink = layout
+            j.restoreRevision = j.initialRevision; try store.write(j, for: f.id)
+            try finishLinkedRestore(f, journal: &j); return
+        }
+        let alreadyPublished: Bool
+        if selectedExists, let restored = layout.restored { alreadyPublished = restored.matches(try parent.entryStat(selected.lastPathComponent)) }
+        else { alreadyPublished = false }
+        if !alreadyPublished { try layout.source.verify(FSKitLinks.holding(layout, parent: parent).child("data")) }
+        let useOriginal = layout.restoration.map { $0 == .original } ?? temporary
+        if layout.stage != .publishing {
+            let revision = useOriginal ? j.initialRevision : (j.restoreRevision ?? j.revision)
+            guard let revision else { throw NestError("Missing verified restore revision; backup and RAM retained.", code: 6) }
+            let (source, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision)
+            j.restoreRevision = revision
+            if useOriginal {
+                try layout.source.verify(FSKitLinks.holding(layout, parent: parent).child("data"))
+                guard try Snapshot.manifest(layout.originalDataURL, matching: expected).matchesExpected(expected) else { throw NestError("Original holding changed; backup and RAM retained.", code: 6) }
+                layout.restored = layout.source
+                layout.restoration = .original
+            } else {
+                // A crash during materialization has no publication authority.
+                // Retain the partial stage instead of adopting by its name.
+                guard j.restoreStage == nil else { throw NestError("Interrupted unverified restore stage retained; export committed snapshot before manual recovery.", code: 6) }
+                let stage = selected.deletingLastPathComponent().appendingPathComponent(".ramnest-\(f.id.uuidString)-restore-\(UUID().uuidString)")
+                let handle = try parent.createDirectory(stage.lastPathComponent)
+                let identity = try handle.identity()
+                j.restoreStage = stage.path; j.restoreStageDevice = identity.device; j.restoreStageInode = identity.inode
+                layout.restoration = .checkpoint; layout.stage = .restoring; j.fsKitLink = layout; j.phase = .restoring
+                try parent.sync(); try store.write(j, for: f.id)
+                // The final-mode tree is a direct sibling of the original.
+                // Darwin can publish a read-only root by same-parent swap;
+                // moving it out of a wrapper can require changing its mode.
+                let dataURL = stage.appendingPathExtension("data")
+                try Snapshot.copyTree(from: source, to: dataURL, manifest: expected, publicationStaging: true, sourceContext: .managedRevision)
+                let data = try parent.child(dataURL.lastPathComponent), restored = try data.identity()
+                // Full independent readback preserves existing metadata,
+                // digest and hardlink checks. Unreadable final modes fail closed.
+                guard try Snapshot.manifest(dataURL, matching: expected).matchesExpected(expected) else { throw NestError("Restore stage readback failed; backup and RAM retained.", code: 6) }
+                try data.sync(); try handle.sync(); try parent.sync()
+                j.restoreDataDevice = restored.device; j.restoreDataInode = restored.inode
+                layout.restored = .init(restored)
+            }
+            layout.stage = .publishing; j.fsKitLink = layout; j.phase = .restoring
+            try store.write(j, for: f.id)
+        }
+        guard let restored = layout.restored else { throw NestError("Missing publication identity.", code: 6) }
+        let nowExists = try parent.exists(selected.lastPathComponent)
+        if nowExists, restored.matches(try parent.entryStat(selected.lastPathComponent)) {
+            try restored.verify(parent.child(selected.lastPathComponent))
+        } else {
+            let from: DirectoryHandle, name: String
+            if useOriginal { from = try FSKitLinks.holding(layout, parent: parent); name = "data" }
+            else {
+                guard let stage = j.restoreStage, let device = j.restoreStageDevice, let inode = j.restoreStageInode,
+                      URL(fileURLWithPath: stage).deletingLastPathComponent() == selected.deletingLastPathComponent() else { throw NestError("Missing bound restore stage.", code: 6) }
+                let container = try parent.child(URL(fileURLWithPath: stage).lastPathComponent)
+                try FSKitLinkLayout.Identity((device, inode)).verify(container)
+                from = parent; name = URL(fileURLWithPath: stage).appendingPathExtension("data").lastPathComponent
+            }
+            try restored.verify(from.child(name))
+            try layout.parent.verify(DirectoryHandle.open(selected.deletingLastPathComponent()))
+            if nowExists {
+                try FSKitLinks.verifyLink(layout, parent: parent)
+                guard renameatx_np(from.fd, name, parent.fd, selected.lastPathComponent, UInt32(RENAME_SWAP)) == 0 else { throw NestError("Atomic original-path restore failed; backup and RAM retained.", code: 6) }
+            } else {
+                // Only evacuation/linking (or a recorded publishing intent)
+                // permits absence; an active link disappearing is a conflict.
+                guard !j.populationVerified else { throw NestError("Managed original-path link disappeared; backup and RAM retained.", code: 6) }
+                try from.renameNoReplace(name, to: parent, as: selected.lastPathComponent)
+            }
+            try from.sync(); try parent.sync()
+        }
+        try restored.verify(parent.child(selected.lastPathComponent))
+        if let revision = j.restoreRevision {
+            let (_, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision)
+            guard try Snapshot.manifest(selected, matching: expected).matchesExpected(expected) else { throw NestError("Published restore readback failed; backup and RAM retained.", code: 6) }
+        }
+        layout.stage = .restored; j.fsKitLink = layout; try store.write(j, for: f.id)
+        try finishLinkedRestore(f, journal: &j)
+    }
+
+    func finishLinkedRestore(_ f: Folder, journal j: inout Journal) throws {
+        guard var layout = j.fsKitLink, layout.stage == .restored, let restored = layout.restored else { throw NestError("FSKit restoration is not committed.", code: 6) }
+        let parent = try FSKitLinks.parent(layout, folder: f, root: session.fsKitMountRoot)
+        let selected = URL(fileURLWithPath: f.path)
+        try restored.verify(parent.child(selected.lastPathComponent))
+        if let revision = j.restoreRevision {
+            let (_, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision)
+            guard try Snapshot.manifest(selected, matching: expected).matchesExpected(expected) else { throw NestError("Restored directory changed before configuration commit; retained.", code: 6) }
+        }
+        // Journal first, config second, idle last. Bookmark cannot follow the
+        // old inode into .original on any interrupted transition.
+        try store.locked {
+            var config = try store.load()
+            guard let index = config.folders.firstIndex(where: { $0.id == f.id }), config.folders[index].path == f.path,
+                  (config.folders[index].device == layout.source.device && config.folders[index].inode == layout.source.inode) ||
+                  (config.folders[index].device == restored.device && config.folders[index].inode == restored.inode) else { throw NestError("Configuration identity conflict; restored data retained.", code: 6) }
+            config.folders[index].device = restored.device; config.folders[index].inode = restored.inode
+            config.folders[index].bookmark = try selected.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+            try store.save(config)
+        }
+        // Atomic swap leaves precisely our old link in the private source slot.
+        // Remove only that inode/target; never traverse it or an opaque backup.
+        if let stage = j.restoreStage {
+            guard let device = j.restoreStageDevice, let inode = j.restoreStageInode,
+                  URL(fileURLWithPath: stage).deletingLastPathComponent() == selected.deletingLastPathComponent() else { throw NestError("Restore container authority changed; retained.", code: 6) }
+            let name = URL(fileURLWithPath: stage).lastPathComponent
+            let dataName = URL(fileURLWithPath: stage).appendingPathExtension("data").lastPathComponent
+            if try parent.exists(dataName) {
+                try FSKitLinks.verifyLink(layout, parent: parent, name: dataName)
+                guard unlinkat(parent.fd, dataName, 0) == 0 else { throw NestError("Cannot retire owned restore link.", code: 6) }; try parent.sync()
+            }
+            if try parent.exists(name) {
+                let container = try parent.child(name)
+                try FSKitLinkLayout.Identity((device, inode)).verify(container)
+                guard try container.names().isEmpty,
+                      (try parent.entryStat(name)).st_ino == inode,
+                      unlinkat(parent.fd, name, AT_REMOVEDIR) == 0 else { throw NestError("Restore container is not owned/empty; retained.", code: 6) }
+                try parent.sync()
+            }
+            j.restoreStage = nil; j.restoreStageDevice = nil; j.restoreStageInode = nil; j.restoreDataDevice = nil; j.restoreDataInode = nil
+        }
+        let holdingName = URL(fileURLWithPath: layout.holdingPath).lastPathComponent
+        if try parent.exists(holdingName) {
+            let wrapper = try FSKitLinks.holding(layout, parent: parent)
+            if layout.restoration == .original, try wrapper.exists("data") {
+                try FSKitLinks.verifyLink(layout, parent: wrapper, name: "data")
+                guard unlinkat(wrapper.fd, "data", 0) == 0 else { throw NestError("Cannot retire original holding link.", code: 6) }; try wrapper.sync()
+            }
+        }
+        let stagedLink = URL(fileURLWithPath: layout.linkStagePath).lastPathComponent
+        if try parent.exists(stagedLink) {
+            try FSKitLinks.verifyLink(layout, parent: parent, name: stagedLink)
+            guard unlinkat(parent.fd, stagedLink, 0) == 0 else { throw NestError("Cannot retire staged original-path link.", code: 6) }; try parent.sync()
+        }
+        if !layout.mountReleased { try FSKitLinks.releaseMountpoint(layout); layout.mountReleased = true }
+        j.fsKitLink = layout; j.phase = .idle; j.mountedDevice = nil; j.lastError = nil
+        try store.write(j, for: f.id)
     }
 }

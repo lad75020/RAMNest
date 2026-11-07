@@ -82,7 +82,7 @@ public final class DirectoryHandle: @unchecked Sendable {
         guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { throw NestError("Cannot inspect snapshot cleanup entry: \(name)", code: 6) }
         return st
     }
-    func readJSON<T: Decodable>(_ type: T.Type, _ name: String) throws -> T {
+    func readJSON<T: Decodable>(_ type: T.Type, _ name: String, decoder: JSONDecoder = JSONDecoder()) throws -> T {
         try Self.checkName(name)
         let descriptor = openat(fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard descriptor >= 0 else { throw NestError("Cannot read managed snapshot metadata: \(name)", code: 6) }
@@ -92,7 +92,7 @@ public final class DirectoryHandle: @unchecked Sendable {
               st.st_uid == getuid(), st.st_size >= 0, st.st_size <= 64 << 20 else {
             throw NestError("Unexpected managed snapshot metadata: \(name)", code: 6)
         }
-        return try JSONDecoder().decode(type, from: handle.readToEnd() ?? Data())
+        return try decoder.decode(type, from: handle.readToEnd() ?? Data())
     }
     // Preflight the entire candidate before unlinking anything. The expected
     // namespace comes from its committed manifest; unknown entries are retained.

@@ -1,21 +1,22 @@
 # RAMNest
 
-RAMNest is a native macOS 27.0+ Apple Silicon app that turns an existing folder into a FUSE-T memory filesystem **at the same path**. It includes a SwiftUI app, shared Swift core, detached C++ per-volume helper, and bundled `ramnest` CLI. Storage is local only. There is no telemetry, trial, licensing server, automatic updater, cloud credential handling, or S3 implementation.
+RAMNest is a native macOS 27.0+ Apple Silicon app that keeps an existing folder accessible **at its original path** while its contents run in a FUSE-T memory filesystem. NFS/SMB mount there directly; new FSKit sessions use a private internal mountpoint and an original-path symlink. It includes a SwiftUI app, shared Swift core, detached C++ per-volume helper, and bundled `ramnest` CLI. Storage is local only. There is no telemetry, trial, licensing server, automatic updater, cloud credential handling, or S3 implementation.
 
 Content uses transparent, default-on LZ4 compression through Apple's system Compression API. Each 64 KiB logical block owns anonymous `mmap` backing rounded to 16 KiB VM pages. Incompressible blocks stay raw; truncation/deletion releases mappings with `munmap`. Capacity is an uncompressed allocation ceiling, not an eager reservation. Sparse holes remain unallocated. [Memory and compression details](docs/MEMORY.md) explain counters, quotas, OS caching/compression/swap, and measured RSS.
 
 ## Build and run
 
-For the verified Trash-exclusion correction, use the Xcode-built Release app in
-`artifacts/trash-exclusion-20261107/release/RAMNest.app`. Its acceptance evidence,
-installation boundary and backend limits are in
-[the correction delivery report](docs/TRASH_EXCLUSION_DELIVERY.md).
+The local `SymLinks` work adds FSKit mounting for external-source folders through
+an internal target. See [the FSKit symlink layout](docs/FSKIT_SYMLINK_LAYOUT.md)
+for behavior, recovery limits and verification. The earlier
+[Trash-exclusion delivery report](docs/TRASH_EXCLUSION_DELIVERY.md) remains
+historical evidence, not proof of this new layout.
 
 Requires Xcode 27 / Swift 6, CMake, macOS 27.0+, and an independently installed [FUSE-T](https://github.com/macos-fuse-t/fuse-t/wiki) runtime. This build uses **only** `/Library/Application Support/fuse-t/include/fuse` and `/Library/Application Support/fuse-t/lib/libfuse-t-1.2.9.dylib`. It never picks global macFUSE headers or installs anything as root. The third-party FUSE-T runtime is not redistributed.
 
 **Settings → Backend for next mount** selects **NFS**, **FSKit**, or **SMB3** for the next new mount of any folder. The app-wide `Configuration.backend` persists as `nfs`, `fskit`, or `smb`. NFS is the default, including existing configuration JSON that lacks this field; unknown or malformed values fail decoding. Existing mounts and helpers are never changed by this preference. A new session records its selected backend in the journal, and mounted captions use that record. Legacy sessions without a record are labeled “backend not recorded.”
 
-Every new session explicitly passes its recorded `--backend` to the helper, which emits exactly one per-mount `backend=...` option. SMB3 uses the FUSE-T id `smb` and additionally forces `listen_addr=127.0.0.1:0,nobonjour`, without LAN advertising. FSKit uses the validated id `fskit` (the requested “fsdisk” choice is labeled FSKit). Before using FSKit, open `/Applications/fuse-t.app` and follow its instructions to manually enable the extension; registration alone does not prove activation. The existing external-volume EPERM remains unresolved, and selectable FSKit does not fix it. RAMNest never changes global `fuse-t.ini` or retries with a different backend. See [backend settings and FSKit validation](docs/FSKIT_BACKEND.md).
+Every new session explicitly passes its recorded `--backend` to the helper, which emits exactly one per-mount `backend=...` option. SMB3 uses the FUSE-T id `smb` and additionally forces `listen_addr=127.0.0.1:0,nobonjour`, without LAN advertising. FSKit uses the validated id `fskit` (the requested “fsdisk” choice is labeled FSKit). Before using FSKit, open `/Applications/fuse-t.app` and follow its instructions to manually enable the extension; registration alone does not prove activation. New FSKit sessions mount at `/Users/Shared/RAMNest-Mounts-<uid>/<original basename>` and publish a symlink at the original folder path, avoiding an OS mount on the external source volume. The private mount root is current-user-only, requires no elevation, and rejects basename collisions. NFS, SMB and existing absent-layout FSKit sessions keep their old paths. RAMNest never changes global `fuse-t.ini` or retries with a different backend. See [backend settings and FSKit validation](docs/FSKIT_BACKEND.md).
 
 ```sh
 cd /Volumes/WDBlack4TB/Code/RAMNest
@@ -33,9 +34,9 @@ export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
 swift test --scratch-path .build/swift --cache-path .build/cache
 ```
 
-An XcodeGen specification is included. The current correction is verified using
-`BuildProject`, `RunSomeTests` and `RunAllTests` on the Release verification
-scheme; its static shared core, bundled CLI and native helper are built together.
+An XcodeGen specification is included. The symlink-layout work is verified using
+`BuildProject` for the Release app and `RunSomeTests`/`RunAllTests` for enabled
+Debug XCTest cases; its static shared core, bundled CLI and native helper are built together.
 The direct-build scripts above are historical alternatives, not this delivery's
 accepted packaging path: the direct-build variant failed a rootless-legacy
 metadata check by acquiring an additional OS provenance attribute. That failure
@@ -60,11 +61,11 @@ holding too; a filtered comparison never authorizes recursive deletion. See
 [Trash exclusion and recovery](docs/TRASH_EXCLUSION.md) before removing any retained
 holding manually.
 
-Use **New RAM Folder**, drop a folder on the window/Dock, or select an existing directory. Choose capacity in MB/GB (binary MiB/GiB), optional unique display name, synchronization and compression. The mounted volume uses the original folder name at the unchanged full path; `--name` and `rename` set only the RAMNest display alias, which remains usable for CLI lookup. Minimum capacity is 16 MiB; maximum is 75% of physical memory. Close writers before the first conversion. Root/home/system directories, app sandbox storage, symlink traversal, overlapping RAM folders, app-support nesting and foreign/nested mounts are rejected.
+Use **New RAM Folder**, drop a folder on the window/Dock, or select an existing directory. Choose capacity in MB/GB (binary MiB/GiB), optional unique display name, synchronization and compression. The original folder path remains usable, directly for NFS/SMB and through a managed symlink for new FSKit sessions. The physical mount retains the original folder basename; `--name` and `rename` set only the RAMNest display alias, which remains usable for CLI lookup. Minimum capacity is 16 MiB; maximum is 75% of physical memory. Close writers before the first conversion. Root/home/system directories, app sandbox storage, arbitrary symlink traversal, overlapping RAM folders, app-support nesting and foreign/nested mounts are rejected. The runtime FSKit link is a narrow journal-owned exception, not a relaxation of those checks.
 
 Capacity must cover the uncompressed logical payload: each non-hardlinked file rounds up to 64 KiB, plus symlink and extended-attribute bytes. Compression does not lower this quota. Metadata has a separate `max(64 KiB, capacity / 4)` budget with no fixed 64 MiB ceiling; neither budget preallocates memory. For a roughly 55,000-entry tree with about 4.1 GiB of rounded payload, choose **8GB** (8 GiB) as a starting point: that allows 2 GiB of metadata, with room for attributes and growth subject to the existing 75%-of-RAM limit. Preflight errors report which budget failed, required/allowed bytes and entry counts before any files move.
 
-Before the selected directory is emptied, RAMNest copies and checksum-verifies its contents into private local storage. Exact selected top-level entries are moved into a 0700 sibling holding directory on the same filesystem. With a negotiated `pre-mount-population-v1` helper, the coordinator pins the authenticated control identity, populates the **guarded tree before mounting**, then explicitly authorizes the mount. Its first callbacks therefore expose the populated namespace and root mode. RAMNest observes the real mount identity, strictly verifies mounted data including xattrs/hardlinks, checks retained originals for write races, journals verification, and only then enables writes. Older helpers retain their guarded legacy ordering. Source files remain recoverable throughout. It does not use `hdiutil`, native RAM devices, tmpfs, or a disk mirror.
+Before changing the selected directory, RAMNest copies and checksum-verifies its contents into private local storage. Direct mounts move exact top-level entries into a 0700 sibling holding directory. New FSKit sessions instead move the complete original directory into that private wrapper's `data` child, preserving original objects while vacating the public path. With a negotiated `pre-mount-population-v1` helper, the coordinator pins the authenticated control identity, populates the **guarded tree before mounting**, then explicitly authorizes the mount. Its first callbacks therefore expose the populated namespace and root mode. RAMNest observes the physical mount identity, strictly verifies mounted data including xattrs/hardlinks, checks retained originals, publishes the bound FSKit symlink where applicable, journals verification, and only then enables writes. Older helpers retain their legacy ordering for direct mounts. Source files remain recoverable throughout. It does not use `hdiutil`, native RAM devices, tmpfs, or a disk mirror.
 
 The sidebar displays all configured folders; detail shows logical allocation, capacity, file bytes, encoded payload and mapped backing. Options have Apply/Discard and unsaved-change guards. Compression and Finder visibility changes take effect on the next mount. Resize changes the live capacity without unmounting, including temporary mode, and rejects shrink below allocated usage. Names, paths and `ram://` percent-encoded names all work in the CLI.
 
