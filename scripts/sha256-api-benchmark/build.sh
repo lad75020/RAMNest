@@ -1,0 +1,20 @@
+#!/bin/bash
+set -euo pipefail
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+src="$root/scripts/sha256-api-benchmark"
+out="${1:-$root/artifacts/metal-sha256}"
+"$root/Libraries/MetalSHA256/build.sh" "$out"
+out="$(cd "$out" && pwd)"
+export TMPDIR="$out/build/tmp/"
+swiftc="$(xcrun --find swiftc)"
+clang="$(xcrun --find clang)"
+sdk="$(xcrun --sdk macosx --show-sdk-path)"
+"$swiftc" -print-target-info > "$out/build/target.json"
+printf '%s\n' "$sdk" > "$out/build/sdk-path.txt"
+printf '%s\n' 'Benchmark: swiftc -O -whole-module-optimization; Probe: clang -O3; library clang++ -O3 ARC / Swift -O WMO; macOS 13; runtime MSL fastMathEnabled=NO; rpath @executable_path/../lib' > "$out/build/flags.txt"
+"$clang" -O3 -isysroot "$sdk" -c "$src/Probe.c" -o "$out/build/Probe.o"
+# Multiple Swift source files require the entry point to be named main.swift.
+cp "$src/Benchmark.swift" "$out/build/main.swift"
+"$swiftc" -O -whole-module-optimization -module-cache-path "$out/build/module-cache" -sdk "$sdk" -I "$out/include" -I "$out/lib" -L "$out/lib" -lMetalSHA256 -lCMetalSHA256 -import-objc-header "$src/Probe.h" "$out/build/main.swift" "$src/MetalBatch.swift" "$out/build/Probe.o" -Xlinker -rpath -Xlinker @executable_path/../lib -o "$out/bin/sha256-api-benchmark"
+shasum -a 256 "$src/Benchmark.swift" "$src/MetalBatch.swift" "$src/Probe.h" "$src/Probe.c" "$src/build.sh" > "$out/build/source-sha256.txt"
+printf 'Built %s\n' "$out/bin/sha256-api-benchmark"

@@ -1,0 +1,4 @@
+module CMetalSHA256 {
+  header "MetalSHA256.h"
+  export *
+}
