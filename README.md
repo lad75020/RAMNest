@@ -41,9 +41,12 @@ export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
 swift test --scratch-path .build/swift --cache-path .build/cache
 ```
 
-An XcodeGen specification is included. The symlink-layout work is verified using
+An XcodeGen specification is included. Canonical Xcode validation uses
 `BuildProject` for the Release app and `RunSomeTests`/`RunAllTests` for enabled
-Debug XCTest cases; its static shared core, bundled CLI and native helper are built together.
+Debug Swift Testing cases; its static shared core, bundled CLI and native helper are built together.
+The [test modernization record](docs/TEST_MODERNIZATION.md) maps the original
+coverage, parameterized cases and preserved standalone harnesses.
+
 The direct-build scripts above are historical alternatives, not this delivery's
 accepted packaging path: the direct-build variant failed a rootless-legacy
 metadata check by acquiring an additional OS provenance attribute. That failure

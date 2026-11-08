@@ -2,12 +2,14 @@ import Foundation
 import Darwin
 @testable import RAMNestCore
 #if !RAMNEST_ATTRIBUTE_ABSENCE_STANDALONE
-import XCTest
-final class AttributeAbsenceTests: XCTestCase {
-    func testExplicitAbsence() throws { try AttributeAbsenceScenarios.absence() }
-    func testErrorsStayFatal() throws { try AttributeAbsenceScenarios.errors() }
-    func testMissingExpectedAttributesFail() throws { try AttributeAbsenceScenarios.mismatch() }
-    func testReadinessDiagnostic() throws { try AttributeAbsenceScenarios.diagnostic() }
+import Testing
+extension RAMNestTestSuite {
+    struct AttributeAbsenceTests {
+        @Test func `Explicit absence`() throws { try AttributeAbsenceScenarios.absence() }
+        @Test func `Errors stay fatal`() throws { try AttributeAbsenceScenarios.errors() }
+        @Test func `Missing expected attributes fail`() throws { try AttributeAbsenceScenarios.mismatch() }
+        @Test func `Readiness diagnostic`() throws { try AttributeAbsenceScenarios.diagnostic() }
+    }
 }
 #endif
 

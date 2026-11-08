@@ -2,12 +2,14 @@ import Foundation
 import Darwin
 @testable import RAMNestCore
 #if !RAMNEST_MOUNTED_FLAG_POLICY_STANDALONE
-import XCTest
-final class MountedFlagPolicyTests: XCTestCase {
-    func testStrictDefaults() throws { try MountedFlagPolicyScenarios.strictDefaults() }
-    func testDirectionalMask() throws { try MountedFlagPolicyScenarios.directionalMask() }
-    func testJournalPolicyAndGuards() throws { try MountedFlagPolicyScenarios.journalPolicy() }
-    func testSnapshotFlagsStayExact() throws { try MountedFlagPolicyScenarios.snapshots() }
+import Testing
+extension RAMNestTestSuite {
+    struct MountedFlagPolicyTests {
+        @Test func `Strict defaults`() throws { try MountedFlagPolicyScenarios.strictDefaults() }
+        @Test func `Directional mask`() throws { try MountedFlagPolicyScenarios.directionalMask() }
+        @Test func `Journal policy and guards`() throws { try MountedFlagPolicyScenarios.journalPolicy() }
+        @Test func `Snapshot flags stay exact`() throws { try MountedFlagPolicyScenarios.snapshots() }
+    }
 }
 #endif
 

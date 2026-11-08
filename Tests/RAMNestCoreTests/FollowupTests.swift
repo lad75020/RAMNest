@@ -163,8 +163,11 @@ struct FollowupRunner {
         if let error=outcome.failure {throw error}
     }
     static func run() throws {
-        let root=URL(fileURLWithPath:CommandLine.arguments[1]).appendingPathComponent("followup-"+UUID().uuidString);try Store.privateDirectory(root)
-        switch CommandLine.arguments[2] {
+        try run(parent: URL(fileURLWithPath: CommandLine.arguments[1]), scenario: CommandLine.arguments[2])
+    }
+    static func run(parent: URL, scenario: String) throws {
+        let root=parent.appendingPathComponent("followup-"+UUID().uuidString);try Store.privateDirectory(root)
+        switch scenario {
         case "lock-child":
             let store=try Store(root:URL(fileURLWithPath:CommandLine.arguments[3])),id=UUID(uuidString:CommandLine.arguments[4])!
             try store.volumeLocked(id) {try Data().write(to:URL(fileURLWithPath:CommandLine.arguments[5]));try waitFile(URL(fileURLWithPath:CommandLine.arguments[6]))}
@@ -205,11 +208,11 @@ struct FollowupRunner {
         case "legacy-large", "occupied", "symlink":
             let source=root.appendingPathComponent("source");try Store.privateDirectory(source)
             let file=source.appendingPathComponent("a");try Data(repeating:83,count:2<<20).write(to:file)
-            if CommandLine.arguments[2] == "occupied" {
+            if scenario == "occupied" {
                 let m=try Snapshot.manifest(source)
                 var rejected=false;do { try m.preflight(capacity:1<<20) } catch { rejected=true }
                 try check(rejected,"occupied sparse pages must reject overquota")
-            } else if CommandLine.arguments[2] == "symlink" {
+            } else if scenario == "symlink" {
                 let a=source.appendingPathComponent("sym-a"),b=source.appendingPathComponent("sym-b")
                 try FileManager.default.createSymbolicLink(atPath:a.path,withDestinationPath:"a")
                 try check(linkat(AT_FDCWD,a.path,AT_FDCWD,b.path,0)==0,"hardlinked symlink fixture")
@@ -254,13 +257,13 @@ struct FollowupRunner {
             j.restoreStageDevice=a.device;j.restoreStageInode=a.inode;j.restoreDataDevice=b.device;j.restoreDataInode=b.inode
             try f.store.write(j,for:f.folder.id)
             try data.renameNoReplace("payload",to:DirectoryHandle.open(f.selected),as:"payload") // move before journal checkpoint
-            if CommandLine.arguments[2] == "restore-replay-split" {
+            if scenario == "restore-replay-split" {
                 let alias=stage.appendingPathComponent("data/alias"),replacement=stage.appendingPathComponent("replacement")
                 try check(copyfile(alias.path,replacement.path,nil,copyfile_flags_t(COPYFILE_ALL|COPYFILE_NOFOLLOW))==0,"split alias fixture")
                 try check(rename(replacement.path,alias.path)==0,"split alias replace")
             }
             f.helper.mounted=false
-            if CommandLine.arguments[2] == "restore-replay-split" {
+            if scenario == "restore-replay-split" {
                 do {try f.engine.finalize(f.folder.id.uuidString)} catch {}
                 try check(!FileManager.default.fileExists(atPath:f.selected.appendingPathComponent("alias").path),"cross-boundary split rejected before remaining move")
             } else {
@@ -277,7 +280,7 @@ struct FollowupRunner {
             var j=try f.store.journal(f.folder.id);j.phase = .restoring;j.restoreRevision=f.initial;j.restoreStage=stage.path
             j.restoreStageDevice=stageID.device;j.restoreStageInode=stageID.inode;j.restoreDataDevice=dataID.device;j.restoreDataInode=dataID.inode
             try f.store.write(j,for:f.folder.id)
-            if CommandLine.arguments[2] == "restore" {
+            if scenario == "restore" {
                 try FileManager.default.moveItem(at:stage.appendingPathComponent("data"),to:stage.appendingPathComponent("old-data"))
                 try Snapshot.copyTree(from:source,to:stage.appendingPathComponent("data"),manifest:expected,sourceContext:.managedRevision)
             } else { try Data("CORRUPT!".utf8).write(to:stage.appendingPathComponent("data/payload")) }
@@ -308,698 +311,709 @@ struct FollowupRunner {
 }
 
 #if !RAMNEST_FOLLOWUP_STANDALONE
-import XCTest
+import Testing
 
-final class SparseExtentFallbackTests: XCTestCase {
-    private let page = 65536
-    private var length: Int { 20 * page + 37 }
-    private struct Payload {
-        let name: String, bytes: Data, checksum: String
-        let pages: UInt64
-    }
-    private func payloads() -> [Payload] {
-        var sparse = Data(repeating: 0, count: length)
-        sparse[3 * page + 17] = 65; sparse[12 * page + 3] = 66
-        var tail = sparse; tail[length - 1] = 67
-        // Fixed reference digests include padded final pages and logical indices.
-        return [
-            Payload(name: "dense", bytes: Data(repeating: 90, count: length),
-                    checksum: "b4a46de3ff39db4a7b03ca5f83e076b9a62c25b31111a822b561192901cc9e12", pages: 21),
-            Payload(name: "sparse", bytes: tail,
-                    checksum: "29f3ba0f44fb7f8e400c14aa46d6e889b4522aeb52e792d5515e3d0803fae8b2", pages: 3),
-            Payload(name: "trailing-zero", bytes: sparse,
-                    checksum: "a400a8dcb30f359dff80c704d37e9595d858b3d0fcafaa114b0d6504248992db", pages: 2),
-            Payload(name: "zero", bytes: Data(repeating: 0, count: length),
-                    checksum: "ed58828563a71e400ceb079b70c8d0816d2e55bb281afa7c598bb132dd9ad670", pages: 0)
-        ]
-    }
-    private func fixture(_ body: (URL) throws -> Void) throws {
-        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
-            .appendingPathComponent("ramnest-sparse-" + UUID().uuidString)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
-                                                attributes: [.posixPermissions: 0o700])
-        defer { try? FileManager.default.removeItem(at: root) }
-        try body(root)
-    }
-    private func file(_ root: URL, _ name: String, _ bytes: Data, sparse: Bool = false) throws -> Int32 {
-        let fd = open(root.appendingPathComponent(name).path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
-        guard fd >= 0 else { throw NestError("Sparse test fixture open failed") }
-        do {
-            guard ftruncate(fd, off_t(bytes.count)) == 0 else { throw NestError("Sparse test truncate failed") }
-            for offset in stride(from: 0, to: bytes.count, by: page) {
-                let count = min(page, bytes.count - offset)
-                if sparse && !bytes[offset..<(offset + count)].contains(where: { $0 != 0 }) { continue }
-                let wrote = bytes.withUnsafeBytes { pwrite(fd, $0.baseAddress!.advanced(by: offset), count, off_t(offset)) }
-                guard wrote == count else { throw NestError("Sparse test fixture write failed") }
-            }
-            return fd
-        } catch { close(fd); throw error }
-    }
-    private func supported(_ bytes: Data) -> SparseContent.ExtentSeeker {
-        { _, offset, whence in
-            XCTAssertEqual(whence, SEEK_DATA)
-            guard let next = bytes[Int(offset)...].firstIndex(where: { $0 != 0 }) else {
-                errno = ENXIO; return -1
-            }
-            return off_t(next)
+extension RAMNestTestSuite {
+    struct FollowupScenarioTests {
+        @Test(arguments: ["equality","thaw","invalidation-failure","restore","restore-corrupt","restore-replay","restore-replay-split","uuid","legacy-large","occupied","symlink","cursor-replacement"])
+        func `In process followup acceptance`(scenario: String) throws {
+            let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .deletingLastPathComponent().deletingLastPathComponent().resolvingSymlinksInPath()
+            try FollowupRunner.run(parent: project.appendingPathComponent("artifacts"), scenario: scenario)
         }
     }
-    private func assertIdentity(_ result: SparseContent.Result, _ payload: Payload,
-                                file: StaticString = #filePath, line: UInt = #line) {
-        XCTAssertEqual(result.checksum, "sparse64-v1:" + payload.checksum, payload.name, file: file, line: line)
-        XCTAssertEqual(result.allocated, payload.pages * UInt64(page), payload.name, file: file, line: line)
-    }
-    private func assertCopy(_ source: Int32, _ payload: Payload, _ root: URL, _ name: String,
-                            seek: SparseContent.ExtentSeeker) throws {
-        let destination = try file(root, name, Data())
-        defer { close(destination) }
-        try SparseContent.copy(source, to: destination, size: Int64(payload.bytes.count), seekExtent: seek)
-        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(name)), payload.bytes, name)
-        assertIdentity(try SparseContent.scan(destination, size: Int64(payload.bytes.count),
-                                             seekExtent: supported(payload.bytes)), payload)
-    }
-    func testUnsupportedExtentsPreserveChecksumAllocationAndExactCopy() throws {
-        try fixture { root in
-            for payload in payloads() {
-                for physicalSparse in [false, true] {
-                    let label = payload.name + (physicalSparse ? "-holes" : "-dense")
-                    let source = try file(root, label, payload.bytes, sparse: physicalSparse)
-                    defer { close(source) }
-                    let optimized = try SparseContent.scan(source, size: Int64(length), seekExtent: supported(payload.bytes))
-                    assertIdentity(optimized, payload)
-                    for code in [EINVAL, ENOTSUP, ENOTTY] {
-                        var calls = 0
-                        let seek: SparseContent.ExtentSeeker = { _, _, whence in
-                            XCTAssertEqual(whence, SEEK_DATA); calls += 1; errno = code; return -1
+
+    struct SparseExtentFallbackTests {
+        private let page = 65536
+        private var length: Int { 20 * page + 37 }
+        private struct Payload {
+            let name: String, bytes: Data, checksum: String
+            let pages: UInt64
+        }
+        private func payloads() -> [Payload] {
+            var sparse = Data(repeating: 0, count: length)
+            sparse[3 * page + 17] = 65; sparse[12 * page + 3] = 66
+            var tail = sparse; tail[length - 1] = 67
+            // Fixed reference digests include padded final pages and logical indices.
+            return [
+                Payload(name: "dense", bytes: Data(repeating: 90, count: length),
+                        checksum: "b4a46de3ff39db4a7b03ca5f83e076b9a62c25b31111a822b561192901cc9e12", pages: 21),
+                Payload(name: "sparse", bytes: tail,
+                        checksum: "29f3ba0f44fb7f8e400c14aa46d6e889b4522aeb52e792d5515e3d0803fae8b2", pages: 3),
+                Payload(name: "trailing-zero", bytes: sparse,
+                        checksum: "a400a8dcb30f359dff80c704d37e9595d858b3d0fcafaa114b0d6504248992db", pages: 2),
+                Payload(name: "zero", bytes: Data(repeating: 0, count: length),
+                        checksum: "ed58828563a71e400ceb079b70c8d0816d2e55bb281afa7c598bb132dd9ad670", pages: 0)
+            ]
+        }
+        private func fixture(_ body: (URL) throws -> Void) throws {
+            let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+                .appendingPathComponent("ramnest-sparse-" + UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+            defer { try? FileManager.default.removeItem(at: root) }
+            try body(root)
+        }
+        private func file(_ root: URL, _ name: String, _ bytes: Data, sparse: Bool = false) throws -> Int32 {
+            let fd = open(root.appendingPathComponent(name).path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+            guard fd >= 0 else { throw NestError("Sparse test fixture open failed") }
+            do {
+                guard ftruncate(fd, off_t(bytes.count)) == 0 else { throw NestError("Sparse test truncate failed") }
+                for offset in stride(from: 0, to: bytes.count, by: page) {
+                    let count = min(page, bytes.count - offset)
+                    if sparse && !bytes[offset..<(offset + count)].contains(where: { $0 != 0 }) { continue }
+                    let wrote = bytes.withUnsafeBytes { pwrite(fd, $0.baseAddress!.advanced(by: offset), count, off_t(offset)) }
+                    guard wrote == count else { throw NestError("Sparse test fixture write failed") }
+                }
+                return fd
+            } catch { close(fd); throw error }
+        }
+        private func supported(_ bytes: Data) -> SparseContent.ExtentSeeker {
+            { _, offset, whence in
+                #expect(whence == SEEK_DATA)
+                guard let next = bytes[Int(offset)...].firstIndex(where: { $0 != 0 }) else {
+                    errno = ENXIO; return -1
+                }
+                return off_t(next)
+            }
+        }
+        private func assertIdentity(_ result: SparseContent.Result, _ payload: Payload,
+                                    sourceLocation: SourceLocation = SourceLocation(fileID: #fileID, filePath: #filePath,
+                                                                                 line: #line, column: #column)) {
+            #expect(result.checksum == "sparse64-v1:" + payload.checksum, Comment(rawValue: payload.name), sourceLocation: sourceLocation)
+            #expect(result.allocated == payload.pages * UInt64(page), Comment(rawValue: payload.name), sourceLocation: sourceLocation)
+        }
+        private func assertCopy(_ source: Int32, _ payload: Payload, _ root: URL, _ name: String,
+                                seek: SparseContent.ExtentSeeker) throws {
+            let destination = try file(root, name, Data())
+            defer { close(destination) }
+            try SparseContent.copy(source, to: destination, size: Int64(payload.bytes.count), seekExtent: seek)
+            #expect((try Data(contentsOf: root.appendingPathComponent(name))) == payload.bytes, Comment(rawValue: name))
+            assertIdentity(try SparseContent.scan(destination, size: Int64(payload.bytes.count),
+                                                 seekExtent: supported(payload.bytes)), payload)
+        }
+        @Test func `Unsupported extents preserve checksum allocation and exact copy`() throws {
+            try fixture { root in
+                for payload in payloads() {
+                    for physicalSparse in [false, true] {
+                        let label = payload.name + (physicalSparse ? "-holes" : "-dense")
+                        let source = try file(root, label, payload.bytes, sparse: physicalSparse)
+                        defer { close(source) }
+                        let optimized = try SparseContent.scan(source, size: Int64(length), seekExtent: supported(payload.bytes))
+                        assertIdentity(optimized, payload)
+                        for code in [EINVAL, ENOTSUP, ENOTTY] {
+                            var calls = 0
+                            let seek: SparseContent.ExtentSeeker = { _, _, whence in
+                                #expect(whence == SEEK_DATA); calls += 1; errno = code; return -1
+                            }
+                            let scanned = try SparseContent.scan(source, size: Int64(length), seekExtent: seek)
+                            assertIdentity(scanned, payload)
+                            #expect(scanned.checksum == optimized.checksum)
+                            #expect(scanned.allocated == optimized.allocated)
+                            #expect(scanned.bytesRead == UInt64(length))
+                            #expect(calls == 1, "fallback must disable later extent queries")
+                            calls = 0
+                            try assertCopy(source, payload, root, label + "-copy-\(code)", seek: seek)
+                            #expect(calls == 1)
                         }
-                        let scanned = try SparseContent.scan(source, size: Int64(length), seekExtent: seek)
-                        assertIdentity(scanned, payload)
-                        XCTAssertEqual(scanned.checksum, optimized.checksum)
-                        XCTAssertEqual(scanned.allocated, optimized.allocated)
-                        XCTAssertEqual(scanned.bytesRead, UInt64(length))
-                        XCTAssertEqual(calls, 1, "fallback must disable later extent queries")
-                        calls = 0
-                        try assertCopy(source, payload, root, label + "-copy-\(code)", seek: seek)
-                        XCTAssertEqual(calls, 1)
                     }
                 }
             }
         }
-    }
-    func testUnsupportedExtentsAfterSuccessfulSkip() throws {
-        let payload = payloads()[1]
-        try fixture { root in
-            let source = try file(root, "source", payload.bytes, sparse: true)
-            defer { close(source) }
-            for code in [EINVAL, ENOTSUP, ENOTTY] {
-                var offsets: [off_t] = []
-                let seek: SparseContent.ExtentSeeker = { _, offset, whence in
-                    XCTAssertEqual(whence, SEEK_DATA); offsets.append(offset)
-                    if offsets.count == 1 { return off_t(3 * self.page + 17) }
-                    errno = code; return -1
-                }
-                let result = try SparseContent.scan(source, size: Int64(length), seekExtent: seek)
-                assertIdentity(result, payload)
-                XCTAssertEqual(result.bytesRead, UInt64(length - 3 * page))
-                XCTAssertEqual(offsets, [0, off_t(4 * page)])
-                offsets = []
-                try assertCopy(source, payload, root, "copy-\(code)", seek: seek)
-                XCTAssertEqual(offsets, [0, off_t(4 * page)])
-            }
-        }
-    }
-    func testENXIOStillEndsExtentWalk() throws {
-        try fixture { root in
-            for payload in [payloads()[2], payloads()[3]] {
-                let source = try file(root, payload.name, payload.bytes, sparse: true)
+        @Test func `Unsupported extents after successful skip`() throws {
+            let payload = payloads()[1]
+            try fixture { root in
+                let source = try file(root, "source", payload.bytes, sparse: true)
                 defer { close(source) }
-                var calls = 0
-                let extent = supported(payload.bytes)
-                let seek: SparseContent.ExtentSeeker = { fd, offset, whence in
-                    calls += 1; return extent(fd, offset, whence)
-                }
-                let result = try SparseContent.scan(source, size: Int64(length), seekExtent: seek)
-                assertIdentity(result, payload)
-                XCTAssertEqual(result.bytesRead, payload.pages * UInt64(page))
-                XCTAssertEqual(calls, Int(payload.pages) + 1)
-                calls = 0
-                try assertCopy(source, payload, root, payload.name + "-copy", seek: seek)
-                XCTAssertEqual(calls, Int(payload.pages) + 1)
-            }
-        }
-    }
-    func testExtentHardErrorsRemainFatalBeforeAndAfterSkip() throws {
-        let payload = payloads()[1]
-        try fixture { root in
-            let source = try file(root, "source", payload.bytes, sparse: true)
-            defer { close(source) }
-            for code in [EIO, EBADF, EPERM] {
-                for skip in [false, true] {
-                    var calls = 0
-                    let seek: SparseContent.ExtentSeeker = { _, _, _ in
-                        calls += 1
-                        if skip && calls == 1 { return off_t(3 * self.page + 17) }
+                for code in [EINVAL, ENOTSUP, ENOTTY] {
+                    var offsets: [off_t] = []
+                    let seek: SparseContent.ExtentSeeker = { _, offset, whence in
+                        #expect(whence == SEEK_DATA); offsets.append(offset)
+                        if offsets.count == 1 { return off_t(3 * self.page + 17) }
                         errno = code; return -1
                     }
-                    func check(_ error: Error) {
-                        XCTAssertEqual((error as? NestError)?.code, 6)
-                        XCTAssertTrue(error.localizedDescription.contains("errno \(code)"))
+                    let result = try SparseContent.scan(source, size: Int64(length), seekExtent: seek)
+                    assertIdentity(result, payload)
+                    #expect(result.bytesRead == UInt64(length - 3 * page))
+                    #expect(offsets == [0, off_t(4 * page)])
+                    offsets = []
+                    try assertCopy(source, payload, root, "copy-\(code)", seek: seek)
+                    #expect(offsets == [0, off_t(4 * page)])
+                }
+            }
+        }
+        @Test func `ENXIO still ends extent walk`() throws {
+            try fixture { root in
+                for payload in [payloads()[2], payloads()[3]] {
+                    let source = try file(root, payload.name, payload.bytes, sparse: true)
+                    defer { close(source) }
+                    var calls = 0
+                    let extent = supported(payload.bytes)
+                    let seek: SparseContent.ExtentSeeker = { fd, offset, whence in
+                        calls += 1; return extent(fd, offset, whence)
                     }
-                    XCTAssertThrowsError(try SparseContent.scan(source, size: Int64(length), seekExtent: seek)) { check($0) }
-                    XCTAssertEqual(calls, skip ? 2 : 1)
+                    let result = try SparseContent.scan(source, size: Int64(length), seekExtent: seek)
+                    assertIdentity(result, payload)
+                    #expect(result.bytesRead == payload.pages * UInt64(page))
+                    #expect(calls == Int(payload.pages) + 1)
                     calls = 0
-                    let destination = try file(root, "error-\(code)-\(skip)", Data())
-                    defer { close(destination) }
-                    XCTAssertThrowsError(try SparseContent.copy(source, to: destination, size: Int64(length), seekExtent: seek)) { check($0) }
-                    XCTAssertEqual(calls, skip ? 2 : 1)
+                    try assertCopy(source, payload, root, payload.name + "-copy", seek: seek)
+                    #expect(calls == Int(payload.pages) + 1)
                 }
             }
         }
-    }
-    func testLegacyAndSmallHashesDoNotQueryExtents() throws {
-        try fixture { root in
-            let seek: SparseContent.ExtentSeeker = { _, _, _ in
-                XCTFail("legacy and small hashes must retain sequential SHA256"); errno = EIO; return -1
+        @Test func `Extent hard errors remain fatal before and after skip`() throws {
+            let payload = payloads()[1]
+            try fixture { root in
+                let source = try file(root, "source", payload.bytes, sparse: true)
+                defer { close(source) }
+                for code in [EIO, EBADF, EPERM] {
+                    for skip in [false, true] {
+                        var calls = 0
+                        let seek: SparseContent.ExtentSeeker = { _, _, _ in
+                            calls += 1
+                            if skip && calls == 1 { return off_t(3 * self.page + 17) }
+                            errno = code; return -1
+                        }
+                        func check(_ error: Error) {
+                            #expect((error as? NestError)?.code == 6)
+                            #expect(error.localizedDescription.contains("errno \(code)"))
+                        }
+                        #expect { try SparseContent.scan(source, size: Int64(length), seekExtent: seek) } throws: { error in check(error); return true }
+                        #expect(calls == (skip ? 2 : 1))
+                        calls = 0
+                        let destination = try file(root, "error-\(code)-\(skip)", Data())
+                        defer { close(destination) }
+                        #expect { try SparseContent.copy(source, to: destination, size: Int64(length), seekExtent: seek) } throws: { error in check(error); return true }
+                        #expect(calls == (skip ? 2 : 1))
+                    }
+                }
             }
-            let dense = try file(root, "dense", payloads()[0].bytes)
-            defer { close(dense) }
-            let legacy = try SparseContent.scan(dense, size: Int64(length), legacy: true, seekExtent: seek)
-            XCTAssertEqual(legacy.checksum, "f1874f462d463d368ff5923cc6bc1bd5e16e948d2108fc31057dd8c11407633e")
-            XCTAssertEqual(legacy.allocated, 21 * UInt64(page))
-            let bytes = Data("small payload".utf8), small = try file(root, "small", bytes)
-            defer { close(small) }
-            let result = try SparseContent.scan(small, size: Int64(bytes.count), seekExtent: seek)
-            XCTAssertEqual(result.checksum, "5bfcd728e8dd338dac05e838f287e56fe4fcb154754cbfb408bb72042df90935")
-            XCTAssertEqual(result.allocated, UInt64(page))
+        }
+        @Test func `Legacy and small hashes do not query extents`() throws {
+            try fixture { root in
+                let seek: SparseContent.ExtentSeeker = { _, _, _ in
+                    Issue.record("legacy and small hashes must retain sequential SHA256"); errno = EIO; return -1
+                }
+                let dense = try file(root, "dense", payloads()[0].bytes)
+                defer { close(dense) }
+                let legacy = try SparseContent.scan(dense, size: Int64(length), legacy: true, seekExtent: seek)
+                #expect(legacy.checksum == "f1874f462d463d368ff5923cc6bc1bd5e16e948d2108fc31057dd8c11407633e")
+                #expect(legacy.allocated == 21 * UInt64(page))
+                let bytes = Data("small payload".utf8), small = try file(root, "small", bytes)
+                defer { close(small) }
+                let result = try SparseContent.scan(small, size: Int64(bytes.count), seekExtent: seek)
+                #expect(result.checksum == "5bfcd728e8dd338dac05e838f287e56fe4fcb154754cbfb408bb72042df90935")
+                #expect(result.allocated == UInt64(page))
+            }
         }
     }
-}
 
-final class FSKitSymlinkJournalTests: XCTestCase {
-    func testMalformedSymlinkLayoutCannotFallBackToLegacyRecovery() throws {
-        let base = try JSONSerialization.jsonObject(with: JSONEncoder().encode(Journal())) as! [String: Any]
-        let invalid: [Any] = [NSNull(), [:] as [String: Any], ["version": 999], ["version": NSNull()]]
-        for record in invalid {
-            var wire = base
-            wire["fsKitLink"] = record
-            let data = try JSONSerialization.data(withJSONObject: wire)
-            XCTAssertThrowsError(try JSONDecoder().decode(Journal.self, from: data),
-                                 "Present but invalid symlink authority must not select legacy recovery")
+    struct FSKitSymlinkJournalTests {
+        @Test func `Malformed symlink layout cannot fall back to legacy recovery`() throws {
+            let base = try JSONSerialization.jsonObject(with: JSONEncoder().encode(Journal())) as! [String: Any]
+            let invalid: [Any] = [NSNull(), [:] as [String: Any], ["version": 999], ["version": NSNull()]]
+            for record in invalid {
+                var wire = base
+                wire["fsKitLink"] = record
+                let data = try JSONSerialization.data(withJSONObject: wire)
+                #expect(throws: (any Error).self, "Present but invalid symlink authority must not select legacy recovery") { try JSONDecoder().decode(Journal.self, from: data) }
+            }
+        }
+
+        @Test func `Absent symlink layout preserves legacy backend journal`() throws {
+            for backend in Configuration.Backend.allCases {
+                var journal = Journal()
+                journal.backend = backend
+                let data = try JSONEncoder().encode(journal)
+                let wire = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+                #expect(wire["fsKitLink"] == nil)
+                #expect((try JSONDecoder().decode(Journal.self, from: data)) == journal)
+            }
         }
     }
 
-    func testAbsentSymlinkLayoutPreservesLegacyBackendJournal() throws {
-        for backend in Configuration.Backend.allCases {
-            var journal = Journal()
-            journal.backend = backend
-            let data = try JSONEncoder().encode(journal)
-            let wire = try JSONSerialization.jsonObject(with: data) as! [String: Any]
-            XCTAssertNil(wire["fsKitLink"])
-            XCTAssertEqual(try JSONDecoder().decode(Journal.self, from: data), journal)
+    /// Owned disk fixtures exercise production transaction helpers. The session
+    /// closures model protocol responses; they are not evidence of an OS mount.
+    struct FSKitSymlinkLifecycleTests {
+        final class Fixture {
+            let root: URL, selected: URL, mountRoot: URL, store: Store, folder: Folder
+            let initial: String, expected: Manifest
+            var journal: Journal
+            var mounted = true
+            var active = false
+            var commands: [String] = []
+            var readPaths: [String] = []
+            var failExport = false
+            var failPopulationRead = false
+            lazy var engine: Engine = {
+                var boundary = EngineSession()
+                boundary.fsKitMountRoot = mountRoot
+                boundary.populationRead = { [unowned self] url in
+                    self.readPaths.append(url.path)
+                    if self.failPopulationRead { throw NestError("Injected physical readback failure") }
+                    return self.expected
+                }
+                boundary.mountedIdentity = { [unowned self] _, _ in self.mounted }
+                boundary.status = { [unowned self] j, id in
+                    guard j.socket != nil else { throw NestError("No fixture helper") }
+                    return HelperStatus(id: id, pid: getpid(), mounted: self.mounted, used: 0, capacity: self.folder.capacity, active: self.active)
+                }
+                boundary.request = { [unowned self] _, command in
+                    let fields = command.components(separatedBy: "\t")
+                    self.commands.append(fields[0])
+                    if fields[0] == "freeze", !self.active {
+                        // Match Helper.cpp: guarded pre-activation trees are already
+                        // frozen, and the active-only freeze command returns EBUSY.
+                        throw NestError("Native helper rejects freeze before activation", code: 6)
+                    }
+                    if fields[0] == "activate" {
+                        let durable = try self.store.journal(self.folder.id)
+                        guard durable.populationVerified, durable.fsKitLink?.stage == .linked else { throw NestError("Activation preceded durable link/readback") }
+                        self.active = true
+                    }
+                    if fields[0] == "export" || fields[0] == "quiesce" {
+                        if self.failExport { throw NestError("Injected checkpoint failure") }
+                        let live = URL(fileURLWithPath: self.journal.fsKitLink!.mountPath)
+                        let manifest = try Snapshot.manifest(live)
+                        try Snapshot.copyTree(from: live, to: URL(fileURLWithPath: fields[1]), manifest: manifest)
+                    }
+                    return []
+                }
+                boundary.unmount = { [unowned self] path in
+                    guard path == self.journal.fsKitLink?.mountPath else { throw NestError("Unmount used original path") }
+                    self.mounted = false
+                    // Model disappearance of the mounted namespace, leaving the
+                    // recorded empty physical reservation. No OS mount is changed.
+                    try FileManager.default.removeItem(at: URL(fileURLWithPath: path).appendingPathComponent("payload"))
+                }
+                return Engine(store: store, session: boundary)
+            }()
+            init(temporary: Bool = false, trash: Bool = false, sourceMode: mode_t = 0o700, fixtureRoot: URL? = nil) throws {
+                let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                root = fixtureRoot ?? project.appendingPathComponent("artifacts/debug-io-instrumentation/symlink-tests-\(UUID().uuidString)")
+                try Store.privateDirectory(root)
+                let sourceParent = root.appendingPathComponent("original-parent"); try Store.privateDirectory(sourceParent)
+                selected = sourceParent.appendingPathComponent("selected"); try Store.privateDirectory(selected)
+                mountRoot = root.appendingPathComponent("RAMNest-Mounts-\(getuid())")
+                store = try Store(root: root.appendingPathComponent("store"))
+                store.fsKitFixtureRoot = mountRoot
+                let identity = try DirectoryHandle.open(selected).identity()
+                var options = FolderOptions(); options.sync = !temporary
+                folder = Folder(name: "Original label", path: selected.path, capacity: 16 << 20, device: identity.device, inode: identity.inode, options: options)
+                var config = Configuration(); config.backend = .fskit; config.folders = [folder]; try store.save(config)
+                try Data("original".utf8).write(to: selected.appendingPathComponent("payload"))
+                if trash {
+                    try Store.privateDirectory(selected.appendingPathComponent(".Trashes"))
+                    try Data("opaque disk Trash".utf8).write(to: selected.appendingPathComponent(".Trashes/retained"))
+                }
+                // Establish only this owned fixture's initial admission metadata.
+                guard chmod(selected.path, sourceMode) == 0 else { throw NestError("Cannot prepare owned source mode") }
+                initial = try Snapshot.capture(store: store, folder: folder, source: selected, previous: nil)
+                expected = try Snapshot.verified(store: store, id: folder.id, revision: initial).1
+                journal = Journal(); journal.phase = .preparing; journal.backend = .fskit; journal.session = UUID()
+                journal.revision = initial; journal.initialRevision = initial; journal.socket = "owned-fixture-socket"
+                // Only the filesystem-location preflight is injected. Reservation,
+                // inode binding, no-follow checks and all mutations are production.
+                journal.fsKitLink = try FSKitLinks.reserve(folder, session: journal.session!, root: mountRoot, filesystemCheck: { _ in })
+                try store.write(journal, for: folder.id)
+            }
+            func dispose() { try? FileManager.default.removeItem(at: root) }
+            func evacuate() throws -> (DirectoryHandle, URL) { try engine.evacuateOriginal(folder, journal: &journal, expected: expected) }
+            func activate() throws {
+                let (source, holding) = try evacuate()
+                let live = URL(fileURLWithPath: journal.fsKitLink!.mountPath)
+                try Data("original".utf8).write(to: live.appendingPathComponent("payload"))
+                journal.mountedDevice = 999; journal.phase = .mounting; try store.write(journal, for: folder.id)
+                try engine.verifyAndActivatePopulation(folder, journal: &journal, expected: expected, source: source, original: holding)
+            }
+            func value() throws -> String { try String(contentsOf: selected.appendingPathComponent("payload"), encoding: .utf8) }
         }
-    }
-}
-
-/// Owned disk fixtures exercise production transaction helpers. The session
-/// closures model protocol responses; they are not evidence of an OS mount.
-final class FSKitSymlinkLifecycleTests: XCTestCase {
-    final class Fixture {
-        let root: URL, selected: URL, mountRoot: URL, store: Store, folder: Folder
-        let initial: String, expected: Manifest
-        var journal: Journal
-        var mounted = true
-        var active = false
-        var commands: [String] = []
-        var readPaths: [String] = []
-        var failExport = false
-        var failPopulationRead = false
-        lazy var engine: Engine = {
-            var boundary = EngineSession()
-            boundary.fsKitMountRoot = mountRoot
-            boundary.populationRead = { [unowned self] url in
-                self.readPaths.append(url.path)
-                if self.failPopulationRead { throw NestError("Injected physical readback failure") }
-                return self.expected
+        @Test func `Mount arguments map physical path and keep source distinct`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            let source = try Snapshot.dataURL(store: f.store, id: f.folder.id, revision: f.initial)
+            let args = try f.engine.helperArguments(f.folder, journal: f.journal, source: source)
+            #expect(args[args.firstIndex(of: "--mount")! + 1] == f.journal.fsKitLink!.mountPath)
+            #expect(args[args.firstIndex(of: "--source")! + 1] == source.path)
+            #expect(URL(fileURLWithPath: f.journal.fsKitLink!.mountPath).lastPathComponent == "selected")
+            f.journal.fsKitLink = nil
+            #expect((try f.engine.helperArguments(f.folder, journal: f.journal, source: source)[args.firstIndex(of: "--mount")! + 1]) == f.selected.path)
+        }
+        @Test func `Whole directory evacuation preserves root and child identities`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            let before = try DirectoryHandle.open(f.selected).entryStat("payload")
+            let (_, holding) = try f.evacuate()
+            #expect(!(FileManager.default.fileExists(atPath: f.selected.path)))
+            #expect((try DirectoryHandle.open(holding).identity().inode) == f.folder.inode)
+            #expect((try DirectoryHandle.open(holding).entryStat("payload").st_ino) == before.st_ino)
+            #expect((try f.store.journal(f.folder.id).fsKitLink?.stage) == .evacuated)
+        }
+        @Test func `Link publication readback precedes activation and keeps original usable`() throws {
+            let f = try Fixture(); defer { f.dispose() }; try f.activate()
+            #expect((try f.value()) == "original")
+            #expect(f.readPaths == [f.journal.fsKitLink!.mountPath])
+            #expect(f.commands == ["activate"])
+            #expect(f.engine.mountedIdentity(f.folder, f.journal))
+            #expect(throws: (any Error).self, "Global symlink rejection must remain strict") { try Paths.checkedIdentity(f.folder) }
+        }
+        @Test func `Exact basename collision refuses without touching source`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            #expect(throws: (any Error).self) { try FSKitLinks.reserve(f.folder, session: UUID(), root: f.mountRoot, filesystemCheck: { _ in }) }
+            try Paths.checkedIdentity(f.folder)
+            #expect((try f.value()) == "original")
+            #expect((try DirectoryHandle.open(f.mountRoot).names()) == ["selected"])
+        }
+        @Test func `Temporary eject preserves original root and child objects`() throws {
+            let f = try Fixture(temporary: true); defer { f.dispose() }
+            let child = try DirectoryHandle.open(f.selected).entryStat("payload").st_ino
+            try f.activate()
+            try Data("discard RAM".utf8).write(to: f.selected.appendingPathComponent("payload"))
+            try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)
+            #expect((try f.value()) == "original")
+            #expect((try DirectoryHandle.open(f.selected).identity().inode) == f.folder.inode)
+            #expect((try DirectoryHandle.open(f.selected).entryStat("payload").st_ino) == child)
+            #expect(!(f.commands.contains("quiesce")))
+            #expect(f.commands.contains("retire"))
+        }
+        @Test func `Normal eject restores latest RAM and refreshes configuration identity`() throws {
+            let f = try Fixture(); defer { f.dispose() }; try f.activate()
+            try Data("latest RAM".utf8).write(to: f.selected.appendingPathComponent("payload"))
+            try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)
+            #expect((try f.value()) == "latest RAM")
+            let updated = try f.engine.folder(f.folder.id.uuidString)
+            #expect(updated.inode != f.folder.inode); try Paths.checkedIdentity(updated)
+            let j = try f.store.journal(f.folder.id)
+            #expect(j.phase == .idle); #expect(j.fsKitLink!.mountReleased)
+            #expect(!(FileManager.default.fileExists(atPath: j.fsKitLink!.mountPath)))
+            #expect(f.commands.firstIndex(of: "quiesce")! < f.commands.firstIndex(of: "retire")!)
+        }
+        @Test func `Checkpoint failure retains RAM link and original holding`() throws {
+            let f = try Fixture(); defer { f.dispose() }; try f.activate(); f.failExport = true
+            #expect(throws: (any Error).self) { try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true) }
+            #expect(f.mounted); #expect(!(f.commands.contains("retire")))
+            #expect((try f.value()) == "original")
+            #expect((try DirectoryHandle.open(f.journal.fsKitLink!.originalDataURL).identity().inode) == f.folder.inode)
+        }
+        @Test func `Link replacement blocks save and retains replacement`() throws {
+            let f = try Fixture(); defer { f.dispose() }; try f.activate()
+            try FileManager.default.removeItem(at: f.selected)
+            try Store.privateDirectory(f.selected)
+            try Data("foreign".utf8).write(to: f.selected.appendingPathComponent("payload"))
+            #expect(throws: (any Error).self) { try f.engine.save(f.folder.id.uuidString) }
+            #expect((try f.value()) == "foreign"); #expect(!(f.commands.contains("export")))
+        }
+        @Test func `Holding and mount root replacement fail closed`() throws {
+            for replaceRoot in [false, true] {
+                let f = try Fixture(); defer { f.dispose() }; _ = try f.evacuate()
+                let target = replaceRoot ? f.mountRoot : URL(fileURLWithPath: f.journal.fsKitLink!.holdingPath)
+                try FileManager.default.moveItem(at: target, to: target.appendingPathExtension("retained"))
+                try Store.privateDirectory(target)
+                #expect(throws: (any Error).self) { try f.engine.restoreLinkedOriginal(f.folder, journal: &f.journal, temporary: true) }
+                #expect(FileManager.default.fileExists(atPath: target.appendingPathExtension("retained").path))
             }
-            boundary.mountedIdentity = { [unowned self] _, _ in self.mounted }
-            boundary.status = { [unowned self] j, id in
-                guard j.socket != nil else { throw NestError("No fixture helper") }
-                return HelperStatus(id: id, pid: getpid(), mounted: self.mounted, used: 0, capacity: self.folder.capacity, active: self.active)
+        }
+        @Test func `Decoder rejects unknown fields backend and incoherent stages`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            let base = try JSONSerialization.jsonObject(with: JSONEncoder().encode(f.journal)) as! [String: Any]
+            for mutation in ["version", "unknown", "stage", "backend", "null-identity"] {
+                var wire = base, layout = wire["fsKitLink"] as! [String: Any]
+                switch mutation {
+                case "version": layout["version"] = 2
+                case "unknown": layout["unrecognizedAuthority"] = true
+                case "stage": layout["stage"] = "linked"
+                case "backend": wire["backend"] = "nfs"
+                default: layout["parent"] = NSNull()
+                }
+                wire["fsKitLink"] = layout
+                #expect(throws: (any Error).self) { try f.store.journalDecoder.decode(Journal.self, from: JSONSerialization.data(withJSONObject: wire)) }
             }
-            boundary.request = { [unowned self] _, command in
+        }
+        @Test func `Evacuation rename crash recovers from bound holding identity`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .evacuated { throw NestError("Injected after rename before checkpoint") } }
+            #expect(throws: (any Error).self) { try f.evacuate() }; f.store.beforeJournalWrite = nil
+            var durable = try f.store.journal(f.folder.id)
+            #expect(durable.fsKitLink?.stage == .evacuating)
+            try f.engine.restoreLinkedOriginal(f.folder, journal: &durable, temporary: true)
+            #expect((try f.value()) == "original"); try Paths.checkedIdentity(f.folder)
+        }
+        @Test func `Publication swap crash resumes latest destination before config`() throws {
+            let f = try Fixture(); defer { f.dispose() }; try f.activate()
+            try Data("committed RAM".utf8).write(to: f.selected.appendingPathComponent("payload"))
+            f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .restored { throw NestError("Injected after swap before checkpoint") } }
+            #expect(throws: (any Error).self) { try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true) }
+            f.store.beforeJournalWrite = nil
+            #expect(!(f.commands.contains("retire")))
+            #expect((try f.value()) == "committed RAM")
+            try f.engine.finalize(f.folder.id.uuidString)
+            #expect((try f.value()) == "committed RAM")
+            try Paths.checkedIdentity(f.engine.folder(f.folder.id.uuidString))
+        }
+        @Test func `Restored checkpoint revalidates completed rename before configuration`() throws {
+            let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            for replace in [false, true] {
+                let root = project.appendingPathComponent("artifacts/source-race-fix/review-restored-\(UUID().uuidString)")
+                let f = try Fixture(fixtureRoot: root); defer { f.dispose() }
+                try f.activate()
+                try Data("committed RAM".utf8).write(to: f.selected.appendingPathComponent("payload"))
+                var checkpoint: Journal?
+                f.store.beforeJournalWrite = { journal, _ in
+                    if journal.fsKitLink?.stage == .restored {
+                        checkpoint = journal
+                        throw NestError("Injected restored checkpoint before configuration")
+                    }
+                }
+                #expect(throws: (any Error).self) { try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true) }
+                f.store.beforeJournalWrite = nil
+                var durable = try #require(checkpoint)
+                #expect(durable.publicationRename?.after != nil)
+                try f.store.write(durable, for: f.folder.id)
+                let beforeConfig = try Data(contentsOf: f.store.root.appendingPathComponent("configuration.json"))
+                if replace {
+                    let payload = f.selected.appendingPathComponent("payload")
+                    let before = try Snapshot.manifest(f.selected)
+                    let copy = f.root.appendingPathComponent("identical-replacement")
+                    try FileManager.default.copyItem(at: payload, to: copy)
+                    try FileManager.default.removeItem(at: payload)
+                    try FileManager.default.moveItem(at: copy, to: payload)
+                    #expect(try Snapshot.manifest(f.selected).matchesExpected(before), "Replacement is invisible to manifest-only checks")
+                    #expect(throws: (any Error).self) { try f.engine.finishLinkedRestore(f.folder, journal: &durable) }
+                    #expect((try Data(contentsOf: f.store.root.appendingPathComponent("configuration.json"))) == beforeConfig)
+                    #expect((try f.store.journal(f.folder.id).fsKitLink?.stage) == .restored)
+                    #expect(FileManager.default.fileExists(atPath: f.journal.fsKitLink!.originalDataURL.path))
+                } else {
+                    try f.engine.finishLinkedRestore(f.folder, journal: &durable)
+                    #expect(durable.phase == .idle)
+                    try Paths.checkedIdentity(f.engine.folder(f.folder.id.uuidString))
+                }
+            }
+        }
+        @Test func `Mountpoint cleanup refuses replaced reservation`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            let mount = URL(fileURLWithPath: f.journal.fsKitLink!.mountPath)
+            try FileManager.default.moveItem(at: mount, to: mount.appendingPathExtension("retained"))
+            try Store.privateDirectory(mount)
+            #expect(throws: (any Error).self) { try FSKitLinks.releaseMountpoint(f.journal.fsKitLink!) }
+            #expect(FileManager.default.fileExists(atPath: mount.path))
+        }
+        @Test func `Source parent replacement retains both trees`() throws {
+            let f = try Fixture(); defer { f.dispose() }; _ = try f.evacuate()
+            let parent = f.selected.deletingLastPathComponent(), retained = parent.appendingPathExtension("retained")
+            try FileManager.default.moveItem(at: parent, to: retained)
+            try Store.privateDirectory(parent); try Store.privateDirectory(f.selected)
+            try Data("replacement".utf8).write(to: f.selected.appendingPathComponent("payload"))
+            #expect(throws: (any Error).self) { try f.engine.restoreLinkedOriginal(f.folder, journal: &f.journal, temporary: true) }
+            #expect((try f.value()) == "replacement")
+            #expect(FileManager.default.fileExists(atPath: retained.appendingPathComponent(URL(fileURLWithPath: f.journal.fsKitLink!.holdingPath).lastPathComponent).path))
+        }
+        @Test func `External disconnect finalization captures retained latest RAM`() throws {
+            let f = try Fixture(); defer { f.dispose() }; try f.activate()
+            try Data("externally ejected RAM".utf8).write(to: f.selected.appendingPathComponent("payload"))
+            // Helper RAM is modeled separately from the now-empty mount reservation.
+            let retained = f.root.appendingPathComponent("retained-ram")
+            let physical = URL(fileURLWithPath: f.journal.fsKitLink!.mountPath)
+            let manifest = try Snapshot.manifest(physical)
+            try Snapshot.copyTree(from: physical, to: retained, manifest: manifest)
+            try FileManager.default.removeItem(at: physical.appendingPathComponent("payload")); f.mounted = false
+            var boundary = EngineSession(); boundary.fsKitMountRoot = f.mountRoot
+            boundary.status = { j, id in HelperStatus(id: id, pid: getpid(), mounted: false, used: 0, capacity: f.folder.capacity, active: false) }
+            boundary.request = { _, command in
                 let fields = command.components(separatedBy: "\t")
-                self.commands.append(fields[0])
-                if fields[0] == "freeze", !self.active {
-                    // Match Helper.cpp: guarded pre-activation trees are already
-                    // frozen, and the active-only freeze command returns EBUSY.
-                    throw NestError("Native helper rejects freeze before activation", code: 6)
-                }
-                if fields[0] == "activate" {
-                    let durable = try self.store.journal(self.folder.id)
-                    guard durable.populationVerified, durable.fsKitLink?.stage == .linked else { throw NestError("Activation preceded durable link/readback") }
-                    self.active = true
-                }
-                if fields[0] == "export" || fields[0] == "quiesce" {
-                    if self.failExport { throw NestError("Injected checkpoint failure") }
-                    let live = URL(fileURLWithPath: self.journal.fsKitLink!.mountPath)
-                    let manifest = try Snapshot.manifest(live)
-                    try Snapshot.copyTree(from: live, to: URL(fileURLWithPath: fields[1]), manifest: manifest)
-                }
+                if fields[0] == "quiesce" { try Snapshot.copyTree(from: retained, to: URL(fileURLWithPath: fields[1]), manifest: Snapshot.manifest(retained)) }
                 return []
             }
-            boundary.unmount = { [unowned self] path in
-                guard path == self.journal.fsKitLink?.mountPath else { throw NestError("Unmount used original path") }
-                self.mounted = false
-                // Model disappearance of the mounted namespace, leaving the
-                // recorded empty physical reservation. No OS mount is changed.
-                try FileManager.default.removeItem(at: URL(fileURLWithPath: path).appendingPathComponent("payload"))
-            }
-            return Engine(store: store, session: boundary)
-        }()
-        init(temporary: Bool = false, trash: Bool = false, sourceMode: mode_t = 0o700, fixtureRoot: URL? = nil) throws {
-            let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            root = fixtureRoot ?? project.appendingPathComponent("artifacts/debug-io-instrumentation/symlink-tests-\(UUID().uuidString)")
-            try Store.privateDirectory(root)
-            let sourceParent = root.appendingPathComponent("original-parent"); try Store.privateDirectory(sourceParent)
-            selected = sourceParent.appendingPathComponent("selected"); try Store.privateDirectory(selected)
-            mountRoot = root.appendingPathComponent("RAMNest-Mounts-\(getuid())")
-            store = try Store(root: root.appendingPathComponent("store"))
-            store.fsKitFixtureRoot = mountRoot
-            let identity = try DirectoryHandle.open(selected).identity()
-            var options = FolderOptions(); options.sync = !temporary
-            folder = Folder(name: "Original label", path: selected.path, capacity: 16 << 20, device: identity.device, inode: identity.inode, options: options)
-            var config = Configuration(); config.backend = .fskit; config.folders = [folder]; try store.save(config)
-            try Data("original".utf8).write(to: selected.appendingPathComponent("payload"))
-            if trash {
-                try Store.privateDirectory(selected.appendingPathComponent(".Trashes"))
-                try Data("opaque disk Trash".utf8).write(to: selected.appendingPathComponent(".Trashes/retained"))
-            }
-            // Establish only this owned fixture's initial admission metadata.
-            guard chmod(selected.path, sourceMode) == 0 else { throw NestError("Cannot prepare owned source mode") }
-            initial = try Snapshot.capture(store: store, folder: folder, source: selected, previous: nil)
-            expected = try Snapshot.verified(store: store, id: folder.id, revision: initial).1
-            journal = Journal(); journal.phase = .preparing; journal.backend = .fskit; journal.session = UUID()
-            journal.revision = initial; journal.initialRevision = initial; journal.socket = "owned-fixture-socket"
-            // Only the filesystem-location preflight is injected. Reservation,
-            // inode binding, no-follow checks and all mutations are production.
-            journal.fsKitLink = try FSKitLinks.reserve(folder, session: journal.session!, root: mountRoot, filesystemCheck: { _ in })
-            try store.write(journal, for: folder.id)
+            try Engine(store: f.store, session: boundary).finalize(f.folder.id.uuidString)
+            #expect((try f.value()) == "externally ejected RAM")
+            #expect((try f.store.journal(f.folder.id).phase) == .idle)
         }
-        func dispose() { try? FileManager.default.removeItem(at: root) }
-        func evacuate() throws -> (DirectoryHandle, URL) { try engine.evacuateOriginal(folder, journal: &journal, expected: expected) }
-        func activate() throws {
-            let (source, holding) = try evacuate()
-            let live = URL(fileURLWithPath: journal.fsKitLink!.mountPath)
-            try Data("original".utf8).write(to: live.appendingPathComponent("payload"))
-            journal.mountedDevice = 999; journal.phase = .mounting; try store.write(journal, for: folder.id)
-            try engine.verifyAndActivatePopulation(folder, journal: &journal, expected: expected, source: source, original: holding)
+        @Test func `Disk trash backup is retained with warning after normal restore`() throws {
+            let f = try Fixture(trash: true); defer { f.dispose() }; try f.activate()
+            let holding = URL(fileURLWithPath: f.journal.fsKitLink!.holdingPath)
+            try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)
+            #expect((try String(contentsOf: holding.appendingPathComponent("data/.Trashes/retained"), encoding: .utf8)) == "opaque disk Trash")
+            #expect((try f.store.journal(f.folder.id).cleanupWarning) != nil)
         }
-        func value() throws -> String { try String(contentsOf: selected.appendingPathComponent("payload"), encoding: .utf8) }
-    }
-    func testMountArgumentsMapPhysicalPathAndKeepSourceDistinct() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        let source = try Snapshot.dataURL(store: f.store, id: f.folder.id, revision: f.initial)
-        let args = try f.engine.helperArguments(f.folder, journal: f.journal, source: source)
-        XCTAssertEqual(args[args.firstIndex(of: "--mount")! + 1], f.journal.fsKitLink!.mountPath)
-        XCTAssertEqual(args[args.firstIndex(of: "--source")! + 1], source.path)
-        XCTAssertEqual(URL(fileURLWithPath: f.journal.fsKitLink!.mountPath).lastPathComponent, "selected")
-        f.journal.fsKitLink = nil
-        XCTAssertEqual(try f.engine.helperArguments(f.folder, journal: f.journal, source: source)[args.firstIndex(of: "--mount")! + 1], f.selected.path)
-    }
-    func testWholeDirectoryEvacuationPreservesRootAndChildIdentities() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        let before = try DirectoryHandle.open(f.selected).entryStat("payload")
-        let (_, holding) = try f.evacuate()
-        XCTAssertFalse(FileManager.default.fileExists(atPath: f.selected.path))
-        XCTAssertEqual(try DirectoryHandle.open(holding).identity().inode, f.folder.inode)
-        XCTAssertEqual(try DirectoryHandle.open(holding).entryStat("payload").st_ino, before.st_ino)
-        XCTAssertEqual(try f.store.journal(f.folder.id).fsKitLink?.stage, .evacuated)
-    }
-    func testLinkPublicationReadbackPrecedesActivationAndKeepsOriginalUsable() throws {
-        let f = try Fixture(); defer { f.dispose() }; try f.activate()
-        XCTAssertEqual(try f.value(), "original")
-        XCTAssertEqual(f.readPaths, [f.journal.fsKitLink!.mountPath])
-        XCTAssertEqual(f.commands, ["activate"])
-        XCTAssertTrue(f.engine.mountedIdentity(f.folder, f.journal))
-        XCTAssertThrowsError(try Paths.checkedIdentity(f.folder), "Global symlink rejection must remain strict")
-    }
-    func testExactBasenameCollisionRefusesWithoutTouchingSource() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        XCTAssertThrowsError(try FSKitLinks.reserve(f.folder, session: UUID(), root: f.mountRoot, filesystemCheck: { _ in }))
-        try Paths.checkedIdentity(f.folder)
-        XCTAssertEqual(try f.value(), "original")
-        XCTAssertEqual(try DirectoryHandle.open(f.mountRoot).names(), ["selected"])
-    }
-    func testTemporaryEjectPreservesOriginalRootAndChildObjects() throws {
-        let f = try Fixture(temporary: true); defer { f.dispose() }
-        let child = try DirectoryHandle.open(f.selected).entryStat("payload").st_ino
-        try f.activate()
-        try Data("discard RAM".utf8).write(to: f.selected.appendingPathComponent("payload"))
-        try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)
-        XCTAssertEqual(try f.value(), "original")
-        XCTAssertEqual(try DirectoryHandle.open(f.selected).identity().inode, f.folder.inode)
-        XCTAssertEqual(try DirectoryHandle.open(f.selected).entryStat("payload").st_ino, child)
-        XCTAssertFalse(f.commands.contains("quiesce"))
-        XCTAssertTrue(f.commands.contains("retire"))
-    }
-    func testNormalEjectRestoresLatestRAMAndRefreshesConfigurationIdentity() throws {
-        let f = try Fixture(); defer { f.dispose() }; try f.activate()
-        try Data("latest RAM".utf8).write(to: f.selected.appendingPathComponent("payload"))
-        try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)
-        XCTAssertEqual(try f.value(), "latest RAM")
-        let updated = try f.engine.folder(f.folder.id.uuidString)
-        XCTAssertNotEqual(updated.inode, f.folder.inode); try Paths.checkedIdentity(updated)
-        let j = try f.store.journal(f.folder.id)
-        XCTAssertEqual(j.phase, .idle); XCTAssertTrue(j.fsKitLink!.mountReleased)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: j.fsKitLink!.mountPath))
-        XCTAssertTrue(f.commands.firstIndex(of: "quiesce")! < f.commands.firstIndex(of: "retire")!)
-    }
-    func testCheckpointFailureRetainsRAMLinkAndOriginalHolding() throws {
-        let f = try Fixture(); defer { f.dispose() }; try f.activate(); f.failExport = true
-        XCTAssertThrowsError(try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true))
-        XCTAssertTrue(f.mounted); XCTAssertFalse(f.commands.contains("retire"))
-        XCTAssertEqual(try f.value(), "original")
-        XCTAssertEqual(try DirectoryHandle.open(f.journal.fsKitLink!.originalDataURL).identity().inode, f.folder.inode)
-    }
-    func testLinkReplacementBlocksSaveAndRetainsReplacement() throws {
-        let f = try Fixture(); defer { f.dispose() }; try f.activate()
-        try FileManager.default.removeItem(at: f.selected)
-        try Store.privateDirectory(f.selected)
-        try Data("foreign".utf8).write(to: f.selected.appendingPathComponent("payload"))
-        XCTAssertThrowsError(try f.engine.save(f.folder.id.uuidString))
-        XCTAssertEqual(try f.value(), "foreign"); XCTAssertFalse(f.commands.contains("export"))
-    }
-    func testHoldingAndMountRootReplacementFailClosed() throws {
-        for replaceRoot in [false, true] {
-            let f = try Fixture(); defer { f.dispose() }; _ = try f.evacuate()
-            let target = replaceRoot ? f.mountRoot : URL(fileURLWithPath: f.journal.fsKitLink!.holdingPath)
-            try FileManager.default.moveItem(at: target, to: target.appendingPathExtension("retained"))
-            try Store.privateDirectory(target)
-            XCTAssertThrowsError(try f.engine.restoreLinkedOriginal(f.folder, journal: &f.journal, temporary: true))
-            XCTAssertTrue(FileManager.default.fileExists(atPath: target.appendingPathExtension("retained").path))
-        }
-    }
-    func testDecoderRejectsUnknownFieldsBackendAndIncoherentStages() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        let base = try JSONSerialization.jsonObject(with: JSONEncoder().encode(f.journal)) as! [String: Any]
-        for mutation in ["version", "unknown", "stage", "backend", "null-identity"] {
-            var wire = base, layout = wire["fsKitLink"] as! [String: Any]
-            switch mutation {
-            case "version": layout["version"] = 2
-            case "unknown": layout["unrecognizedAuthority"] = true
-            case "stage": layout["stage"] = "linked"
-            case "backend": wire["backend"] = "nfs"
-            default: layout["parent"] = NSNull()
-            }
-            wire["fsKitLink"] = layout
-            XCTAssertThrowsError(try f.store.journalDecoder.decode(Journal.self, from: JSONSerialization.data(withJSONObject: wire)))
-        }
-    }
-    func testEvacuationRenameCrashRecoversFromBoundHoldingIdentity() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .evacuated { throw NestError("Injected after rename before checkpoint") } }
-        XCTAssertThrowsError(try f.evacuate()); f.store.beforeJournalWrite = nil
-        var durable = try f.store.journal(f.folder.id)
-        XCTAssertEqual(durable.fsKitLink?.stage, .evacuating)
-        try f.engine.restoreLinkedOriginal(f.folder, journal: &durable, temporary: true)
-        XCTAssertEqual(try f.value(), "original"); try Paths.checkedIdentity(f.folder)
-    }
-    func testPublicationSwapCrashResumesLatestDestinationBeforeConfig() throws {
-        let f = try Fixture(); defer { f.dispose() }; try f.activate()
-        try Data("committed RAM".utf8).write(to: f.selected.appendingPathComponent("payload"))
-        f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .restored { throw NestError("Injected after swap before checkpoint") } }
-        XCTAssertThrowsError(try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true))
-        f.store.beforeJournalWrite = nil
-        XCTAssertFalse(f.commands.contains("retire"))
-        XCTAssertEqual(try f.value(), "committed RAM")
-        try f.engine.finalize(f.folder.id.uuidString)
-        XCTAssertEqual(try f.value(), "committed RAM")
-        try Paths.checkedIdentity(f.engine.folder(f.folder.id.uuidString))
-    }
-    func testRestoredCheckpointRevalidatesCompletedRenameBeforeConfiguration() throws {
-        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        for replace in [false, true] {
-            let root = project.appendingPathComponent("artifacts/source-race-fix/review-restored-\(UUID().uuidString)")
-            let f = try Fixture(fixtureRoot: root); defer { f.dispose() }
-            try f.activate()
-            try Data("committed RAM".utf8).write(to: f.selected.appendingPathComponent("payload"))
-            var checkpoint: Journal?
-            f.store.beforeJournalWrite = { journal, _ in
-                if journal.fsKitLink?.stage == .restored {
-                    checkpoint = journal
-                    throw NestError("Injected restored checkpoint before configuration")
+        @Test func `Interrupted restore copy retains backup checkpoint and helper`() throws {
+            let f = try Fixture(); defer { f.dispose() }; try f.activate()
+            f.store.beforeJournalWrite = { j, _ in
+                if j.fsKitLink?.stage == .restoring, let stage = j.restoreStage {
+                    // A foreign child conflicts with copyTree's required new data
+                    // destination. The recorded stage itself remains pinned.
+                    try Store.privateDirectory(URL(fileURLWithPath: stage).appendingPathExtension("data"))
                 }
             }
-            XCTAssertThrowsError(try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true))
-            f.store.beforeJournalWrite = nil
-            var durable = try XCTUnwrap(checkpoint)
-            XCTAssertNotNil(durable.publicationRename?.after)
-            try f.store.write(durable, for: f.folder.id)
-            let beforeConfig = try Data(contentsOf: f.store.root.appendingPathComponent("configuration.json"))
-            if replace {
-                let payload = f.selected.appendingPathComponent("payload")
-                let before = try Snapshot.manifest(f.selected)
-                let copy = f.root.appendingPathComponent("identical-replacement")
-                try FileManager.default.copyItem(at: payload, to: copy)
-                try FileManager.default.removeItem(at: payload)
-                try FileManager.default.moveItem(at: copy, to: payload)
-                XCTAssertTrue(try Snapshot.manifest(f.selected).matchesExpected(before), "Replacement is invisible to manifest-only checks")
-                XCTAssertThrowsError(try f.engine.finishLinkedRestore(f.folder, journal: &durable))
-                XCTAssertEqual(try Data(contentsOf: f.store.root.appendingPathComponent("configuration.json")), beforeConfig)
-                XCTAssertEqual(try f.store.journal(f.folder.id).fsKitLink?.stage, .restored)
-                XCTAssertTrue(FileManager.default.fileExists(atPath: f.journal.fsKitLink!.originalDataURL.path))
-            } else {
-                try f.engine.finishLinkedRestore(f.folder, journal: &durable)
-                XCTAssertEqual(durable.phase, .idle)
-                try Paths.checkedIdentity(f.engine.folder(f.folder.id.uuidString))
-            }
+            #expect(throws: (any Error).self) { try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true) }; f.store.beforeJournalWrite = nil
+            let durable = try f.store.journal(f.folder.id)
+            #expect(durable.restoreStage != nil); #expect(durable.restoreRevision != nil)
+            #expect(FileManager.default.fileExists(atPath: durable.fsKitLink!.holdingPath))
+            #expect(!(f.commands.contains("retire")))
+            #expect(throws: (any Error).self) { try f.engine.finalize(f.folder.id.uuidString) }
         }
-    }
-    func testMountpointCleanupRefusesReplacedReservation() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        let mount = URL(fileURLWithPath: f.journal.fsKitLink!.mountPath)
-        try FileManager.default.moveItem(at: mount, to: mount.appendingPathExtension("retained"))
-        try Store.privateDirectory(mount)
-        XCTAssertThrowsError(try FSKitLinks.releaseMountpoint(f.journal.fsKitLink!))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: mount.path))
-    }
-    func testSourceParentReplacementRetainsBothTrees() throws {
-        let f = try Fixture(); defer { f.dispose() }; _ = try f.evacuate()
-        let parent = f.selected.deletingLastPathComponent(), retained = parent.appendingPathExtension("retained")
-        try FileManager.default.moveItem(at: parent, to: retained)
-        try Store.privateDirectory(parent); try Store.privateDirectory(f.selected)
-        try Data("replacement".utf8).write(to: f.selected.appendingPathComponent("payload"))
-        XCTAssertThrowsError(try f.engine.restoreLinkedOriginal(f.folder, journal: &f.journal, temporary: true))
-        XCTAssertEqual(try f.value(), "replacement")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: retained.appendingPathComponent(URL(fileURLWithPath: f.journal.fsKitLink!.holdingPath).lastPathComponent).path))
-    }
-    func testExternalDisconnectFinalizationCapturesRetainedLatestRAM() throws {
-        let f = try Fixture(); defer { f.dispose() }; try f.activate()
-        try Data("externally ejected RAM".utf8).write(to: f.selected.appendingPathComponent("payload"))
-        // Helper RAM is modeled separately from the now-empty mount reservation.
-        let retained = f.root.appendingPathComponent("retained-ram")
-        let physical = URL(fileURLWithPath: f.journal.fsKitLink!.mountPath)
-        let manifest = try Snapshot.manifest(physical)
-        try Snapshot.copyTree(from: physical, to: retained, manifest: manifest)
-        try FileManager.default.removeItem(at: physical.appendingPathComponent("payload")); f.mounted = false
-        var boundary = EngineSession(); boundary.fsKitMountRoot = f.mountRoot
-        boundary.status = { j, id in HelperStatus(id: id, pid: getpid(), mounted: false, used: 0, capacity: f.folder.capacity, active: false) }
-        boundary.request = { _, command in
-            let fields = command.components(separatedBy: "\t")
-            if fields[0] == "quiesce" { try Snapshot.copyTree(from: retained, to: URL(fileURLWithPath: fields[1]), manifest: Snapshot.manifest(retained)) }
-            return []
-        }
-        try Engine(store: f.store, session: boundary).finalize(f.folder.id.uuidString)
-        XCTAssertEqual(try f.value(), "externally ejected RAM")
-        XCTAssertEqual(try f.store.journal(f.folder.id).phase, .idle)
-    }
-    func testDiskTrashBackupIsRetainedWithWarningAfterNormalRestore() throws {
-        let f = try Fixture(trash: true); defer { f.dispose() }; try f.activate()
-        let holding = URL(fileURLWithPath: f.journal.fsKitLink!.holdingPath)
-        try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)
-        XCTAssertEqual(try String(contentsOf: holding.appendingPathComponent("data/.Trashes/retained"), encoding: .utf8), "opaque disk Trash")
-        XCTAssertNotNil(try f.store.journal(f.folder.id).cleanupWarning)
-    }
-    func testInterruptedRestoreCopyRetainsBackupCheckpointAndHelper() throws {
-        let f = try Fixture(); defer { f.dispose() }; try f.activate()
-        f.store.beforeJournalWrite = { j, _ in
-            if j.fsKitLink?.stage == .restoring, let stage = j.restoreStage {
-                // A foreign child conflicts with copyTree's required new data
-                // destination. The recorded stage itself remains pinned.
-                try Store.privateDirectory(URL(fileURLWithPath: stage).appendingPathExtension("data"))
-            }
-        }
-        XCTAssertThrowsError(try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)); f.store.beforeJournalWrite = nil
-        let durable = try f.store.journal(f.folder.id)
-        XCTAssertNotNil(durable.restoreStage); XCTAssertNotNil(durable.restoreRevision)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: durable.fsKitLink!.holdingPath))
-        XCTAssertFalse(f.commands.contains("retire"))
-        XCTAssertThrowsError(try f.engine.finalize(f.folder.id.uuidString))
-    }
-    func testConfigWrittenBeforeIdleJournalCanResume() throws {
-        let f = try Fixture(); defer { f.dispose() }; try f.activate()
-        try Data("new committed content".utf8).write(to: f.selected.appendingPathComponent("payload"))
-        f.store.beforeJournalWrite = { j, _ in if j.phase == .idle { throw NestError("Injected config-to-idle boundary") } }
-        XCTAssertThrowsError(try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)); f.store.beforeJournalWrite = nil
-        let updated = try f.engine.folder(f.folder.id.uuidString)
-        XCTAssertNotEqual(updated.inode, f.folder.inode)
-        XCTAssertEqual(try f.store.journal(f.folder.id).fsKitLink?.stage, .restored)
-        try f.engine.finalize(f.folder.id.uuidString)
-        XCTAssertEqual(try f.value(), "new committed content"); try Paths.checkedIdentity(updated)
-    }
-    func testLinkRenameCrashRestoresOnlyBoundOriginal() throws {
-        let f = try Fixture(); defer { f.dispose() }; _ = try f.evacuate()
-        f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .linked { throw NestError("Injected after link rename") } }
-        XCTAssertThrowsError(try f.engine.publishOriginalLink(f.folder, journal: &f.journal)); f.store.beforeJournalWrite = nil
-        var durable = try f.store.journal(f.folder.id)
-        XCTAssertEqual(durable.fsKitLink?.stage, .linking)
-        try f.engine.restoreLinkedOriginal(f.folder, journal: &durable, temporary: true)
-        XCTAssertEqual(try f.value(), "original"); try Paths.checkedIdentity(f.folder)
-    }
-    func testLinkIntentCrashBeforeRenameCleansOnlyOwnedStagedLink() throws {
-        let f = try Fixture(); defer { f.dispose() }; _ = try f.evacuate()
-        // Publish the linking intent, then simulate the rename not occurring.
-        try f.engine.publishOriginalLink(f.folder, journal: &f.journal)
-        let parent = try DirectoryHandle.open(f.selected.deletingLastPathComponent())
-        let staged = URL(fileURLWithPath: f.journal.fsKitLink!.linkStagePath).lastPathComponent
-        try parent.renameNoReplace(f.selected.lastPathComponent, to: parent, as: staged); try parent.sync()
-        f.journal.fsKitLink!.stage = .linking; try f.store.write(f.journal, for: f.folder.id)
-        try f.engine.restoreLinkedOriginal(f.folder, journal: &f.journal, temporary: true)
-        XCTAssertEqual(try f.value(), "original"); XCTAssertFalse(try parent.exists(staged))
-    }
-    func testRestoredDestinationReplacementBlocksConfigTransition() throws {
-        let f = try Fixture(); defer { f.dispose() }; try f.activate()
-        f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .restored { throw NestError("Injected after restore swap") } }
-        XCTAssertThrowsError(try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)); f.store.beforeJournalWrite = nil
-        let retained = f.selected.appendingPathExtension("restored-retained")
-        try FileManager.default.moveItem(at: f.selected, to: retained); try Store.privateDirectory(f.selected)
-        try Data("foreign destination".utf8).write(to: f.selected.appendingPathComponent("payload"))
-        XCTAssertThrowsError(try f.engine.finalize(f.folder.id.uuidString))
-        XCTAssertEqual(try f.value(), "foreign destination")
-        XCTAssertEqual(try f.engine.folder(f.folder.id.uuidString).inode, f.folder.inode)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: retained.appendingPathComponent("payload").path))
-    }
-    func testUnjournaledStagedLinkIsRetainedWithoutAdoption() throws {
-        let f = try Fixture(); defer { f.dispose() }; _ = try f.evacuate()
-        f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .linking { throw NestError("Injected before link identity checkpoint") } }
-        XCTAssertThrowsError(try f.engine.publishOriginalLink(f.folder, journal: &f.journal)); f.store.beforeJournalWrite = nil
-        var durable = try f.store.journal(f.folder.id)
-        XCTAssertNil(durable.fsKitLink?.link)
-        XCTAssertThrowsError(try f.engine.restoreLinkedOriginal(f.folder, journal: &durable, temporary: true))
-        XCTAssertEqual(try f.value(), "original", "Disk restoration may commit; unknown staging still blocks cleanup/retirement")
-        var st = stat(); XCTAssertEqual(lstat(durable.fsKitLink!.linkStagePath, &st), 0); XCTAssertEqual(st.st_mode & S_IFMT, S_IFLNK)
-    }
-    func testInternalFilesystemPreflightFailureOccursBeforeReservation() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        let other = f.root.appendingPathComponent("preflight-parent"); try Store.privateDirectory(other)
-        let root = other.appendingPathComponent("RAMNest-Mounts-\(getuid())")
-        XCTAssertThrowsError(try FSKitLinks.reserve(f.folder, session: UUID(), root: root, filesystemCheck: { _ in throw NestError("Injected external filesystem") }))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path)); try Paths.checkedIdentity(f.folder)
-    }
-    func testFailedPhysicalReadbackNeverPublishesOrActivatesAndCanEjectGuarded() throws {
-        let f = try Fixture(); defer { f.dispose() }; f.failPopulationRead = true
-        XCTAssertThrowsError(try f.activate())
-        XCTAssertFalse(f.active); XCTAssertFalse(f.commands.contains("activate"))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: f.selected.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: f.journal.fsKitLink!.holdingPath))
-        try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)
-        XCTAssertEqual(try f.value(), "original"); try Paths.checkedIdentity(f.folder)
-        XCTAssertFalse(f.commands.contains("quiesce")); XCTAssertTrue(f.commands.contains("retire"))
-    }
-    func testUnsafeMountRootModeRefusesBeforeEvacuation() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        let handle = try DirectoryHandle.open(f.mountRoot)
-        XCTAssertEqual(fchmod(handle.fd, 0o755), 0)
-        XCTAssertThrowsError(try f.evacuate()); try Paths.checkedIdentity(f.folder)
-        XCTAssertEqual(try f.value(), "original")
-    }
-    func testCentralDecoderRejectsNonProductionRootWithoutFixtureContext() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        let data = try JSONEncoder().encode(f.journal)
-        XCTAssertThrowsError(try JSONDecoder().decode(Journal.self, from: data))
-        XCTAssertEqual(try f.store.journalDecoder.decode(Journal.self, from: data), f.journal)
-    }
-    func testPublicSourceModeNormalAndTemporaryRestoresPreserveMetadataAndCleanWrapper() throws {
-        for temporary in [false, true] {
-            let f = try Fixture(temporary: temporary, sourceMode: 0o755); defer { f.dispose() }
-            try f.activate()
-            let layout = f.journal.fsKitLink!, wrapper = URL(fileURLWithPath: layout.holdingPath)
-            let parent = try DirectoryHandle.open(wrapper.deletingLastPathComponent())
-            XCTAssertEqual(try parent.entryStat(wrapper.lastPathComponent).st_mode & 0o7777, 0o700)
-            XCTAssertEqual(try DirectoryHandle.open(wrapper).entryStat("data").st_mode & 0o7777, 0o755)
-            let before = try DirectoryHandle.open(layout.originalDataURL).entryStat("payload").st_ino
-            // Model the original logical root mode in the mounted view.
-            try Snapshot.restorePublicRootMetadata(from: DirectoryHandle.open(layout.originalDataURL),
-                to: DirectoryHandle.open(URL(fileURLWithPath: layout.mountPath)), manifest: f.expected)
-            try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)
+        @Test func `Config written before idle journal can resume`() throws {
+            let f = try Fixture(); defer { f.dispose() }; try f.activate()
+            try Data("new committed content".utf8).write(to: f.selected.appendingPathComponent("payload"))
+            f.store.beforeJournalWrite = { j, _ in if j.phase == .idle { throw NestError("Injected config-to-idle boundary") } }
+            #expect(throws: (any Error).self) { try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true) }; f.store.beforeJournalWrite = nil
             let updated = try f.engine.folder(f.folder.id.uuidString)
-            XCTAssertEqual(try DirectoryHandle.open(f.selected.deletingLastPathComponent()).entryStat(f.selected.lastPathComponent).st_mode & 0o7777, 0o755)
-            if temporary {
-                XCTAssertEqual(updated.inode, f.folder.inode)
-                XCTAssertEqual(try DirectoryHandle.open(f.selected).entryStat("payload").st_ino, before)
+            #expect(updated.inode != f.folder.inode)
+            #expect((try f.store.journal(f.folder.id).fsKitLink?.stage) == .restored)
+            try f.engine.finalize(f.folder.id.uuidString)
+            #expect((try f.value()) == "new committed content"); try Paths.checkedIdentity(updated)
+        }
+        @Test func `Link rename crash restores only bound original`() throws {
+            let f = try Fixture(); defer { f.dispose() }; _ = try f.evacuate()
+            f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .linked { throw NestError("Injected after link rename") } }
+            #expect(throws: (any Error).self) { try f.engine.publishOriginalLink(f.folder, journal: &f.journal) }; f.store.beforeJournalWrite = nil
+            var durable = try f.store.journal(f.folder.id)
+            #expect(durable.fsKitLink?.stage == .linking)
+            try f.engine.restoreLinkedOriginal(f.folder, journal: &durable, temporary: true)
+            #expect((try f.value()) == "original"); try Paths.checkedIdentity(f.folder)
+        }
+        @Test func `Link intent crash before rename cleans only owned staged link`() throws {
+            let f = try Fixture(); defer { f.dispose() }; _ = try f.evacuate()
+            // Publish the linking intent, then simulate the rename not occurring.
+            try f.engine.publishOriginalLink(f.folder, journal: &f.journal)
+            let parent = try DirectoryHandle.open(f.selected.deletingLastPathComponent())
+            let staged = URL(fileURLWithPath: f.journal.fsKitLink!.linkStagePath).lastPathComponent
+            try parent.renameNoReplace(f.selected.lastPathComponent, to: parent, as: staged); try parent.sync()
+            f.journal.fsKitLink!.stage = .linking; try f.store.write(f.journal, for: f.folder.id)
+            try f.engine.restoreLinkedOriginal(f.folder, journal: &f.journal, temporary: true)
+            #expect((try f.value()) == "original"); #expect(!(try parent.exists(staged)))
+        }
+        @Test func `Restored destination replacement blocks config transition`() throws {
+            let f = try Fixture(); defer { f.dispose() }; try f.activate()
+            f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .restored { throw NestError("Injected after restore swap") } }
+            #expect(throws: (any Error).self) { try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true) }; f.store.beforeJournalWrite = nil
+            let retained = f.selected.appendingPathExtension("restored-retained")
+            try FileManager.default.moveItem(at: f.selected, to: retained); try Store.privateDirectory(f.selected)
+            try Data("foreign destination".utf8).write(to: f.selected.appendingPathComponent("payload"))
+            #expect(throws: (any Error).self) { try f.engine.finalize(f.folder.id.uuidString) }
+            #expect((try f.value()) == "foreign destination")
+            #expect((try f.engine.folder(f.folder.id.uuidString).inode) == f.folder.inode)
+            #expect(FileManager.default.fileExists(atPath: retained.appendingPathComponent("payload").path))
+        }
+        @Test func `Unjournaled staged link is retained without adoption`() throws {
+            let f = try Fixture(); defer { f.dispose() }; _ = try f.evacuate()
+            f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .linking { throw NestError("Injected before link identity checkpoint") } }
+            #expect(throws: (any Error).self) { try f.engine.publishOriginalLink(f.folder, journal: &f.journal) }; f.store.beforeJournalWrite = nil
+            var durable = try f.store.journal(f.folder.id)
+            #expect(durable.fsKitLink?.link == nil)
+            #expect(throws: (any Error).self) { try f.engine.restoreLinkedOriginal(f.folder, journal: &durable, temporary: true) }
+            #expect((try f.value()) == "original", "Disk restoration may commit; unknown staging still blocks cleanup/retirement")
+            var st = stat(); #expect(lstat(durable.fsKitLink!.linkStagePath, &st) == 0); #expect(st.st_mode & S_IFMT == S_IFLNK)
+        }
+        @Test func `Internal filesystem preflight failure occurs before reservation`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            let other = f.root.appendingPathComponent("preflight-parent"); try Store.privateDirectory(other)
+            let root = other.appendingPathComponent("RAMNest-Mounts-\(getuid())")
+            #expect(throws: (any Error).self) { try FSKitLinks.reserve(f.folder, session: UUID(), root: root, filesystemCheck: { _ in throw NestError("Injected external filesystem") }) }
+            #expect(!(FileManager.default.fileExists(atPath: root.path))); try Paths.checkedIdentity(f.folder)
+        }
+        @Test func `Failed physical readback never publishes or activates and can eject guarded`() throws {
+            let f = try Fixture(); defer { f.dispose() }; f.failPopulationRead = true
+            #expect(throws: (any Error).self) { try f.activate() }
+            #expect(!(f.active)); #expect(!(f.commands.contains("activate")))
+            #expect(!(FileManager.default.fileExists(atPath: f.selected.path)))
+            #expect(FileManager.default.fileExists(atPath: f.journal.fsKitLink!.holdingPath))
+            try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)
+            #expect((try f.value()) == "original"); try Paths.checkedIdentity(f.folder)
+            #expect(!(f.commands.contains("quiesce"))); #expect(f.commands.contains("retire"))
+        }
+        @Test func `Unsafe mount root mode refuses before evacuation`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            let handle = try DirectoryHandle.open(f.mountRoot)
+            #expect(fchmod(handle.fd, 0o755) == 0)
+            #expect(throws: (any Error).self) { try f.evacuate() }; try Paths.checkedIdentity(f.folder)
+            #expect((try f.value()) == "original")
+        }
+        @Test func `Central decoder rejects non production root without fixture context`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            let data = try JSONEncoder().encode(f.journal)
+            #expect(throws: (any Error).self) { try JSONDecoder().decode(Journal.self, from: data) }
+            #expect((try f.store.journalDecoder.decode(Journal.self, from: data)) == f.journal)
+        }
+        @Test func `Public source mode normal and temporary restores preserve metadata and clean wrapper`() throws {
+            for temporary in [false, true] {
+                let f = try Fixture(temporary: temporary, sourceMode: 0o755); defer { f.dispose() }
+                try f.activate()
+                let layout = f.journal.fsKitLink!, wrapper = URL(fileURLWithPath: layout.holdingPath)
+                let parent = try DirectoryHandle.open(wrapper.deletingLastPathComponent())
+                #expect((try parent.entryStat(wrapper.lastPathComponent).st_mode & 0o7777) == 0o700)
+                #expect((try DirectoryHandle.open(wrapper).entryStat("data").st_mode & 0o7777) == 0o755)
+                let before = try DirectoryHandle.open(layout.originalDataURL).entryStat("payload").st_ino
+                // Model the original logical root mode in the mounted view.
+                try Snapshot.restorePublicRootMetadata(from: DirectoryHandle.open(layout.originalDataURL),
+                    to: DirectoryHandle.open(URL(fileURLWithPath: layout.mountPath)), manifest: f.expected)
+                try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true)
+                let updated = try f.engine.folder(f.folder.id.uuidString)
+                #expect((try DirectoryHandle.open(f.selected.deletingLastPathComponent()).entryStat(f.selected.lastPathComponent).st_mode & 0o7777) == 0o755)
+                if temporary {
+                    #expect(updated.inode == f.folder.inode)
+                    #expect((try DirectoryHandle.open(f.selected).entryStat("payload").st_ino) == before)
+                }
+                #expect(!(FileManager.default.fileExists(atPath: wrapper.path)))
+                #expect((try f.store.journal(f.folder.id).cleanupWarning) == nil)
+                try f.engine.recover(f.folder.id.uuidString)
+                #expect(!(FileManager.default.fileExists(atPath: wrapper.path)))
             }
-            XCTAssertFalse(FileManager.default.fileExists(atPath: wrapper.path))
-            XCTAssertNil(try f.store.journal(f.folder.id).cleanupWarning)
-            try f.engine.recover(f.folder.id.uuidString)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: wrapper.path))
         }
-    }
-    func testACLAddedAfterReservationBlocksOperationalReopen() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/chmod")
-        p.arguments = ["+a", "everyone allow add_file,add_subdirectory,delete_child", f.mountRoot.path]
-        try p.run(); p.waitUntilExit(); XCTAssertEqual(p.terminationStatus, 0)
-        XCTAssertThrowsError(try FSKitLinks.root(f.journal.fsKitLink!))
-        XCTAssertThrowsError(try f.evacuate()); try Paths.checkedIdentity(f.folder)
-    }
-    func testWrapperCheckpointFailureRetainsUnknownWrapperAndUntouchedSource() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .evacuating { throw NestError("Injected wrapper identity checkpoint failure") } }
-        XCTAssertThrowsError(try f.evacuate()); f.store.beforeJournalWrite = nil
-        var durable = try f.store.journal(f.folder.id)
-        XCTAssertNil(durable.fsKitLink?.holding); try Paths.checkedIdentity(f.folder)
-        XCTAssertThrowsError(try f.engine.restoreLinkedOriginal(f.folder, journal: &durable, temporary: true))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: durable.fsKitLink!.holdingPath))
-        XCTAssertEqual(try f.value(), "original")
-    }
-    func testCaseCollidingReservationNeverSuffixesOrAdoptsExistingDirectory() throws {
-        let f = try Fixture(); defer { f.dispose() }
-        let otherParent = f.root.appendingPathComponent("other-parent"); try Store.privateDirectory(otherParent)
-        let selected = otherParent.appendingPathComponent("SELECTED"); try Store.privateDirectory(selected)
-        let identity = try DirectoryHandle.open(selected).identity()
-        let other = Folder(name: "Case collision", path: selected.path, capacity: f.folder.capacity, device: identity.device, inode: identity.inode)
-        let rootHandle = try DirectoryHandle.open(f.mountRoot)
-        if try rootHandle.exists("SELECTED") {
-            XCTAssertThrowsError(try FSKitLinks.reserve(other, session: UUID(), root: f.mountRoot, filesystemCheck: { _ in }))
-            XCTAssertEqual(try rootHandle.names(), ["selected"])
-        } else {
-            // On case-sensitive storage these are genuinely distinct names;
-            // repeated exact reservation must still refuse atomically.
-            _ = try FSKitLinks.reserve(other, session: UUID(), root: f.mountRoot, filesystemCheck: { _ in })
-            XCTAssertThrowsError(try FSKitLinks.reserve(other, session: UUID(), root: f.mountRoot, filesystemCheck: { _ in }))
-            XCTAssertEqual(try rootHandle.names(), ["SELECTED", "selected"])
+        @Test func `ACL added after reservation blocks operational reopen`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/chmod")
+            p.arguments = ["+a", "everyone allow add_file,add_subdirectory,delete_child", f.mountRoot.path]
+            try p.run(); p.waitUntilExit(); #expect(p.terminationStatus == 0)
+            #expect(throws: (any Error).self) { try FSKitLinks.root(f.journal.fsKitLink!) }
+            #expect(throws: (any Error).self) { try f.evacuate() }; try Paths.checkedIdentity(f.folder)
         }
-        try Paths.checkedIdentity(other); try Paths.checkedIdentity(f.folder)
-    }
-    func testConcurrentExactReservationsHaveOneExclusiveWinner() throws {
-        final class Results: @unchecked Sendable {
-            let lock = NSLock()
-            var successes = 0, failures = 0
-            func record(_ success: Bool) {
-                lock.lock(); defer { lock.unlock() }
-                if success { successes += 1 } else { failures += 1 }
+        @Test func `Wrapper checkpoint failure retains unknown wrapper and untouched source`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            f.store.beforeJournalWrite = { j, _ in if j.fsKitLink?.stage == .evacuating { throw NestError("Injected wrapper identity checkpoint failure") } }
+            #expect(throws: (any Error).self) { try f.evacuate() }; f.store.beforeJournalWrite = nil
+            var durable = try f.store.journal(f.folder.id)
+            #expect(durable.fsKitLink?.holding == nil); try Paths.checkedIdentity(f.folder)
+            #expect(throws: (any Error).self) { try f.engine.restoreLinkedOriginal(f.folder, journal: &durable, temporary: true) }
+            #expect(FileManager.default.fileExists(atPath: durable.fsKitLink!.holdingPath))
+            #expect((try f.value()) == "original")
+        }
+        @Test func `Case colliding reservation never suffixes or adopts existing directory`() throws {
+            let f = try Fixture(); defer { f.dispose() }
+            let otherParent = f.root.appendingPathComponent("other-parent"); try Store.privateDirectory(otherParent)
+            let selected = otherParent.appendingPathComponent("SELECTED"); try Store.privateDirectory(selected)
+            let identity = try DirectoryHandle.open(selected).identity()
+            let other = Folder(name: "Case collision", path: selected.path, capacity: f.folder.capacity, device: identity.device, inode: identity.inode)
+            let rootHandle = try DirectoryHandle.open(f.mountRoot)
+            if try rootHandle.exists("SELECTED") {
+                #expect(throws: (any Error).self) { try FSKitLinks.reserve(other, session: UUID(), root: f.mountRoot, filesystemCheck: { _ in }) }
+                #expect((try rootHandle.names()) == ["selected"])
+            } else {
+                // On case-sensitive storage these are genuinely distinct names;
+                // repeated exact reservation must still refuse atomically.
+                _ = try FSKitLinks.reserve(other, session: UUID(), root: f.mountRoot, filesystemCheck: { _ in })
+                #expect(throws: (any Error).self) { try FSKitLinks.reserve(other, session: UUID(), root: f.mountRoot, filesystemCheck: { _ in }) }
+                #expect((try rootHandle.names()) == ["SELECTED", "selected"])
             }
+            try Paths.checkedIdentity(other); try Paths.checkedIdentity(f.folder)
         }
-        let f = try Fixture(); defer { f.dispose() }
-        try FSKitLinks.releaseMountpoint(f.journal.fsKitLink!)
-        let folder = f.folder, root = f.mountRoot, results = Results()
-        DispatchQueue.concurrentPerform(iterations: 2) { _ in
-            do { _ = try FSKitLinks.reserve(folder, session: UUID(), root: root, filesystemCheck: { _ in }); results.record(true) }
-            catch { results.record(false) }
+        @Test func `Concurrent exact reservations have one exclusive winner`() throws {
+            final class Results: @unchecked Sendable {
+                let lock = NSLock()
+                var successes = 0, failures = 0
+                func record(_ success: Bool) {
+                    lock.lock(); defer { lock.unlock() }
+                    if success { successes += 1 } else { failures += 1 }
+                }
+            }
+            let f = try Fixture(); defer { f.dispose() }
+            try FSKitLinks.releaseMountpoint(f.journal.fsKitLink!)
+            let folder = f.folder, root = f.mountRoot, results = Results()
+            DispatchQueue.concurrentPerform(iterations: 2) { _ in
+                do { _ = try FSKitLinks.reserve(folder, session: UUID(), root: root, filesystemCheck: { _ in }); results.record(true) }
+                catch { results.record(false) }
+            }
+            #expect(results.successes == 1); #expect(results.failures == 1)
+            #expect((try DirectoryHandle.open(root).names()) == ["selected"])
+            try Paths.checkedIdentity(folder)
         }
-        XCTAssertEqual(results.successes, 1); XCTAssertEqual(results.failures, 1)
-        XCTAssertEqual(try DirectoryHandle.open(root).names(), ["selected"])
-        try Paths.checkedIdentity(folder)
     }
 }
 #endif

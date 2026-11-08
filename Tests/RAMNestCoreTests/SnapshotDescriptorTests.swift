@@ -2,12 +2,19 @@ import Foundation
 import Darwin
 @testable import RAMNestCore
 
-#if RAMNEST_SNAPSHOT_DESCRIPTOR_STANDALONE
-@main enum SnapshotDescriptorTests {
-    static func main() {
-        do { try run() }
-        catch { FileHandle.standardError.write(Data("FAIL: \(error)\n".utf8)); exit(1) }
+#if !RAMNEST_SNAPSHOT_DESCRIPTOR_STANDALONE
+import Testing
+
+extension RAMNestTestSuite {
+    struct SnapshotDescriptorTests {
+        @Test func `Wide snapshot cleanup`() throws {
+            try SnapshotDescriptorScenarios.run()
+        }
     }
+}
+#endif
+
+enum SnapshotDescriptorScenarios {
     static func run() throws {
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().resolvingSymlinksInPath()
         let root = project.appendingPathComponent("artifacts/latest-snapshot/descriptor-\(UUID().uuidString)")
@@ -27,7 +34,15 @@ import Darwin
             try revisions.removeCommittedRevision(revision)
             guard try !revisions.exists(revision) else { throw NestError("Obsolete revision remains.") }
         }
-        print("PASS: 160-directory snapshot cleanup with a process-only 96-descriptor limit")
+        print("PASS: 160-directory snapshot cleanup")
+    }
+}
+
+#if RAMNEST_SNAPSHOT_DESCRIPTOR_STANDALONE
+@main enum SnapshotDescriptorTests {
+    static func main() {
+        do { try SnapshotDescriptorScenarios.run() }
+        catch { FileHandle.standardError.write(Data("FAIL: \(error)\n".utf8)); exit(1) }
     }
 }
 #endif

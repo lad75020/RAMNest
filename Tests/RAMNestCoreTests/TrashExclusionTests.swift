@@ -2,14 +2,16 @@ import Foundation
 import Darwin
 @testable import RAMNestCore
 #if !RAMNEST_TRASH_STANDALONE
-import XCTest
-final class TrashExclusionTests: XCTestCase {
-    func testExactDirectoryCapture() throws { try TrashScenarios.capture() }
-    func testOldRevisionViews() throws { try TrashScenarios.oldRevisions() }
-    func testOriginalHoldingRetention() throws { try TrashScenarios.holding() }
-    func testOwnedSimulatedLifecycleAndRollback() throws { try TrashScenarios.lifecycle() }
-    func testLegacyFreshExportExclusion() throws { try TrashScenarios.legacyExport() }
-    func testCrossBoundaryHardlinks() throws { try TrashScenarios.crossBoundary() }
+import Testing
+extension RAMNestTestSuite {
+    struct TrashExclusionTests {
+        @Test func `Exact directory capture`() throws { try TrashScenarios.capture() }
+        @Test func `Old revision views`() throws { try TrashScenarios.oldRevisions() }
+        @Test func `Original holding retention`() throws { try TrashScenarios.holding() }
+        @Test func `Owned simulated lifecycle and rollback`() throws { try TrashScenarios.lifecycle() }
+        @Test func `Legacy fresh export exclusion`() throws { try TrashScenarios.legacyExport() }
+        @Test func `Cross boundary hardlinks`() throws { try TrashScenarios.crossBoundary() }
+    }
 }
 #endif
 enum TrashScenarios {

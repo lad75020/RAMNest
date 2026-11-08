@@ -2,6 +2,16 @@ import Foundation
 import Darwin
 @testable import RAMNestCore
 
+#if !RAMNEST_REVIEW_STANDALONE
+import Testing
+
+extension RAMNestTestSuite {
+    struct ReviewAcceptanceTests {
+        @Test func `Review acceptance scenarios`() throws { try ReviewAcceptanceRunner.main() }
+    }
+}
+#endif
+
 #if RAMNEST_REVIEW_STANDALONE
 @main
 #endif
@@ -69,8 +79,16 @@ struct ReviewAcceptanceRunner {
         let aliases=base.appendingPathComponent("aliases");try Store.privateDirectory(aliases)
         let large=aliases.appendingPathComponent("0-anchor");try Data(repeating:65,count:2<<20).write(to:large)
         for i in 1...16 { try FileManager.default.linkItem(at:large,to:aliases.appendingPathComponent("alias-\(i)")) }
-        let trace=base.appendingPathComponent("hash.jsonl");setenv("RAMNEST_HASH_TRACE",trace.path,1)
-        let links=try Snapshot.manifest(aliases,phase:"hardlink-proof");unsetenv("RAMNEST_HASH_TRACE")
+        let trace=base.appendingPathComponent("hash.jsonl")
+        let links = try { () throws -> Manifest in
+            let previous = getenv("RAMNEST_HASH_TRACE").map { String(cString: $0) }
+            try check(setenv("RAMNEST_HASH_TRACE", trace.path, 1) == 0, "set owned hash trace")
+            defer {
+                if let previous { setenv("RAMNEST_HASH_TRACE", previous, 1) }
+                else { unsetenv("RAMNEST_HASH_TRACE") }
+            }
+            return try Snapshot.manifest(aliases, phase: "hardlink-proof")
+        }()
         let event=try JSONSerialization.jsonObject(with:Data(contentsOf:trace)) as! [String:Any]
         try check((event["bytesRead"] as? Int)==2<<20 && (event["hardlinkDigestsReused"] as? Int)==16,"one stable inode digest per walk")
         try check(links.allocatedEstimate<UInt64(3<<20),"aliases not charged twice")
@@ -123,14 +141,19 @@ struct ReviewAcceptanceRunner {
             };return []
         },status:{ j,id in HelperStatus(id:id,pid:getpid(),mounted:true,used:0,capacity:16<<20,active:true) },mountedIdentity:{_,_ in true})
         let engine=Engine(store:store,session:session),first=folders[0].id.uuidString,second=folders[1].id.uuidString
-        DispatchQueue.global().async { do{try engine.save(first)}catch{gate.failure(error)};gate.done.signal() }
+        let work = DispatchGroup()
+        // Drain every callback even if an earlier bounded observation fails.
+        // A confirmation would count callbacks but would not wait for them.
+        defer { gate.release.signal(); work.wait() }
+        DispatchQueue.global().async(group: work) { do{try engine.save(first)}catch{gate.failure(error)};gate.done.signal() }
         try check(gate.entered.wait(timeout:.now()+5) == .success,"first volume export entered")
         let started=ProcessInfo.processInfo.systemUptime
-        DispatchQueue.global().async { do { _ = try engine.statuses() } catch { gate.failure(error) };gate.status.signal() }
+        DispatchQueue.global().async(group: work) { do { _ = try engine.statuses() } catch { gate.failure(error) };gate.status.signal() }
         let statusResult=gate.status.wait(timeout:.now()+5)
-        DispatchQueue.global().async { do{try engine.save(second)}catch{gate.failure(error)};gate.second.signal() }
+        DispatchQueue.global().async(group: work) { do{try engine.save(second)}catch{gate.failure(error)};gate.second.signal() }
         let result=gate.second.wait(timeout:.now()+5)
-        gate.release.signal();try check(gate.done.wait(timeout:.now()+5) == .success,"first save completed")
+        gate.release.signal(); work.wait()
+        try check(gate.done.wait(timeout:.now()+5) == .success,"first save completed")
         try check(statusResult == .success && result == .success && gate.failures.isEmpty,"independent volume completes while first export blocked: \(gate.failures)")
         print("PASS item10 two volumes in same store: status and second save progress while first export paused; seconds=\(ProcessInfo.processInfo.systemUptime-started)")
     }

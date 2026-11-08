@@ -2,9 +2,11 @@ import Foundation
 import Darwin
 @testable import RAMNestCore
 #if !RAMNEST_HOLDING_CLEANUP_STANDALONE
-import XCTest
-final class HoldingCleanupTests: XCTestCase {
-    func testCompletedSessionCleanup() throws { try HoldingCleanupScenarios.run() }
+import Testing
+extension RAMNestTestSuite {
+    struct HoldingCleanupTests {
+        @Test func `Completed session cleanup`() throws { try HoldingCleanupScenarios.run() }
+    }
 }
 #endif
 

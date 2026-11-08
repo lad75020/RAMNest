@@ -27,7 +27,9 @@ def run(name,args):
 core=['swiftc',*flags,'-module-name','RAMNestCore','-enable-testing','-emit-library','-emit-module','-emit-module-path',str(build/'RAMNestCore.swiftmodule'),'-Xlinker','-install_name','-Xlinker','@rpath/libRAMNestCore.dylib',*map(str,(project/'Sources/RAMNestCore').glob('*.swift')),'-o',str(build/'libRAMNestCore.dylib')]
 if not run('swift-core-build',core):sys.exit(1)
 platform=Path(subprocess.check_output(['xcrun','--sdk','macosx','--show-sdk-platform-path'],env=env,text=True).strip())
-run('swift-xctest-typecheck',['swiftc','-typecheck',*flags,'-F',str(platform/'Developer/Library/Frameworks'),'-I',str(build),*map(str,(project/'Tests/RAMNestCoreTests').glob('*.swift'))])
+compiler=Path(subprocess.check_output(['xcrun','--find','swiftc'],env=env,text=True).strip())
+testing_plugins=compiler.parent.parent/'lib/swift/host/plugins/testing'
+run('swift-xctest-typecheck',['swiftc','-typecheck',*flags,'-F',str(platform/'Developer/Library/Frameworks'),'-plugin-path',str(testing_plugins),'-I',str(build),*map(str,(project/'Tests/RAMNestCoreTests').glob('*.swift'))])
 run('swift-cli-build',['swiftc',*flags,'-parse-as-library',*link,*map(str,(project/'Sources/RAMNestCLI').glob('*.swift')),'-o',str(build/'ramnest')])
 run('swift-all-app-typecheck',['swiftc','-typecheck',*flags,'-parse-as-library','-I',str(build),*map(str,(project/'Sources/RAMNestApp').glob('*.swift'))])
 run('swift-core-test-build',['swiftc',*flags,'-D','RAMNEST_STANDALONE','-parse-as-library',*link,'Tests/RAMNestCoreTests/CoreTests.swift','scripts/CoreTestRunner.swift','-o',str(build/'core-tests')])

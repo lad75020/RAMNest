@@ -2,25 +2,27 @@ import Foundation
 import Darwin
 @testable import RAMNestCore
 #if !RAMNEST_STORAGE_STANDALONE
-import XCTest
-final class StorageFormatTests: XCTestCase {
-    func testRestrictiveNativeExportAdoption() throws { try StorageFormatScenarios.nativeAdoption() }
-    func testPrivateNativeExportAdoption() throws { try StorageFormatScenarios.nativeAdoption(privateFormat:true) }
-    func testStorageFormatTamperRejection() throws { try StorageFormatScenarios.tampering() }
-    func testOriginalAndCommittedImmutability() throws { try StorageFormatScenarios.immutability() }
-    func testRunningLegacyHelperSaveEject() throws { try StorageFormatScenarios.coordinator(legacy:true) }
-    func testCorrectedHelperSaveNoopDirtyEject() throws { try StorageFormatScenarios.coordinator(legacy:false) }
-    func testProcessExitPublicationRecovery() throws { try StorageFormatScenarios.crashRecovery() }
-    func testRestrictivePublicExportReceipt() throws { try StorageFormatScenarios.publicExport() }
-    func testUnreadableOriginalAdmissionFailsUnchanged() throws { try StorageFormatScenarios.unreadableOriginal() }
-    func testReadableReadOnlyDirectoryPublication() throws { try StorageFormatScenarios.readOnlyDirectoryRestore() }
-    func testFreshLogicalModeReceiptBinding() throws { try StorageFormatScenarios.freshModeReceipt() }
-    func testLegacyHelperDoesNotReadIncompatiblePriorPayload() throws { try StorageFormatScenarios.legacyBadPrior() }
-    func testRootlessLegacyCopyExportRestore() throws { try StorageFormatScenarios.rootlessLegacy() }
-    func testOrdinarySourceHasNoReservedPathShape() throws { try StorageFormatScenarios.sourceNames() }
-    func testFreshNormalizationPinsBeforeMutation() throws { try StorageFormatScenarios.normalizationReplacement() }
-    func testUnpinnableLegacyExportFailsClosed() throws { try StorageFormatScenarios.unpinnableLegacy() }
-    func testOldPrivateHelperGetsNoFilteredPrior() throws { try StorageFormatScenarios.policyCapability() }
+import Testing
+extension RAMNestTestSuite {
+    struct StorageFormatTests {
+        @Test(arguments: [false, true])
+        func `Native export adoption`(privateFormat: Bool) throws { try StorageFormatScenarios.nativeAdoption(privateFormat: privateFormat) }
+        @Test func `Storage format tamper rejection`() throws { try StorageFormatScenarios.tampering() }
+        @Test func `Original and committed immutability`() throws { try StorageFormatScenarios.immutability() }
+        @Test(arguments: [true, false])
+        func `Helper save and dirty eject`(legacy: Bool) throws { try StorageFormatScenarios.coordinator(legacy: legacy) }
+        @Test func `Process exit publication recovery`() throws { try StorageFormatScenarios.crashRecovery() }
+        @Test func `Restrictive public export receipt`() throws { try StorageFormatScenarios.publicExport() }
+        @Test func `Unreadable original admission fails unchanged`() throws { try StorageFormatScenarios.unreadableOriginal() }
+        @Test func `Readable read only directory publication`() throws { try StorageFormatScenarios.readOnlyDirectoryRestore() }
+        @Test func `Fresh logical mode receipt binding`() throws { try StorageFormatScenarios.freshModeReceipt() }
+        @Test func `Legacy helper does not read incompatible prior payload`() throws { try StorageFormatScenarios.legacyBadPrior() }
+        @Test func `Rootless legacy copy export restore`() throws { try StorageFormatScenarios.rootlessLegacy() }
+        @Test func `Ordinary source has no reserved path shape`() throws { try StorageFormatScenarios.sourceNames() }
+        @Test func `Fresh normalization pins before mutation`() throws { try StorageFormatScenarios.normalizationReplacement() }
+        @Test func `Unpinnable legacy export fails closed`() throws { try StorageFormatScenarios.unpinnableLegacy() }
+        @Test func `Old private helper gets no filtered prior`() throws { try StorageFormatScenarios.policyCapability() }
+    }
 }
 #endif
 enum StorageFormatScenarios {
@@ -98,7 +100,7 @@ enum StorageFormatScenarios {
     }
     static func rejects(_ body: () throws -> Void) throws { var rejected=false;do{try body()}catch{rejected=true};try check(rejected,"expected fail-closed rejection") }
     // These cases also run through a freshly built CLI when its explicit owned
-    // fixture path is supplied. XCTest can exercise the same Engine boundaries.
+    // fixture path is supplied. Swift Testing exercises the same Engine boundaries.
     static func cli(_ arguments: [String], fallback: () throws -> Void) throws {
         guard let binary=ProcessInfo.processInfo.environment["RAMNEST_STORAGE_CLI"] else { try fallback();return }
         let p=Process();p.executableURL=URL(fileURLWithPath:binary);p.arguments=arguments

@@ -2,22 +2,24 @@ import Foundation
 import Darwin
 @testable import RAMNestCore
 #if !RAMNEST_POPULATION_READINESS_STANDALONE
-import XCTest
-final class PopulationReadinessTests: XCTestCase {
-    func testTransientReadsRequireExactManifest() throws { try PopulationReadinessScenarios.transientReads() }
-    func testExhaustionAndPermissions() throws { try PopulationReadinessScenarios.failures() }
-    func testMonotonicBounds() throws { try PopulationReadinessScenarios.bounds() }
-    func testSnapshotPreservesErrno() throws { try PopulationReadinessScenarios.structuredErrno() }
-    func testActivationOrderingAndOriginalGuards() throws { try PopulationReadinessScenarios.activation() }
-    func testSessionReadinessAndActions() throws { try PopulationReadinessScenarios.statuses() }
-    func testNegotiatedPopulationPrecedesMount() throws { try PopulationReadinessScenarios.startupOrder(guarded: true) }
-    func testLegacyPopulationFollowsMount() throws { try PopulationReadinessScenarios.startupOrder(guarded: false) }
-    func testStartupCapabilityAndACKRejection() throws { try PopulationReadinessScenarios.startupCapabilities() }
-    func testStartupImportFailureNeverRequestsMount() throws { try PopulationReadinessScenarios.startupImportFailure() }
-    func testAbandonedStartupRequiresSealedRetirement() throws { try PopulationReadinessScenarios.startupRetirement() }
-    func testGuardedStartupRecoveryRetiresBeforeRollback() throws { try PopulationReadinessScenarios.startupRecovery() }
-    func testNativeGuardedStartupCommandAndOrder() throws { try PopulationReadinessScenarios.nativeStartup() }
-    func testStartupJournalWirePresenceAndRecoveryConsistency() throws { try PopulationReadinessScenarios.startupJournalWire() }
+import Testing
+extension RAMNestTestSuite {
+    struct PopulationReadinessTests {
+        @Test func `Transient reads require exact manifest`() throws { try PopulationReadinessScenarios.transientReads() }
+        @Test func `Exhaustion and permissions`() throws { try PopulationReadinessScenarios.failures() }
+        @Test func `Monotonic bounds`() throws { try PopulationReadinessScenarios.bounds() }
+        @Test func `Snapshot preserves errno`() throws { try PopulationReadinessScenarios.structuredErrno() }
+        @Test func `Activation ordering and original guards`() throws { try PopulationReadinessScenarios.activation() }
+        @Test func `Session readiness and actions`() throws { try PopulationReadinessScenarios.statuses() }
+        @Test(arguments: [true, false])
+        func `Population order follows negotiated capability`(guarded: Bool) throws { try PopulationReadinessScenarios.startupOrder(guarded: guarded) }
+        @Test func `Startup capability and ACK rejection`() throws { try PopulationReadinessScenarios.startupCapabilities() }
+        @Test func `Startup import failure never requests mount`() throws { try PopulationReadinessScenarios.startupImportFailure() }
+        @Test func `Abandoned startup requires sealed retirement`() throws { try PopulationReadinessScenarios.startupRetirement() }
+        @Test func `Guarded startup recovery retires before rollback`() throws { try PopulationReadinessScenarios.startupRecovery() }
+        @Test func `Native guarded startup command and order`() throws { try PopulationReadinessScenarios.nativeStartup() }
+        @Test func `Startup journal wire presence and recovery consistency`() throws { try PopulationReadinessScenarios.startupJournalWire() }
+    }
 }
 #endif
 

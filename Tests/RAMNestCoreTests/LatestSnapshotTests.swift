@@ -2,9 +2,11 @@ import Foundation
 import Darwin
 @testable import RAMNestCore
 #if !RAMNEST_LATEST_SNAPSHOT_STANDALONE
-import XCTest
-final class LatestSnapshotTests: XCTestCase {
-    func testLatestSnapshotRetention() throws { try LatestSnapshotScenarios.run() }
+import Testing
+extension RAMNestTestSuite {
+    struct LatestSnapshotTests {
+        @Test func `Latest snapshot retention`() throws { try LatestSnapshotScenarios.run() }
+    }
 }
 #endif
 
