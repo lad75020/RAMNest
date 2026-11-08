@@ -4,6 +4,14 @@ import ServiceManagement
 import RAMNestCore
 
 @MainActor final class AppModel: ObservableObject {
+#if DEBUG
+    @Published var benchmarkReport: DebugBenchmarkReport?
+    @Published var benchmarkProgress: DebugBenchmarkProgress?
+    @Published var benchmarkRunning = false
+    var benchmarkAdmission = DebugBenchmarkAdmission()
+    var benchmarkCancellation: DebugBenchmarkCancellation?
+    var benchmarkTask: Task<Void, Never>?
+#endif
     @Published var statuses: [FolderStatus] = []
     @Published var selected: UUID?
     @Published var draft: Folder?
@@ -16,19 +24,45 @@ import RAMNestCore
     @Published private(set) var backend = Configuration.Backend.nfs
     @Published private(set) var backendError: String?
     @Published var memoryUsed: Double = 0
-    let engine: Engine?
+    @Published private(set) var engine: Engine?
+    @Published private(set) var snapshotStoragePath = ""
+    @Published private(set) var storagePending: String?
+    @Published private(set) var storageError: String?
+    @Published private(set) var movingStorage = false
+    @Published private(set) var storageDestinationPath: String?
+    let storageManager: SnapshotStorageManager?
+    var storagePicker: (@MainActor () -> URL?)?
+    // Injectable asynchronous read boundary for stale-completion regression tests.
+    var refreshRead: (@Sendable (Engine) async throws -> ([FolderStatus], Configuration.Backend))?
+    private var engineGeneration: UInt64 = 0
+    private var storageCancellation: StorageMoveCancellation?
     var refreshTask: Task<Void, Never>?
     var selectedStatus: FolderStatus? { statuses.first { $0.id == selected } }
     var dirty: Bool { guard let draft, let selectedStatus else { return false }; return draft != selectedStatus.folder }
-    init(repository: Store? = nil) {
+    var canMoveSnapshotStorage: Bool {
+        storageManager != nil && engine != nil && !busy && !dirty && storagePending == nil &&
+        statuses.allSatisfy { $0.journal.phase == .idle && !$0.connected && !$0.mounted && $0.helperActive != true }
+    }
+    init(repository: Store? = nil, storageManager injectedManager: SnapshotStorageManager? = nil,
+         storagePicker: (@MainActor () -> URL?)? = nil) {
+        self.storagePicker = storagePicker
+        let args = CommandLine.arguments
+        let explicit: URL?
+        if repository == nil, let i = args.firstIndex(of: "--store"), args.count > i+1 { explicit = URL(fileURLWithPath: args[i+1]) }
+        else { explicit = nil }
+        // Repository-only fixtures never consult home. An explicit launch cannot
+        // change the global selection; tests opt in with an injected manager.
+        storageManager = injectedManager ?? (repository == nil && explicit == nil ? SnapshotStorageManager() : nil)
         do {
-            let args = CommandLine.arguments
-            let root: URL
-            if let i = args.firstIndex(of: "--store"), args.count > i+1 { root = URL(fileURLWithPath: args[i+1]) } else { root = Store.defaultRoot }
-            let store = try repository ?? Store(root: root)
+            if repository == nil, args.last == "--store" { throw NestError("--store requires a directory.", code: 64) }
+            let store = try repository ?? (explicit.map { try Store(root: $0) } ?? storageManager!.open())
             let config = try store.locked { try store.load() }
-            engine = Engine(store: store); menuBarMode = config.menuBarMode; backend = config.backend
-        } catch { engine = nil; self.error = error.localizedDescription; backendError = error.localizedDescription }
+            engine = Engine(store: store); menuBarMode = config.menuBarMode; backend = config.backend; snapshotStoragePath = store.root.path
+            if let storageManager { let state = try storageManager.state(); storagePending = state.pending }
+        } catch {
+            engine = nil; self.error = error.localizedDescription; backendError = error.localizedDescription; storageError = error.localizedDescription
+            if let state = try? storageManager?.state() { snapshotStoragePath = state.path; storagePending = state.pending }
+        }
     }
     func start() {
         // Launch belongs to AppDelegate, not view appearance. Reopening a window
@@ -37,11 +71,12 @@ import RAMNestCore
         refreshTask = Task { [weak self] in
             guard let self else { return }
             await refresh()
-            if let engine {
+            if let engine, engineGeneration == 0, !movingStorage, storagePending == nil {
                 let unclean = statuses.contains { !$0.connected && $0.journal.phase != .idle }
                 if unclean { error = "A previous session did not finish cleanly. Automatic mounting is paused. Recover or export each affected folder first." }
                 else {
                     for status in statuses where !status.mounted && status.journal.phase == .idle && status.folder.options.mountAtLaunch {
+                        guard engineGeneration == 0, !movingStorage, storagePending == nil, self.engine === engine else { break }
                         await perform("Mounting \(status.folder.name)…") { try engine.mount(status.id.uuidString) }
                     }
                 }
@@ -50,16 +85,83 @@ import RAMNestCore
         }
     }
     func refresh() async {
-        guard let engine else { return }
+        guard !busy, let engine else { return }
+        let generation = engineGeneration, reader = refreshRead
         do {
-            let (current, preference) = try await Task.detached { (try engine.statuses(), try engine.backend()) }.value
+            let (current, preference) = try await Task.detached {
+                if let reader { return try await reader(engine) }
+                return (try engine.statuses(), try engine.backend())
+            }.value
+            guard !busy, generation == engineGeneration, self.engine === engine else { return }
             let wasDirty = dirty
             statuses = current
             backend = preference
             if selected == nil { selected = current.first?.id }
             if !wasDirty { draft = selectedStatus?.folder }
             memoryUsed = MemoryReading.usedFraction()
-        } catch { self.error = error.localizedDescription }
+        } catch {
+            guard !busy, generation == engineGeneration, self.engine === engine else { return }
+            self.error = error.localizedDescription
+        }
+    }
+    func chooseSnapshotStorage() {
+        guard canMoveSnapshotStorage else { storageError = "Finish all folder operations and apply or discard option edits before moving snapshots."; return }
+        let parent: URL?
+        if let storagePicker { parent = storagePicker() }
+        else {
+            let panel = NSOpenPanel(); panel.title = "Choose snapshot storage parent"
+            panel.message = "RAMNest creates a private ‘RAMNest Snapshots’ child here and moves snapshots, journals and settings together. The parent’s contents and permissions stay unchanged."
+            panel.prompt = "Choose Parent"; panel.canChooseDirectories = true; panel.canChooseFiles = false
+            panel.canCreateDirectories = false; panel.allowsMultipleSelection = false
+            parent = panel.runModal() == .OK ? panel.url : nil
+        }
+        guard let parent else { return }
+        Task { await moveSnapshotStorage(toParent: parent) }
+    }
+    func moveSnapshotStorage(toParent parent: URL) async {
+        guard canMoveSnapshotStorage, let storageManager, let engine else { storageError = "Storage can move only when every folder is idle and option edits are applied or discarded."; return }
+        storageDestinationPath = parent.standardizedFileURL.appendingPathComponent("RAMNest Snapshots").path
+        await runStorageChange(manager: storageManager) { cancellation, progress in
+            try storageManager.move(store: engine.store, toParent: parent, cancellation: cancellation, progress: progress)
+        }
+    }
+    func retrySnapshotStorage() {
+        guard !busy, !dirty, let storageManager else { return }
+        Task { await runStorageChange(manager: storageManager) { _, progress in try storageManager.retry(progress: progress) } }
+    }
+    func cancelSnapshotStorageMove() { storageCancellation?.cancel() }
+    private func runStorageChange(manager: SnapshotStorageManager,
+        operation: @escaping @Sendable (StorageMoveCancellation, @Sendable (String) -> Void) throws -> SnapshotStorageState) async {
+        // Queued Retry tasks must recheck admission on the main actor, before
+        // this operation first suspends. Only one generation owns completion.
+        guard !busy, !dirty else { return }
+        busy = true; movingStorage = true; storageError = nil; engineGeneration &+= 1
+        let generation = engineGeneration
+        progress = "Preparing snapshot storage move…"
+        let cancellation = StorageMoveCancellation(); storageCancellation = cancellation
+        let model = self
+        do {
+            let state = try await Task.detached(priority: .userInitiated) {
+                try operation(cancellation, { message in Task { @MainActor [weak model] in if model?.movingStorage == true && model?.engineGeneration == generation { model?.progress = message } } })
+            }.value
+            guard generation == engineGeneration, movingStorage else { return }
+            snapshotStoragePath = state.path; storagePending = state.pending
+        } catch {
+            guard generation == engineGeneration, movingStorage else { return }
+            storageError = error.localizedDescription
+        }
+        guard generation == engineGeneration, movingStorage else { return }
+        if let state = try? manager.state() { snapshotStoragePath = state.path; storagePending = state.pending }
+        do {
+            let store = try manager.open(), config = try store.locked { try store.load() }
+            self.engine = Engine(store: store); menuBarMode = config.menuBarMode; backend = config.backend
+        } catch {
+            // A committed-but-not-retired destination stays fenced. Settings
+            // remains usable for Retry, while all folder mutators lose authority.
+            self.engine = nil; statuses = []; storageError = storageError ?? error.localizedDescription
+        }
+        engineGeneration &+= 1; storageCancellation = nil; storageDestinationPath = nil; movingStorage = false; busy = false; progress = ""
+        await refresh()
     }
     func perform(_ label: String, operation: @escaping @Sendable () throws -> Void) async {
         guard !busy else { return }; busy = true; progress = label
@@ -149,8 +251,9 @@ import RAMNestCore
             Task { await self.perform("Removing RAM folder…") { try engine.delete(s.id.uuidString, destroy: destroy, confirmed: destroy) }; self.selected = nil; self.draft = nil; await self.refresh() }
         }
     }
-    func presentCreate(_ url: URL? = nil) { guarded { self.creationPath = url; self.showCreate = true } }
+    func presentCreate(_ url: URL? = nil) { guard engine != nil else { return }; guarded { self.creationPath = url; self.showCreate = true } }
     func installCLI() {
+        guard !busy else { return }
         let panel = NSOpenPanel(); panel.title = "Choose a directory for the ramnest launcher"; panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.canCreateDirectories = true
         if panel.runModal() == .OK, let directory = panel.url {
             let target = directory.appendingPathComponent("ramnest")

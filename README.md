@@ -4,6 +4,13 @@ RAMNest is a native macOS 27.0+ Apple Silicon app that keeps an existing folder 
 
 Content uses transparent, default-on LZ4 compression through Apple's system Compression API. Each 64 KiB logical block owns anonymous `mmap` backing rounded to 16 KiB VM pages. Incompressible blocks stay raw; truncation/deletion releases mappings with `munmap`. Capacity is an uncompressed allocation ceiling, not an eager reservation. Sparse holes remain unallocated. [Memory and compression details](docs/MEMORY.md) explain counters, quotas, OS caching/compression/swap, and measured RSS.
 
+**Settings → Snapshot storage** can move checkpoints and their journals/settings
+to a private **RAMNest Snapshots** child under a selected parent directory.
+All folders must be idle and option edits applied or discarded. The move verifies
+the copied store before publishing its location and retiring obsolete payloads;
+interrupted work remains visible with Retry. Normal retention keeps the latest
+checkpoint, not an unlimited history. See [snapshot storage](docs/SNAPSHOT_STORAGE.md).
+
 ## Build and run
 
 The local `SymLinks` work adds FSKit mounting for external-source folders through

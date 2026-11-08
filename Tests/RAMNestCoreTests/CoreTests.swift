@@ -3,6 +3,341 @@ import Darwin
 @testable import RAMNestCore
 #if !RAMNEST_STANDALONE
 import XCTest
+
+// Location tests inject every path. They never read or write real AppSupport.
+final class SnapshotStorageLocationTests: XCTestCase {
+    private func fixture() throws -> URL {
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let root = project.appendingPathComponent("artifacts/snapshot-storage-location/fixtures-\(UUID().uuidString)")
+        try Store.privateDirectory(root)
+        return root
+    }
+    func testAbsentAndExplicitLocation() throws {
+        let root = try fixture()
+        let locations = StoreLocation(bootstrapRoot: root.appendingPathComponent("bootstrap"))
+        XCTAssertEqual(try locations.resolve().root, locations.bootstrapRoot)
+        let explicit = root.appendingPathComponent("explicit")
+        let isolated = try locations.open(explicitRoot: explicit)
+        XCTAssertEqual(isolated.root, explicit)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: locations.bootstrapRoot.path))
+        let normal = try locations.open()
+        XCTAssertEqual(normal.root, locations.bootstrapRoot)
+    }
+    func testCommittedSelectionReopensAndRejectsStaleStore() throws {
+        let root = try fixture()
+        let locations = StoreLocation(bootstrapRoot: root.appendingPathComponent("bootstrap"))
+        let old = try locations.open()
+        let destination = try Store(root: root.appendingPathComponent("destination"))
+        var config = Configuration(); config.menuBarMode = true; config.backend = .fskit
+        try destination.save(config)
+        let selection = try locations.selection(for: destination.root)
+        try Store.atomicJSON(selection, locations.selectionURL)
+        let reopened = try locations.open()
+        XCTAssertEqual(reopened.root.path, destination.root.path)
+        XCTAssertEqual(try reopened.load().backend, .fskit)
+        XCTAssertTrue(try reopened.load().menuBarMode)
+        XCTAssertThrowsError(try old.locked { try old.save(Configuration()) })
+        XCTAssertThrowsError(try old.load())
+        XCTAssertThrowsError(try old.volume(UUID()))
+        XCTAssertEqual(try locations.open(explicitRoot: old.root).root, old.root)
+    }
+    func testMalformedSelectionsFailClosed() throws {
+        let root = try fixture()
+        let locations = StoreLocation(bootstrapRoot: root.appendingPathComponent("bootstrap"))
+        _ = try locations.open()
+        let destination = try Store(root: root.appendingPathComponent("destination"))
+        let selection = try locations.selection(for: destination.root)
+        let encoder = JSONEncoder()
+        let valid = try encoder.encode(selection)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: valid) as? [String: Any])
+        let mutations: [([String: Any]) -> [String: Any]] = [
+            { var v = $0; v["version"] = 99; return v },
+            { var v = $0; v["stage"] = "copying"; return v },
+            { var v = $0; v["root"] = NSNull(); return v },
+            { var v = $0; v["inode"] = nil; return v },
+            { var v = $0; v["unexpected"] = true; return v }
+        ]
+        for mutation in mutations {
+            try Store.atomicData(JSONSerialization.data(withJSONObject: mutation(object)), locations.selectionURL)
+            XCTAssertThrowsError(try locations.open())
+        }
+        for bytes in [Data("null".utf8), Data("{".utf8), Data("{}".utf8), Data()] {
+            try Store.atomicData(bytes, locations.selectionURL)
+            XCTAssertThrowsError(try locations.open())
+            // An explicit test/CLI store must not consult or repair globals.
+            let isolated = root.appendingPathComponent("isolated")
+            XCTAssertEqual(try locations.open(explicitRoot: isolated).root, isolated)
+            XCTAssertEqual(try Data(contentsOf: locations.selectionURL), bytes)
+        }
+        try FileManager.default.removeItem(at: locations.selectionURL)
+        try FileManager.default.createSymbolicLink(at: locations.selectionURL, withDestinationURL: root.appendingPathComponent("missing"))
+        XCTAssertThrowsError(try locations.open())
+    }
+    func testMissingReplacedAndSymlinkDestinationsNeverCreateStore() throws {
+        let root = try fixture()
+        let locations = StoreLocation(bootstrapRoot: root.appendingPathComponent("bootstrap"))
+        _ = try locations.open()
+        let destination = try Store(root: root.appendingPathComponent("destination"))
+        let selection = try locations.selection(for: destination.root)
+        try Store.atomicJSON(selection, locations.selectionURL)
+        let retired = root.appendingPathComponent("disconnected")
+        try FileManager.default.moveItem(at: destination.root, to: retired)
+        XCTAssertThrowsError(try locations.open())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.root.path))
+        _ = try Store(root: destination.root)
+        XCTAssertThrowsError(try locations.open())
+        try FileManager.default.removeItem(at: destination.root)
+        try FileManager.default.createSymbolicLink(at: destination.root, withDestinationURL: retired)
+        XCTAssertThrowsError(try locations.open())
+    }
+    func testUnsafeAndDuplicateSelectionFilesFailClosed() throws {
+        let root = try fixture()
+        let locations = StoreLocation(bootstrapRoot: root.appendingPathComponent("bootstrap"))
+        _ = try locations.open()
+        let destination = try Store(root: root.appendingPathComponent("destination"))
+        let selection = try locations.selection(for: destination.root)
+        try Store.atomicJSON(selection, locations.selectionURL)
+        let bytes = try Data(contentsOf: locations.selectionURL)
+        let duplicate = "{\"version\":1," + String(decoding: bytes.dropFirst(), as: UTF8.self)
+        try Store.atomicData(Data(duplicate.utf8), locations.selectionURL)
+        XCTAssertThrowsError(try locations.open())
+        try Store.atomicJSON(selection, locations.selectionURL)
+        XCTAssertEqual(chmod(locations.selectionURL.path, 0o644), 0)
+        XCTAssertThrowsError(try locations.open())
+        XCTAssertEqual(chmod(locations.selectionURL.path, 0o600), 0)
+        let alias = root.appendingPathComponent("selection-hardlink")
+        XCTAssertEqual(link(locations.selectionURL.path, alias.path), 0)
+        XCTAssertThrowsError(try locations.open())
+    }
+    private func moveFixture() throws -> (URL, SnapshotStorageManager, Store, Folder, String) {
+        let root = try fixture(), locations = StoreLocation(bootstrapRoot: root.appendingPathComponent("bootstrap"))
+        let manager = SnapshotStorageManager(location: locations), store = try manager.open()
+        let selected = root.appendingPathComponent("selected"); try Store.privateDirectory(selected)
+        try Data("snapshot payload αβ".utf8).write(to: selected.appendingPathComponent("payload"))
+        var options = FolderOptions(); options.mountAtLaunch = false; options.comparison = .checksum
+        let folder = try Engine(store: store).create(path: selected, name: "Relocation fixture", capacity: 16 << 20, options: options)
+        let revision = try Snapshot.capture(store: store, folder: folder, source: selected, previous: nil)
+        var journal = Journal(); journal.revision = revision; try store.write(journal, for: folder.id)
+        var config = try store.load(); config.backend = .fskit; config.menuBarMode = true; try store.save(config)
+        let trash = store.root.appendingPathComponent("opaque/.Trashes")
+        try Store.privateDirectory(trash)
+        let raw = trash.appendingPathComponent("raw")
+        try Data("opaque retained trash bytes".utf8).write(to: raw)
+        XCTAssertEqual(chmod(raw.path, 0o640), 0)
+        let attribute = Data([0, 1, 2, 255])
+        XCTAssertEqual(attribute.withUnsafeBytes { setxattr(raw.path, "user.ramnest.storage-location", $0.baseAddress, $0.count, 0, 0) }, 0)
+        try FileManager.default.createSymbolicLink(atPath: store.root.appendingPathComponent("opaque/link").path, withDestinationPath: "../outside-is-never-followed")
+        return (root, manager, store, folder, revision)
+    }
+    func testOpaqueMovePreservesStoreAndRemovesOldPayload() throws {
+        let (root, manager, store, folder, revision) = try moveFixture()
+        // Optional owned host fixture seam, not a production preference override.
+        let crossPath = ProcessInfo.processInfo.environment["RAMNEST_SNAPSHOT_CROSS_DISK_PARENT"]
+        let base = crossPath.map { URL(fileURLWithPath: $0) } ?? root
+        if crossPath != nil {
+            try Paths.rejectSymlinks(base.path, allowMissingLast: false)
+            let handle = try DirectoryHandle.open(base)
+            try handle.requireOwnedDirectory(device: handle.identity().device, privateMode: true)
+        }
+        let parent = base.appendingPathComponent("chosen-" + UUID().uuidString); try Store.privateDirectory(parent)
+        let config = try Data(contentsOf: store.root.appendingPathComponent("configuration.json"))
+        let journal = try Data(contentsOf: store.volume(folder.id).appendingPathComponent("journal.json"))
+        let parentMode = try FileManager.default.attributesOfItem(atPath: parent.path)[.posixPermissions] as? NSNumber
+        let result = try manager.move(store: store, toParent: parent)
+        XCTAssertNil(result.pending)
+        let reopened = try manager.open()
+        XCTAssertEqual(reopened.root.path, parent.appendingPathComponent("RAMNest Snapshots").path)
+        if crossPath != nil { XCTAssertNotEqual(try DirectoryHandle.open(store.root).identity().device, try DirectoryHandle.open(reopened.root).identity().device) }
+        XCTAssertEqual(try reopened.load().folders, [folder])
+        XCTAssertEqual(try Data(contentsOf: reopened.root.appendingPathComponent("configuration.json")), config)
+        XCTAssertEqual(try Data(contentsOf: reopened.volume(folder.id).appendingPathComponent("journal.json")), journal)
+        XCTAssertEqual(try reopened.journal(folder.id).revision, revision)
+        _ = try Snapshot.verified(store: reopened, id: folder.id, revision: revision)
+        XCTAssertEqual(try String(contentsOf: reopened.root.appendingPathComponent("opaque/.Trashes/raw"), encoding: .utf8), "opaque retained trash bytes")
+        let raw = reopened.root.appendingPathComponent("opaque/.Trashes/raw")
+        var rawStat = stat(); XCTAssertEqual(lstat(raw.path, &rawStat), 0); XCTAssertEqual(rawStat.st_mode & 0o7777, 0o640)
+        var copiedAttribute = Data(count: 4)
+        XCTAssertEqual(copiedAttribute.withUnsafeMutableBytes { getxattr(raw.path, "user.ramnest.storage-location", $0.baseAddress, $0.count, 0, 0) }, 4)
+        XCTAssertEqual(copiedAttribute, Data([0, 1, 2, 255]))
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: reopened.root.appendingPathComponent("opaque/link").path), "../outside-is-never-followed")
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: parent.path)[.posixPermissions] as? NSNumber, parentMode)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("volumes").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("configuration.json").path))
+        XCTAssertTrue(Set(try DirectoryHandle.open(store.root).names()).isSubset(of: ["repository.lock", "storage-location.lock", "storage-location.json", ".ramnest-retired.json"]))
+        XCTAssertThrowsError(try store.save(Configuration()))
+        XCTAssertThrowsError(try store.volume(UUID()))
+        XCTAssertThrowsError(try Store(root: store.root))
+        XCTAssertEqual(try StoreLocation(bootstrapRoot: manager.location.bootstrapRoot).open().root.path, reopened.root.path)
+        XCTAssertNil(try manager.move(store: reopened, toParent: reopened.root).pending)
+        XCTAssertNil(try manager.move(store: reopened, toParent: parent).pending)
+        let second = root.appendingPathComponent("second"); try Store.privateDirectory(second)
+        XCTAssertNil(try manager.move(store: reopened, toParent: second).pending)
+        XCTAssertEqual(try manager.open().load().folders.first?.id, folder.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: reopened.root.appendingPathComponent("volumes").path))
+        if crossPath != nil {
+            try FileManager.default.removeItem(at: parent)
+            print("PASS owned external-to-internal-to-external opaque relocation and cleanup")
+        }
+    }
+    func testCompletedVerifiedStartupCanMoveButUnretiredGuardCannot() throws {
+        let (root, manager, store, folder, revision) = try moveFixture()
+        let parent = root.appendingPathComponent("chosen"); try Store.privateDirectory(parent)
+        var journal = Journal(); journal.revision = revision; journal.session = UUID()
+        journal.backend = .nfs; journal.startupProtocol = GuardedPopulationStartup.version
+        try store.write(journal, for: folder.id)
+        XCTAssertThrowsError(try manager.move(store: store, toParent: parent))
+        // A normally activated and cleanly restored session retains startup
+        // provenance; startupRetired is the aborted-startup receipt, not a
+        // requirement for every completed session. Helper absence stays checked.
+        journal.populationVerified = true
+        try store.write(journal, for: folder.id)
+        XCTAssertNil(try manager.move(store: store, toParent: parent).pending)
+        XCTAssertEqual(try manager.open().journal(folder.id).revision, revision)
+    }
+    func testRelocationRejectsBusyLifecycleAndVolumeLock() throws {
+        let (root, manager, store, folder, revision) = try moveFixture()
+        let parent = root.appendingPathComponent("chosen"); try Store.privateDirectory(parent)
+        for phase in [Phase.mounted, .pendingRestore, .preparing, .restoring] {
+            var journal = Journal(); journal.phase = phase; journal.revision = revision; try store.write(journal, for: folder.id)
+            XCTAssertThrowsError(try manager.move(store: store, toParent: parent))
+        }
+        var journal = Journal(); journal.revision = revision; journal.restoreStage = root.appendingPathComponent("owned-pending-stage").path
+        try store.write(journal, for: folder.id)
+        XCTAssertThrowsError(try manager.move(store: store, toParent: parent))
+        journal.restoreStage = nil; journal.socket = root.appendingPathComponent("fake-helper-socket").path
+        try Data().write(to: URL(fileURLWithPath: journal.socket!)); try store.write(journal, for: folder.id)
+        XCTAssertThrowsError(try manager.move(store: store, toParent: parent))
+        journal.socket = nil; try store.write(journal, for: folder.id)
+        try store.volumeLocked(folder.id) { XCTAssertThrowsError(try manager.move(store: store, toParent: parent)) }
+        XCTAssertNil(try manager.state().pending)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parent.appendingPathComponent("RAMNest Snapshots").path))
+    }
+    func testRelocationRejectsOverlapUnknownAndSymlinkTargets() throws {
+        let (root, manager, store, folder, _) = try moveFixture()
+        let inside = store.root.appendingPathComponent("inside"); try Store.privateDirectory(inside)
+        XCTAssertThrowsError(try manager.move(store: store, toParent: inside))
+        XCTAssertThrowsError(try manager.move(store: store, toParent: URL(fileURLWithPath: folder.path)))
+        let parent = root.appendingPathComponent("chosen"); try Store.privateDirectory(parent)
+        let unrelated = parent.appendingPathComponent("RAMNest Snapshots"); try Store.privateDirectory(unrelated)
+        let sentinel = unrelated.appendingPathComponent("unrelated"); try Data("leave me".utf8).write(to: sentinel)
+        XCTAssertThrowsError(try manager.move(store: store, toParent: parent))
+        XCTAssertEqual(try String(contentsOf: sentinel, encoding: .utf8), "leave me")
+        let alias = root.appendingPathComponent("alias"); try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: parent)
+        XCTAssertThrowsError(try manager.move(store: store, toParent: alias))
+        let unknown = store.root.appendingPathComponent("volumes/unknown"); try Store.privateDirectory(unknown)
+        let other = root.appendingPathComponent("other"); try Store.privateDirectory(other)
+        XCTAssertThrowsError(try manager.move(store: store, toParent: other))
+        XCTAssertNil(try manager.state().pending)
+    }
+    func testRelocationFaultsResumeAndCleanupIsVisible() throws {
+        for stage in ["copy", "copy-file", "hash", "fsync", "verified", "fenced", "publication", "committed", "cleanup", "cleanup-entry"] {
+            let (root, manager, store, folder, revision) = try moveFixture()
+            let parent = root.appendingPathComponent("chosen"); try Store.privateDirectory(parent)
+            manager.fault = { if $0 == stage { throw NestError("injected " + stage) } }
+            XCTAssertThrowsError(try manager.move(store: store, toParent: parent), stage)
+            XCTAssertNotNil(try manager.state().pending, stage)
+            XCTAssertThrowsError(try manager.open(), stage)
+            manager.fault = nil
+            XCTAssertNil(try manager.retry().pending, stage)
+            XCTAssertNil(try manager.retry().pending, stage)
+            let reopened = try manager.open()
+            XCTAssertEqual(try reopened.journal(folder.id).revision, revision, stage)
+            _ = try Snapshot.verified(store: reopened, id: folder.id, revision: revision)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("volumes").path), stage)
+        }
+    }
+    func testRecordedCopyCancellationCanRetryAndMissingStorageFailsClosed() throws {
+        let (root, manager, store, _, _) = try moveFixture()
+        let parent = root.appendingPathComponent("chosen"); try Store.privateDirectory(parent)
+        let token = StorageMoveCancellation()
+        manager.fault = { if $0 == "copy-file" { token.cancel() } }
+        XCTAssertThrowsError(try manager.move(store: store, toParent: parent, cancellation: token))
+        manager.fault = nil
+        XCTAssertNil(try manager.retry().pending)
+        let destination = try manager.open().root
+        let disconnected = root.appendingPathComponent("disconnected")
+        try FileManager.default.moveItem(at: parent, to: disconnected)
+        XCTAssertThrowsError(try manager.open())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("volumes").path))
+    }
+    func testPendingDisconnectAndCorruptReceiptRetainBothStores() throws {
+        let (root, manager, store, _, _) = try moveFixture()
+        let parent = root.appendingPathComponent("chosen"); try Store.privateDirectory(parent)
+        manager.fault = { if $0 == "fenced" { throw NestError("interrupted") } }
+        XCTAssertThrowsError(try manager.move(store: store, toParent: parent))
+        manager.fault = nil
+        let disconnected = root.appendingPathComponent("disconnected")
+        try FileManager.default.moveItem(at: parent, to: disconnected)
+        XCTAssertThrowsError(try manager.retry())
+        XCTAssertThrowsError(try manager.open())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("volumes").path))
+        try FileManager.default.moveItem(at: disconnected, to: parent)
+        let receipt = manager.location.bootstrapRoot.appendingPathComponent("storage-migration.json")
+        let original = try Data(contentsOf: receipt)
+        try Store.atomicData(Data("null".utf8), receipt)
+        XCTAssertThrowsError(try manager.retry())
+        XCTAssertThrowsError(try manager.open())
+        try Store.atomicData(original, receipt)
+        XCTAssertNil(try manager.retry().pending)
+    }
+    func testPendingCopyFencesExplicitClientsAndRetryResyncsFences() throws {
+        let (root, manager, store, _, _) = try moveFixture()
+        let parent = root.appendingPathComponent("chosen"); try Store.privateDirectory(parent)
+        manager.fault = { if $0 == "copy" { throw NestError("Pause recorded copy") } }
+        XCTAssertThrowsError(try manager.move(store: store, toParent: parent))
+        XCTAssertThrowsError(try Store(root: store.root))
+        XCTAssertThrowsError(try store.load())
+        for point in ["fence-file-sync", "fence-directory-sync"] {
+            manager.fault = { if $0 == point { throw NestError("Fence durability ACK failure") } }
+            XCTAssertThrowsError(try manager.retry())
+            XCTAssertFalse(FileManager.default.fileExists(atPath: manager.location.selectionURL.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("volumes").path))
+        }
+        manager.fault = nil
+        XCTAssertNil(try manager.retry().pending)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("volumes").path))
+    }
+    func testPartialCopyUnlinkLostACKCanRetryFromBothNamesAbsent() throws {
+        let (root, manager, store, folder, revision) = try moveFixture()
+        let parent = root.appendingPathComponent("chosen"); try Store.privateDirectory(parent)
+        manager.fault = { if $0 == "copy-file" { throw NestError("Leave owned partial file") } }
+        XCTAssertThrowsError(try manager.move(store: store, toParent: parent))
+        let first = try XCTUnwrap(StorageRelocation.readReceipt(at: manager.location.bootstrapRoot)?.partialFile)
+        XCTAssertNotEqual(first.inode, 0)
+        manager.fault = { if $0 == "partial-copy-unlinked" { throw NestError("Lost unlink ACK") } }
+        XCTAssertThrowsError(try manager.retry())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: URL(fileURLWithPath: first.parent.path).appendingPathComponent(first.temporary).path))
+        XCTAssertNotNil(try StorageRelocation.readReceipt(at: manager.location.bootstrapRoot)?.partialFile)
+        manager.fault = nil
+        XCTAssertNil(try manager.retry().pending)
+        XCTAssertEqual(try manager.open().journal(folder.id).revision, revision)
+    }
+    func testPartialCleanupRetryAndUnknownDestinationAreConservative() throws {
+        let (root, manager, store, _, _) = try moveFixture()
+        let parent = root.appendingPathComponent("chosen"); try Store.privateDirectory(parent)
+        var unlinks = 0
+        manager.fault = { if $0 == "cleanup-entry" { unlinks += 1; if unlinks == 3 { throw NestError("partial cleanup") } } }
+        XCTAssertThrowsError(try manager.move(store: store, toParent: parent))
+        XCTAssertTrue(try manager.state().cleanupPending)
+        XCTAssertThrowsError(try Store(root: store.root))
+        manager.fault = nil
+        XCTAssertNil(try manager.retry().pending)
+        XCTAssertNil(try manager.retry().pending)
+        let reopened = try manager.open()
+        XCTAssertTrue(try reopened.load().menuBarMode)
+        let second = root.appendingPathComponent("second"); try Store.privateDirectory(second)
+        manager.fault = { if $0 == "verified" { throw NestError("before fence") } }
+        XCTAssertThrowsError(try manager.move(store: reopened, toParent: second))
+        manager.fault = nil
+        let unknown = second.appendingPathComponent("RAMNest Snapshots/unrelated")
+        try Data("preserve unknown".utf8).write(to: unknown)
+        XCTAssertThrowsError(try manager.retry())
+        XCTAssertEqual(try String(contentsOf: unknown, encoding: .utf8), "preserve unknown")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: reopened.root.appendingPathComponent("volumes").path))
+    }
+}
+
 final class RAMNestCoreTests: XCTestCase {
     func testCoreScenarios() throws { try Scenarios.run() }
 }

@@ -39,7 +39,16 @@ struct ContentView: View {
                 }.padding(18)
             }.navigationSplitViewColumnWidth(min: 245, ideal: 270)
         } detail: {
-            if let status = model.selectedStatus { FolderDetail(status: status) }
+            if let status = model.selectedStatus {
+#if DEBUG
+                VStack(spacing: 0) {
+                    FolderDetail(status: status)
+                    DebugBenchmarkView()
+                }
+#else
+                FolderDetail(status: status)
+#endif
+            }
             else {
                 ContentUnavailableView {
                     Label("Make space for your work", systemImage: "leaf.circle")
@@ -160,6 +169,27 @@ struct AppSettingsView: View {
     @ViewState<String?> private var loginError: String?
     var body: some View {
         Form {
+            Section("Snapshot storage") {
+                Text(model.snapshotStoragePath.isEmpty ? "Storage unavailable" : model.snapshotStoragePath)
+                    .font(.callout.monospaced()).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                Text("Choose a parent directory. RAMNest creates a private ‘RAMNest Snapshots’ child and moves all snapshots, journals and folder settings together. A small location record stays in Application Support. Eject every RAM folder and apply option edits first.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Button("Choose / Move Snapshot Storage…") { model.chooseSnapshotStorage() }.disabled(!model.canMoveSnapshotStorage)
+                if model.storageManager == nil { Text("Storage selection is unavailable for an explicit --store session.").font(.caption).foregroundStyle(.secondary) }
+                if let pending = model.storagePending {
+                    Text(pending).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                }
+                if model.storagePending != nil || model.storageError != nil {
+                    Button("Retry Storage Move / Cleanup") { model.retrySnapshotStorage() }.disabled(model.busy || model.dirty)
+                }
+                if model.movingStorage {
+                    if let destination = model.storageDestinationPath { Text("Destination: " + destination).font(.caption.monospaced()).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
+                    ProgressView(); Text(model.progress).font(.caption)
+                    Button("Pause Before Commit") { model.cancelSnapshotStorageMove() }
+                    Text("Pausing retains both recorded locations. After selection commits, cleanup finishes without cancellation.").font(.caption).foregroundStyle(.secondary)
+                }
+                if let error = model.storageError { Text(error).foregroundStyle(.red).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
+            }
             Picker("Backend for next mount", selection: Binding(get: { model.backend }, set: { model.setBackend($0) })) {
                 ForEach(Configuration.Backend.allCases, id: \.self) { backend in Text(backend.displayName).tag(backend) }
             }.disabled(model.busy || model.engine == nil)
@@ -168,14 +198,14 @@ struct AppSettingsView: View {
                 Text("FSKit requires the FUSE-T extension to be enabled through /Applications/fuse-t.app. New mounts use a private internal location and a symlink at your folder’s original path, including for external-volume folders. RAMNest does not fall back to another backend.").font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
             if let error = model.backendError { Text(error).foregroundStyle(.red).textSelection(.enabled) }
-            Toggle("Show in menu bar instead of Dock", isOn: Binding(get: { model.menuBarMode }, set: { model.setMenuMode($0) }))
-            Toggle("Open at login", isOn: $login).onChange(of: login) { _, enabled in
+            Toggle("Show in menu bar instead of Dock", isOn: Binding(get: { model.menuBarMode }, set: { model.setMenuMode($0) })).disabled(model.busy || model.engine == nil)
+            Toggle("Open at login", isOn: $login).disabled(model.busy).onChange(of: login) { _, enabled in
                 do { if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } }
                 catch { loginError = error.localizedDescription; login = SMAppService.mainApp.status == .enabled }
             }
             if let loginError { Text(loginError).foregroundStyle(.red) }
             Text("Startup mounting pauses whenever an unfinished session needs recovery.").font(.caption).foregroundStyle(.secondary)
-            Button("Install Command Line Tool…") { model.installCLI() }
+            Button("Install Command Line Tool…") { model.installCLI() }.disabled(model.busy)
             Text("RAMNest has no telemetry, license checks, cloud storage, or automatic updater.").font(.caption).foregroundStyle(.secondary)
         }.padding(24).frame(width: 460)
     }

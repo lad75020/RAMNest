@@ -12,7 +12,8 @@ final class SiblingInventoryTests: XCTestCase {
 
 final class FSKitIndependentSafetyTests: XCTestCase {
     func testNonPrivateSourceRootKeepsPrivateBackupAndCleansAfterRestore() throws {
-        let root = URL(fileURLWithPath: "/Volumes/WDBlack4TB/.hermes/cache/scratch/ramnest-symlinks-independent-" + UUID().uuidString)
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let root = project.appendingPathComponent("artifacts/debug-io-instrumentation/independent-symlink-tests-" + UUID().uuidString)
         try Store.privateDirectory(root)
         defer { try? FileManager.default.removeItem(at: root) }
         let selected = root.appendingPathComponent("selected")

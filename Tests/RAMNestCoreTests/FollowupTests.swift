@@ -576,8 +576,9 @@ final class FSKitSymlinkLifecycleTests: XCTestCase {
             }
             return Engine(store: store, session: boundary)
         }()
-        init(temporary: Bool = false, trash: Bool = false, sourceMode: mode_t = 0o700) throws {
-            root = URL(fileURLWithPath: "/Volumes/WDBlack4TB/.hermes/cache/scratch/ramnest-symlinks-work/tests-\(UUID().uuidString)")
+        init(temporary: Bool = false, trash: Bool = false, sourceMode: mode_t = 0o700, fixtureRoot: URL? = nil) throws {
+            let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            root = fixtureRoot ?? project.appendingPathComponent("artifacts/debug-io-instrumentation/symlink-tests-\(UUID().uuidString)")
             try Store.privateDirectory(root)
             let sourceParent = root.appendingPathComponent("original-parent"); try Store.privateDirectory(sourceParent)
             selected = sourceParent.appendingPathComponent("selected"); try Store.privateDirectory(selected)
@@ -734,6 +735,45 @@ final class FSKitSymlinkLifecycleTests: XCTestCase {
         try f.engine.finalize(f.folder.id.uuidString)
         XCTAssertEqual(try f.value(), "committed RAM")
         try Paths.checkedIdentity(f.engine.folder(f.folder.id.uuidString))
+    }
+    func testRestoredCheckpointRevalidatesCompletedRenameBeforeConfiguration() throws {
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        for replace in [false, true] {
+            let root = project.appendingPathComponent("artifacts/source-race-fix/review-restored-\(UUID().uuidString)")
+            let f = try Fixture(fixtureRoot: root); defer { f.dispose() }
+            try f.activate()
+            try Data("committed RAM".utf8).write(to: f.selected.appendingPathComponent("payload"))
+            var checkpoint: Journal?
+            f.store.beforeJournalWrite = { journal, _ in
+                if journal.fsKitLink?.stage == .restored {
+                    checkpoint = journal
+                    throw NestError("Injected restored checkpoint before configuration")
+                }
+            }
+            XCTAssertThrowsError(try f.engine.unmount(f.folder.id.uuidString, ignoreBusy: true))
+            f.store.beforeJournalWrite = nil
+            var durable = try XCTUnwrap(checkpoint)
+            XCTAssertNotNil(durable.publicationRename?.after)
+            try f.store.write(durable, for: f.folder.id)
+            let beforeConfig = try Data(contentsOf: f.store.root.appendingPathComponent("configuration.json"))
+            if replace {
+                let payload = f.selected.appendingPathComponent("payload")
+                let before = try Snapshot.manifest(f.selected)
+                let copy = f.root.appendingPathComponent("identical-replacement")
+                try FileManager.default.copyItem(at: payload, to: copy)
+                try FileManager.default.removeItem(at: payload)
+                try FileManager.default.moveItem(at: copy, to: payload)
+                XCTAssertTrue(try Snapshot.manifest(f.selected).matchesExpected(before), "Replacement is invisible to manifest-only checks")
+                XCTAssertThrowsError(try f.engine.finishLinkedRestore(f.folder, journal: &durable))
+                XCTAssertEqual(try Data(contentsOf: f.store.root.appendingPathComponent("configuration.json")), beforeConfig)
+                XCTAssertEqual(try f.store.journal(f.folder.id).fsKitLink?.stage, .restored)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: f.journal.fsKitLink!.originalDataURL.path))
+            } else {
+                try f.engine.finishLinkedRestore(f.folder, journal: &durable)
+                XCTAssertEqual(durable.phase, .idle)
+                try Paths.checkedIdentity(f.engine.folder(f.folder.id.uuidString))
+            }
+        }
     }
     func testMountpointCleanupRefusesReplacedReservation() throws {
         let f = try Fixture(); defer { f.dispose() }

@@ -2,6 +2,217 @@ import Foundation
 import CryptoKit
 import Darwin
 
+// Authority for one coordinator-owned rename window, never a general manifest
+// comparison mode. Intent is durable before mutation; an incomplete receipt is
+// retained for review, not promoted by observing an inode after a crash.
+struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
+    enum Operation: String, Codable, Sendable { case evacuation, rollback, publication }
+    struct Node: Codable, Equatable, Sendable {
+        var path: String
+        var device: UInt64
+        var inode: UInt64
+        var links: UInt64
+        var mode: UInt16
+        var owner: UInt32
+        var group: UInt32
+        var flags: UInt32
+        var size: Int64
+        var mtimeSeconds: Int64
+        var mtimeNanos: Int64
+        var ctimeSeconds: Int64
+        var ctimeNanos: Int64
+        init(_ path: String, _ st: stat) {
+            self.path = path; device = Paths.deviceID(st.st_dev); inode = UInt64(st.st_ino)
+            links = UInt64(st.st_nlink); mode = UInt16(st.st_mode)
+            owner = st.st_uid; group = st.st_gid; flags = st.st_flags
+            size = Int64(st.st_size); mtimeSeconds = Int64(st.st_mtimespec.tv_sec); mtimeNanos = Int64(st.st_mtimespec.tv_nsec)
+            ctimeSeconds = Int64(st.st_ctimespec.tv_sec); ctimeNanos = Int64(st.st_ctimespec.tv_nsec)
+        }
+    }
+    struct Observation: Codable, Equatable, Sendable {
+        var manifest: Manifest
+        var nodes: [Node]
+        // Stat-only admission records for excluded top-level directories.
+        // Their xattrs/accounting are outside the exclusion contract entirely.
+        var opaque: [Entry]
+    }
+    var version = 1
+    var operation: Operation
+    var folder: UUID
+    var session: UUID
+    var wholeRoot: Bool
+    var names: [String]
+    var destinationDevice: UInt64
+    var destinationInode: UInt64
+    var destinationOwner: UInt32
+    var destinationGroup: UInt32
+    var before: Observation
+    var after: Observation?
+
+    static func observe(_ url: URL, matching: Manifest? = nil) throws -> Observation {
+        let root = try DirectoryHandle.open(url), cursor = DirectoryCursor(root)
+        let manifest = try Snapshot.manifest(url, matching: matching)
+        let names = try root.names()
+        guard names.count < StorageModes.maximumRecords else { throw NestError("Rename namespace bound exceeded; retained.", code: 6) }
+        let tops = Set(manifest.entries.map { String($0.path.split(separator: "/")[0]) })
+        var opaque: [Entry] = []
+        for name in names where !tops.contains(name) {
+            let st = try root.entryStat(name)
+            guard SnapshotExclusion.directory(name, st.st_mode) else { throw failure(name, "unknown entry") }
+            opaque.append(try Snapshot.renameDirectoryMetadata(url.appendingPathComponent(name), path: name, info: st))
+        }
+        var rootStat = stat(); guard fstat(root.fd, &rootStat) == 0 else { throw failure(".", "root stat") }
+        var nodes = [Node("", rootStat)]
+        for path in (manifest.entries.map(\.path) + opaque.map(\.path)).sorted() {
+            let (parent, name) = try cursor.parent(of: path)
+            nodes.append(Node(path, try parent.entryStat(name)))
+        }
+        // Pin every observation to the same no-follow root and independent raw
+        // readback. Nothing is changed to make an unreadable tree accessible.
+        guard try root.identity() == DirectoryHandle.open(url).identity(),
+              try Snapshot.manifest(url, matching: matching) == manifest else { throw failure(".", "observation changed") }
+        for node in nodes {
+            let now: Node
+            if node.path.isEmpty { var st = stat(); guard fstat(root.fd, &st) == 0 else { throw failure(".", "root stat") }; now = Node("", st) }
+            else { let (parent, name) = try cursor.parent(of: node.path); now = Node(node.path, try parent.entryStat(name)) }
+            guard now == node else { throw failure(node.path, "identity/metadata changed during readback") }
+        }
+        return Observation(manifest: manifest, nodes: nodes, opaque: opaque)
+    }
+    init(operation: Operation, folder: Folder, journal: Journal, source: URL,
+         destination: DirectoryHandle, wholeRoot: Bool = false, matching: Manifest? = nil) throws {
+        guard let session = journal.session else { throw Self.failure(".", "missing session") }
+        self.operation = operation; self.folder = folder.id; self.session = session; self.wholeRoot = wholeRoot
+        before = try Self.observe(source, matching: matching)
+        names = wholeRoot ? [""] : try DirectoryHandle.open(source).names()
+        let target = try destination.identity(); destinationDevice = target.device; destinationInode = target.inode
+        var targetStat = stat(); guard fstat(destination.fd, &targetStat) == 0 else { throw Self.failure(".", "destination stat") }
+        destinationOwner = targetStat.st_uid; destinationGroup = targetStat.st_gid
+        try validate()
+    }
+    static func failure(_ path: String, _ reason: String) -> NestError {
+        NestError("Verified rename at \(Snapshot.diagnosticLabel(path.isEmpty ? "." : path)): \(reason). Originals retained.", code: 6)
+    }
+    func validate() throws {
+        func valid(_ path: String) -> Bool {
+            path.isEmpty || (!path.hasPrefix("/") && !path.contains("\0") && path.utf8.count <= 4096 &&
+                path.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." })
+        }
+        guard version == 1, destinationInode > 0, before.nodes.count <= StorageModes.maximumRecords,
+              before.nodes.first?.path == "", Set(before.nodes.map(\.path)).count == before.nodes.count,
+              before.manifest.publicRoot?.path == "", before.manifest.publicRoot?.kind == "directory",
+              before.manifest.entries.count + before.opaque.count + 1 == before.nodes.count,
+              before.nodes.allSatisfy({ valid($0.path) && $0.inode > 0 && $0.links > 0 && $0.size >= 0 &&
+                  (0..<1_000_000_000).contains($0.mtimeNanos) && (0..<1_000_000_000).contains($0.ctimeNanos) }),
+              Set(before.nodes.map(\.path)) == Set([""] + before.manifest.entries.map(\.path) + before.opaque.map(\.path)),
+              names == names.sorted(), Set(names).count == names.count,
+              (wholeRoot ? names == [""] : names.allSatisfy({ valid($0) && !$0.isEmpty && !$0.contains("/") })),
+              wholeRoot || Set(names) == Set(before.nodes.dropFirst().map { String($0.path.split(separator: "/")[0]) }) else {
+            throw Self.failure(".", "invalid rename receipt")
+        }
+        _ = try before.manifest.copyFidelityView()
+        if let after {
+            guard after.manifest.publicRoot?.path == "", after.manifest.publicRoot?.kind == "directory" else { throw Self.failure(".", "missing raw completed root") }
+            _ = try after.manifest.copyFidelityView()
+            try compare(after)
+        }
+    }
+    func bound(to folder: Folder, journal: Journal, operation: Operation) throws {
+        try validate()
+        guard self.folder == folder.id, session == journal.session, self.operation == operation else { throw Self.failure(".", "receipt binding changed") }
+    }
+    // The exception applies only to the actual renamed inodes, including a
+    // hardlink alias of one of them. All other raw fields remain exact.
+    private func compare(_ observed: Observation, allowProvenanceChanges: Bool = true) throws {
+        guard observed.nodes.count == before.nodes.count,
+              observed.nodes.map(\.path) == before.nodes.map(\.path) else { throw Self.failure(".", "namespace changed") }
+        let renamedPaths = Set(names)
+        let moved = Set(before.nodes.filter { wholeRoot ? $0.path.isEmpty : renamedPaths.contains($0.path) }.map { "\($0.device):\($0.inode)" })
+        let allowed = Set(before.nodes.filter { moved.contains("\($0.device):\($0.inode)") }.map(\.path))
+        for (prior, actual) in zip(before.nodes, observed.nodes) {
+            if prior.path.isEmpty && !wholeRoot {
+                guard actual.device == destinationDevice, actual.inode == destinationInode,
+                      actual.owner == destinationOwner, actual.group == destinationGroup,
+                      operation != .evacuation || actual.mode == UInt16(S_IFDIR | 0o700) else { throw Self.failure(".", "destination identity/owner/private mode changed") }
+                continue
+            }
+            var normalized = actual
+            if allowed.contains(prior.path) { normalized.ctimeSeconds = prior.ctimeSeconds; normalized.ctimeNanos = prior.ctimeNanos }
+            guard normalized == prior else { throw Self.failure(prior.path, "inode/owner/mode/flags/link/ctime changed") }
+        }
+        func check(_ actual: Entry, _ prior: Entry) throws {
+            var a = actual, b = prior
+            if allowProvenanceChanges && allowed.contains(prior.path) {
+                a = try Self.renameEntryView(a); b = try Self.renameEntryView(b)
+            }
+            guard a == b else { throw Self.failure(prior.path, Snapshot.mismatchDetail(Manifest(entries: [a]), Manifest(entries: [b]))) }
+        }
+        guard observed.manifest.entries.count == before.manifest.entries.count,
+              observed.opaque.count == before.opaque.count else { throw Self.failure(".", "namespace changed") }
+        for (a, b) in zip(observed.manifest.entries, before.manifest.entries) { try check(a, b) }
+        // Opaque admission never reads xattrs and never uses copy/rename xattr
+        // normalization. Its recorded stat fields and inode nodes remain exact.
+        for (a, b) in zip(observed.opaque, before.opaque) {
+            guard a == b else { throw Self.failure(b.path, "excluded directory admission changed") }
+        }
+        if wholeRoot {
+            guard let a = observed.manifest.publicRoot, let b = before.manifest.publicRoot else { throw Self.failure(".", "missing public root") }
+            try check(a, b)
+        }
+    }
+    private static func renameEntryView(_ entry: Entry) throws -> Entry {
+        // Reuse measured accounting validation, not a payload length or format.
+        try Manifest(entries: [entry]).copyFidelityView().entries[0]
+    }
+    mutating func complete(at url: URL) throws {
+        guard after == nil else { throw Self.failure(".", "rename receipt already completed") }
+        let observed = try Self.observe(url, matching: before.manifest)
+        try compare(observed); after = observed
+    }
+    func verify(at url: URL) throws -> Manifest {
+        try validate()
+        guard let after else { throw Self.failure(".", "unacknowledged rename requires review") }
+        let actual = try Self.observe(url, matching: after.manifest)
+        guard actual == after else { throw Self.failure(".", "raw post-rename observation changed") }
+        return after.manifest
+    }
+    // Recovery only: missing completion grants no provenance exception. The
+    // already-bound inodes and every raw manifest field must still match the
+    // before observation. Only the actual moved inode's rename ctime can vary;
+    // unrenamed descendants retain exact ctimes. This creates no after receipt.
+    func verifyStrictIncomplete(at url: URL) throws -> Manifest {
+        try validate()
+        guard after == nil else { throw Self.failure(".", "expected incomplete rename intent") }
+        let actual = try Self.observe(url, matching: before.manifest)
+        try compare(actual, allowProvenanceChanges: false)
+        return actual.manifest
+    }
+    // Explicit null is not an absent completion, and an unknown version cannot
+    // select legacy journal recovery. Encoding omits the pending after field.
+    private enum CodingKeys: String, CodingKey { case version, operation, folder, session, wholeRoot, names, destinationDevice, destinationInode, destinationOwner, destinationGroup, before, after }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decode(Int.self, forKey: .version); operation = try c.decode(Operation.self, forKey: .operation)
+        folder = try c.decode(UUID.self, forKey: .folder); session = try c.decode(UUID.self, forKey: .session)
+        wholeRoot = try c.decode(Bool.self, forKey: .wholeRoot); names = try c.decode([String].self, forKey: .names)
+        destinationDevice = try c.decode(UInt64.self, forKey: .destinationDevice); destinationInode = try c.decode(UInt64.self, forKey: .destinationInode)
+        destinationOwner = try c.decode(UInt32.self, forKey: .destinationOwner); destinationGroup = try c.decode(UInt32.self, forKey: .destinationGroup)
+        before = try c.decode(Observation.self, forKey: .before)
+        after = c.contains(.after) ? try c.decode(Observation.self, forKey: .after) : nil
+        try validate()
+    }
+}
+
+extension Snapshot {
+    // Excluded roots are admitted by no-follow stat only. Do not open for
+    // reading, list/get xattrs, chmod, or descend into this directory.
+    static func renameDirectoryMetadata(_ url: URL, path: String, info: stat) throws -> Entry {
+        Entry(path: path, kind: "directory", size: 0, mode: UInt16(info.st_mode & 0o7777),
+              mtimeSeconds: 0, mtimeNanos: 0, checksum: "", attributes: [:],
+              hardlink: nil, flags: info.st_flags, attributeBytes: 0)
+    }
+}
+
 public struct Entry: Codable, Equatable, Sendable {
     public var path: String
     public var kind: String
@@ -15,11 +226,14 @@ public struct Entry: Codable, Equatable, Sendable {
     public var flags: UInt32
     public var attributeBytes: UInt64
     public var allocatedBytes: UInt64? = nil
+    // Observed name + value cost; nil only in older immutable records.
+    public var provenanceBytes: UInt64? = nil
     // Directional compatibility is allowed only when the EXPECTED old record
     // predates allocatedBytes. Equatable itself is exact (synthesized).
     func matchesExpected(_ expected: Entry) -> Bool {
         var observed = self
         if expected.allocatedBytes == nil { observed.allocatedBytes = nil }
+        if expected.provenanceBytes == nil { observed.provenanceBytes = nil }
         return observed == expected
     }
 
@@ -30,7 +244,7 @@ public struct Manifest: Codable, Equatable, Sendable {
     // The data root carries public metadata; its enclosing revision stays 0700.
     public var publicRoot: Entry? = nil
     public func matchesExpected(_ expected: Manifest) -> Bool {
-        contentsMatchExpected(expected) && (expected.publicRoot == nil || publicRoot == expected.publicRoot)
+        contentsMatchExpected(expected) && (expected.publicRoot == nil || publicRoot?.matchesExpected(expected.publicRoot!) == true)
     }
     // Holding directories have private root permissions, separately from their
     // original public root. Only callers that verify that container use this.
@@ -49,6 +263,23 @@ public struct Manifest: Codable, Equatable, Sendable {
             if anchors[group] == nil { anchors[group] = selected[i].path }
         }
         return Manifest(entries: selected, publicRoot: publicRoot)
+    }
+    // Only distinct copy instances may differ in OS-managed provenance. Both
+    // operands must be contemporary observations with measured byte costs.
+    func matchesCopy(of source: Manifest) throws -> Bool {
+        try copyFidelityView().matchesExpected(source.copyFidelityView())
+    }
+    func copyFidelityView() throws -> Manifest {
+        func entry(_ value: Entry) throws -> Entry {
+            var e = value
+            guard let cost = e.provenanceBytes,
+                  (e.attributes[Snapshot.provenanceName] == nil ? cost == 0 : (cost >= UInt64(Snapshot.provenanceName.utf8.count) && cost <= UInt64(1024 * 1024 + Snapshot.provenanceName.utf8.count))),
+                  cost <= e.attributeBytes else { throw NestError("Missing or invalid observed provenance accounting.", code: 6) }
+            e.attributes.removeValue(forKey: Snapshot.provenanceName)
+            e.attributeBytes -= cost; e.provenanceBytes = 0
+            return e
+        }
+        return try Manifest(entries: entries.map(entry), publicRoot: publicRoot.map(entry))
     }
     public var metadataEstimate: UInt64 {
         entries.reduce(1024 + UInt64((publicRoot?.attributes.count ?? 0) * 256)) { bytes, entry in
@@ -133,6 +364,7 @@ extension Manifest {
     }
 }
 public enum Snapshot {
+    static let provenanceName = "com.apple.provenance"
     // Only callers reading an explicitly selected Store revision may request
     // logical projection. User-controlled path/sibling names confer no authority.
     public enum SourceContext { case original, managedRevision }
@@ -186,6 +418,19 @@ public enum Snapshot {
             throw readFailure("Cannot inspect ACL", errno, url)
         }
     }
+    static func manifestFileBytes(_ container: DirectoryHandle) throws -> Data {
+        let fd = openat(container.fd, "manifest.json", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { throw NestError("Cannot pin immutable manifest.", code: 6) }
+        defer { close(fd) }
+        var before = stat()
+        guard fstat(fd, &before) == 0, before.st_mode & S_IFMT == S_IFREG, before.st_uid == getuid(),
+              before.st_nlink == 1, before.st_size > 0, before.st_size <= 64 << 20 else { throw NestError("Invalid immutable manifest inode.", code: 6) }
+        let bytes = try FileHandle(fileDescriptor: fd, closeOnDealloc: false).read(upToCount: (64 << 20) + 1) ?? Data()
+        var after = stat()
+        guard fstat(fd, &after) == 0, before.st_ctimespec == after.st_ctimespec, before.st_size == after.st_size,
+              bytes.count == Int(before.st_size) else { throw NestError("Immutable manifest changed while reading.", code: 6) }
+        return bytes
+    }
     static func storedMetadata(_ data: URL) throws -> StoredManifest? {
         let revision = data.deletingLastPathComponent()
         let container = try DirectoryHandle.open(revision)
@@ -194,7 +439,7 @@ public enum Snapshot {
             let st = try container.entryStat("manifest.json")
             guard st.st_mode & 0o7777 == 0o600, st.st_uid == getuid(), st.st_gid == getgid(), st.st_nlink == 1 else { throw NestError("Invalid private manifest inode/physical policy.", code: 6) }
         }
-        return metadata
+        return try SnapshotCopyObservations.applying(to: metadata, data: data)
     }
     static func checkedModes(_ data: URL, _ metadata: StoredManifest) throws -> StorageModes? {
         guard metadata.storageFormat != nil else { return nil }
@@ -241,7 +486,7 @@ public enum Snapshot {
                 let logicalFlags = type == S_IFREG ? st.st_flags & ~UInt32(UF_COMPRESSED) : st.st_flags
                 var entry = Entry(path: path, kind: "", size: 0, mode: UInt16(st.st_mode & 0o7777), mtimeSeconds: 0, mtimeNanos: 0, checksum: "", attributes: try relativeAttributes(child,path), hardlink: nil, flags: logicalFlags, attributeBytes: 0)
                 guard logicalFlags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else { throw NestError("Unsupported file flags on \(path). Clear immutable/append/system flags before conversion.", code: 4) }
-                for name in entry.attributes.keys { let bytes = getxattr(child.path, name, nil, 0, 0, XATTR_NOFOLLOW); guard bytes >= 0 else { throw readFailure("Cannot read extended attribute size", errno) }; entry.attributeBytes += UInt64(bytes + name.utf8.count) }
+                try accountAttributes(child, entry: &entry)
                 if type == S_IFDIR { entry.kind = "directory" }
                 else if type == S_IFLNK {
                     guard st.st_nlink == 1 else { throw NestError("Hardlinked symbolic links cannot be preserved; no files were moved.", code: 4) }
@@ -289,7 +534,7 @@ public enum Snapshot {
             if fd >= 0 { _ = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }; close(fd) }
         }
         var rootEntry = Entry(path: "", kind: "directory", size: 0, mode: UInt16(rootStat.st_mode & 0o7777), mtimeSeconds: 0, mtimeNanos: 0, checksum: "", attributes: try relativeAttributes(root,"."), hardlink: nil, flags: rootStat.st_flags, attributeBytes: 0)
-        for name in rootEntry.attributes.keys { let bytes = getxattr(root.path, name, nil, 0, 0, XATTR_NOFOLLOW); guard bytes >= 0 else { throw readFailure("Root attributes changed", errno) }; rootEntry.attributeBytes += UInt64(bytes + name.utf8.count) }
+        try accountAttributes(root, entry: &rootEntry)
         guard rootEntry.flags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else { throw NestError("Unsupported root flags.", code: 4) }
         if containedHardlinks { guard linkCounts == expectedLinks else { throw NestError("Private snapshot has a cross-boundary hardlink.", code: 6) } }
         for (url,before) in identities + [(root,rootStat)] {
@@ -298,6 +543,23 @@ public enum Snapshot {
                   after.st_size == before.st_size, after.st_mtimespec == before.st_mtimespec, after.st_ctimespec == before.st_ctimespec else { throw NestError("Snapshot source changed during independent readback.", code: 6) }
         }
         return Manifest(entries: entries.sorted { $0.path < $1.path }, publicRoot: rootEntry)
+    }
+    private static func accountAttributes(_ url: URL, entry: inout Entry) throws {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else { throw readFailure("Cannot inspect attribute accounting", errno, url) }
+        let fd = open(url.path, O_RDONLY | O_CLOEXEC | (st.st_mode & S_IFMT == S_IFLNK ? O_SYMLINK : O_NOFOLLOW))
+        guard fd >= 0 else { throw readFailure("Cannot pin attribute accounting", errno, url) }
+        defer { close(fd) }
+        entry.attributeBytes = 0; entry.provenanceBytes = 0
+        for name in entry.attributes.keys {
+            let size = fgetxattr(fd, name, nil, 0, 0, 0)
+            guard size >= 0, size <= 1024 * 1024 else { throw readFailure("Cannot measure extended attribute", errno, url) }
+            let amount = UInt64(size) + UInt64(name.utf8.count)
+            let sum = entry.attributeBytes.addingReportingOverflow(amount)
+            guard !sum.overflow else { throw NestError("Attribute accounting overflow.", code: 6) }
+            entry.attributeBytes = sum.partialValue
+            if name == provenanceName { entry.provenanceBytes = amount }
+        }
     }
     static func relativeAttributes(_ url: URL, _ path: String) throws -> [String:String] {
         do { return try attributes(url) }
@@ -379,52 +641,86 @@ public enum Snapshot {
         }
         guard try read(destination) == bytes else { throw failure("exact preservation not retained") }
     }
+    private static func verifyRootCopySource(_ fd: Int32, expected: Entry) throws {
+        var before = stat()
+        guard fstat(fd, &before) == 0, before.st_flags == expected.flags else { throw NestError("Public root source flags changed.", code: 6) }
+        let count = flistxattr(fd, nil, 0, 0)
+        guard count >= 0, count <= 1 << 20 else { throw NestError("Cannot enumerate public root source attributes.", code: 6) }
+        var names = [CChar](repeating: 0, count: max(1, count))
+        guard flistxattr(fd, &names, count, 0) == count else { throw NestError("Public root source attributes changed.", code: 6) }
+        var hashes: [String: String] = [:], total: UInt64 = 0
+        for key in names.prefix(count).split(separator: 0) {
+            let name = String(decoding: key.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            if name == "com.apple.decmpfs" { continue }
+            let size = fgetxattr(fd, name, nil, 0, 0, 0)
+            guard size >= 0, size <= 1 << 20 else { throw NestError("Cannot read public root source attribute.", code: 6) }
+            var bytes = Data(count: size)
+            guard bytes.withUnsafeMutableBytes({ fgetxattr(fd, name, $0.baseAddress, size, 0, 0) }) == size else { throw NestError("Public root source attribute changed.", code: 6) }
+            hashes[name] = digest(bytes)
+            let sum = total.addingReportingOverflow(UInt64(name.utf8.count) + UInt64(size))
+            guard !sum.overflow else { throw NestError("Public root attribute accounting overflow.", code: 6) }; total = sum.partialValue
+        }
+        var after = stat()
+        guard fstat(fd, &after) == 0, before.st_ctimespec == after.st_ctimespec,
+              before.st_mode == after.st_mode, hashes == expected.attributes, total == expected.attributeBytes else { throw NestError("Public root raw source metadata changed. No source files were removed.", code: 6) }
+    }
     // Both copy and recovery finish public-root metadata from already-verified,
     // no-follow directory descriptors. Darwin's quarantine copy API can rewrite
     // bytes; replay only the value authenticated by this manifest, then sync.
     // Rootless historical manifests retain their original metadata contract.
     static func restorePublicRootMetadata(from source: DirectoryHandle, to destination: DirectoryHandle, manifest: Manifest) throws {
         guard let rootEntry = manifest.publicRoot else { return }
+        try verifyRootCopySource(source.fd, expected: rootEntry)
         guard fcopyfile(source.fd, destination.fd, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR)) == 0 else {
             throw NestError("Cannot preserve public root metadata.", code: 6)
         }
         try preserveQuarantine(from: source.fd, to: destination.fd, entry: rootEntry)
+        try verifyRootCopySource(source.fd, expected: rootEntry)
         guard fchmod(destination.fd,mode_t(rootEntry.mode)) == 0 else { throw NestError("Cannot finalize public root mode.", code: 6) }
         try destination.sync()
     }
-    static func preparePublicRoot(from source: DirectoryHandle, to destination: DirectoryHandle, selected: URL, manifest: Manifest) throws {
+    static func preparePublicRoot(from source: DirectoryHandle, to destination: DirectoryHandle, selected: URL, manifest: Manifest) throws -> Entry {
         guard let root = manifest.publicRoot else { throw NestError("Missing public root metadata.", code: 6) }
+        try verifyRootCopySource(source.fd, expected: root)
         guard fcopyfile(source.fd,destination.fd,nil,copyfile_flags_t(COPYFILE_XATTR)) == 0 else { throw NestError("Cannot copy public root attributes.", code: 6) }
         try preserveQuarantine(from:source.fd,to:destination.fd,entry:root)
-        guard fchflags(destination.fd,root.flags) == 0, try relativeAttributes(selected,".") == root.attributes else { throw NestError("Public root attribute/flag readback failed.", code: 6) }
+        try verifyRootCopySource(source.fd, expected: root)
+        guard fchflags(destination.fd,root.flags) == 0 else { throw NestError("Public root flag restoration failed.", code: 6) }
+        var st = stat()
+        guard fstat(destination.fd, &st) == 0, st.st_flags == root.flags else { throw NestError("Public root flag readback failed.", code: 6) }
+        var observed = root
+        observed.attributes = try relativeAttributes(selected, ".")
+        try accountAttributes(selected, entry: &observed)
+        guard try Manifest(entries: [], publicRoot: observed).matchesCopy(of: Manifest(entries: [], publicRoot: root)) else { throw NestError("Public root attribute readback failed.", code: 6) }
         try destination.sync()
+        return observed
     }
     // A legacy manifest that omitted root metadata authenticates only entries.
     // Observe the readable physical root for THIS new materialization; never
     // invent historical metadata or rewrite/relabel the legacy revision.
     static func materializationManifest(_ source: URL, expected: Manifest, context: SourceContext) throws -> Manifest {
-        guard expected.publicRoot == nil else { return expected }
-        let observed = try manifest(source,matching:expected,phase:"legacy-materialization-root",context:context)
-        guard observed.matchesExpected(expected) else { throw NestError("Legacy materialization source changed.", code: 6) }
-        var result = expected;result.publicRoot = observed.publicRoot
-        return result
+        if expected.publicRoot?.provenanceBytes != nil, expected.entries.allSatisfy({ $0.provenanceBytes != nil }) { return expected }
+        let observed = try manifest(source,matching:expected,phase:"materialization-source",context:context)
+        guard observed.matchesExpected(expected) else { throw NestError("Materialization source changed \(mismatchDetail(observed, expected)). No source files were removed.", code: 6) }
+        return observed
     }
-    public static func copyTree(from source: URL, to destination: URL, manifest expected: Manifest, previous: URL? = nil, comparison: Comparison = .checksum, privateStorage: Bool = false, publicationStaging: Bool = false, sourceContext: SourceContext = .original, previousContext: SourceContext = .original) throws {
+
+    @discardableResult public static func copyTree(from source: URL, to destination: URL, manifest expected: Manifest, previous: URL? = nil, comparison: Comparison = .checksum, privateStorage: Bool = false, publicationStaging: Bool = false, sourceContext: SourceContext = .original, previousContext: SourceContext = .original) throws -> Manifest {
         let manifest = try materializationManifest(source,expected:expected.excludingTrashDirectories(),context:sourceContext)
-        if privateStorage { try copyAccessibleTree(from:source,to:destination,manifest:manifest,previous:previous,comparison:comparison,sourceContext:sourceContext,previousContext:previousContext);return }
+        if privateStorage { return try copyAccessibleTree(from:source,to:destination,manifest:manifest,previous:previous,comparison:comparison,sourceContext:sourceContext,previousContext:previousContext) }
         if publicationStaging {
-            try copyAccessibleTree(from:source,to:destination,manifest:manifest,previous:previous,comparison:comparison,sourceContext:sourceContext,previousContext:previousContext)
-            _ = try finalizeModes(destination,manifest:manifest,destination:destination.lastPathComponent)
-            return
+            let copied = try copyAccessibleTree(from:source,to:destination,manifest:manifest,previous:previous,comparison:comparison,sourceContext:sourceContext,previousContext:previousContext)
+            _ = try finalizeModes(destination,manifest:copied,destination:destination.lastPathComponent)
+            return copied
         }
         let parent = try DirectoryHandle.open(destination.deletingLastPathComponent())
         guard try !parent.exists(destination.lastPathComponent) else { throw NestError("Export destination already exists.", code: 6) }
         let name = ".ramnest-materialize-" + UUID().uuidString
         let container = try parent.createDirectory(name)
         let staging = destination.deletingLastPathComponent().appendingPathComponent(name).appendingPathComponent("data")
-        try copyAccessibleTree(from:source,to:staging,manifest:manifest,previous:previous,comparison:comparison,sourceContext:sourceContext,previousContext:previousContext)
+        let copied = try copyAccessibleTree(from:source,to:staging,manifest:manifest,previous:previous,comparison:comparison,sourceContext:sourceContext,previousContext:previousContext)
         let privateName = ".ramnest-publish-" + UUID().uuidString
-        var intent = PublicationReceipt(manifest:manifest,destination:destination.lastPathComponent,phase:"verified-accessible")
+        var intent = PublicationReceipt(manifest:copied,destination:destination.lastPathComponent,phase:"verified-accessible")
         intent.privateName = privateName
         try Store.atomicJSON(intent,staging.deletingLastPathComponent().appendingPathComponent("publication.json"))
         let pinned = try container.child("data").identity()
@@ -435,7 +731,7 @@ public enum Snapshot {
         try container.sync();try parent.sync()
         let privateURL = destination.deletingLastPathComponent().appendingPathComponent(privateName)
         guard try parent.child(privateName).identity() == pinned else { throw NestError("Publication materialization identity changed.", code: 6) }
-        var receipt = try finalizeModes(privateURL,manifest:manifest,destination:destination.lastPathComponent)
+        var receipt = try finalizeModes(privateURL,manifest:copied,destination:destination.lastPathComponent)
         receipt.privateName = privateName
         try Store.atomicJSON(receipt,staging.deletingLastPathComponent().appendingPathComponent("publication.json"))
         try container.sync()
@@ -447,8 +743,9 @@ public enum Snapshot {
               try DirectoryHandle.open(destination.deletingLastPathComponent()).identity() == parent.identity() else { throw NestError("Published materialization identity changed; receipt retained.", code: 6) }
         receipt.phase = "published"
         try Store.atomicJSON(receipt,staging.deletingLastPathComponent().appendingPathComponent("publication.json"))
+        return copied
     }
-    static func copyAccessibleTree(from source: URL, to destination: URL, manifest: Manifest, previous: URL? = nil, comparison: Comparison = .checksum, sourceContext: SourceContext = .original, previousContext: SourceContext = .original, freshExportModes: StorageModes? = nil) throws {
+    @discardableResult static func copyAccessibleTree(from source: URL, to destination: URL, manifest: Manifest, previous: URL? = nil, comparison: Comparison = .checksum, sourceContext: SourceContext = .original, previousContext: SourceContext = .original, freshExportModes: StorageModes? = nil) throws -> Manifest {
         // Only adoptExport supplies this capability, after full native receipt
         // or fresh-normalization validation. It confers no authority on a path.
         func observe(_ phase: String) throws -> Manifest {
@@ -528,10 +825,11 @@ public enum Snapshot {
         guard fchmod(destinationRoot.fd,0o700) == 0 else { throw NestError("Cannot set private root storage policy.", code: 6) }
         try destinationRoot.sync(); try destinationParent.sync()
         let actual = try StorageModes(manifest).projecting(scanManifest(destination, matching: manifest, phase: "copy-readback",containedHardlinks:true))
-        guard actual.matchesExpected(manifest) else { throw NestError("Snapshot verification failed \(mismatchDetail(actual, manifest)). No source files were removed.", code: 6) }
+        guard try actual.matchesCopy(of: before) else { throw NestError("Snapshot verification failed \(mismatchDetail(actual, manifest)). No source files were removed.", code: 6) }
         try Store.syncDirectory(destination)
         let after = try observe("copy-source-after")
-        guard after.matchesExpected(manifest) else { throw NestError("Source changed during copy \(mismatchDetail(after,manifest)). No source files were removed.", code: 6) }
+        guard after == before else { throw NestError("Source changed during copy \(mismatchDetail(after,manifest)). No source files were removed.", code: 6) }
+        return actual
     }
     public static func dataURL(store: Store, id: UUID, revision: String) throws -> URL {
         guard UUID(uuidString: revision) != nil else { throw NestError("Invalid snapshot revision.", code: 6) }
@@ -544,7 +842,7 @@ public enum Snapshot {
         let container = try revisions.child(revision)
         let metadataBefore = try container.entryStat("manifest.json")
         let containerIdentity = try container.identity()
-        let metadata = try container.readJSON(StoredManifest.self, "manifest.json")
+        guard let metadata = try storedMetadata(data) else { throw NestError("Missing snapshot metadata.", code: 6) }
         try container.requireOwnedDirectory(device:revisions.identity().device,privateMode:true)
         guard try container.names() == (metadata.storageFormat == 2 ? ["data", "manifest.json", "modes.bin"] : ["data", "manifest.json"]) else { throw NestError("Unexpected snapshot container namespace.", code: 6) }
         // Keep the full stored record/map immutable; only the returned view is filtered.
@@ -570,12 +868,13 @@ public enum Snapshot {
         let directory = try store.volume(folder.id).appendingPathComponent("revisions/\(revision)")
         try Store.privateDirectory(directory)
         let old = try previous.map { try dataURL(store: store, id: folder.id, revision: $0) }
-        try copyTree(from: source, to: directory.appendingPathComponent("data"), manifest: initial, previous: old, comparison: folder.options.comparison, privateStorage: true,sourceContext:sourceContext,previousContext:.managedRevision)
+        let copied = try copyTree(from: source, to: directory.appendingPathComponent("data"), manifest: initial, previous: old, comparison: folder.options.comparison, privateStorage: true,sourceContext:sourceContext,previousContext:.managedRevision)
         let final = try manifest(source, matching: initial, phase: "capture-source-after",context:sourceContext)
         guard final == initial else { throw NestError("Source changed during snapshot \(mismatchDetail(final, initial)). Close writers and retry. No source files were removed.", code: 6) }
-        let modes = try StorageModes(initial)
+        try copied.preflight(capacity: folder.capacity)
+        let modes = try StorageModes(copied)
         try modes.write(directory.appendingPathComponent("modes.bin"))
-        try Store.atomicJSON(StoredManifest(initial,modes:modes), directory.appendingPathComponent("manifest.json")); try Store.syncDirectory(directory); try Store.syncDirectory(directory.deletingLastPathComponent())
+        try Store.atomicJSON(StoredManifest(copied,modes:modes), directory.appendingPathComponent("manifest.json")); try Store.syncDirectory(directory); try Store.syncDirectory(directory.deletingLastPathComponent())
         return revision
     }
     public static func adoptExport(store: Store, folder: Folder, stage: URL, privateStorage: Bool = false, modeMapDigest: String? = nil) throws -> String {
@@ -590,7 +889,8 @@ public enum Snapshot {
             guard modeMapDigest == nil else { throw NestError("Legacy helper/storage receipt mismatch; stage retained.", code: 6) }
             modes = try StorageModes.normalizeFreshExport(stage,volume:volume)
         }
-        let manifest = try modes.projecting(scanManifest(stage,phase:"export-independent-readback",containedHardlinks:true))
+        var manifest = try modes.projecting(scanManifest(stage,phase:"export-independent-readback",containedHardlinks:true))
+        try manifest.preflight(capacity: folder.capacity)
         let includedModes = try StorageModes(manifest)
         let excluded = try excludedDirectoryPaths(stage)
         let revision = UUID().uuidString
@@ -604,12 +904,13 @@ public enum Snapshot {
         } else {
             // A running old helper may still export Trash. Copy only the
             // authenticated included view; leave opaque stage Trash untouched.
-            try copyAccessibleTree(from:stage,to:directory.appendingPathComponent("data"),manifest:manifest,freshExportModes:modes)
+            manifest = try copyAccessibleTree(from:stage,to:directory.appendingPathComponent("data"),manifest:manifest,freshExportModes:modes)
             try includedModes.write(directory.appendingPathComponent("modes.bin"))
             let warning = "Legacy helper exported excluded RAM Trash. Opaque export retained at " + stage.path
             try Store.atomicJSON(["stage":stage.path,"reason":warning],URL(fileURLWithPath:stage.path+".trash-retained.json"))
             FileHandle.standardError.write(Data((warning+"\n").utf8))
         }
+        try manifest.preflight(capacity: folder.capacity)
         guard digest(try StorageModes.read(directory.appendingPathComponent("modes.bin"))) == digest(includedModes.encoded) else { throw NestError("Promoted logical mode map changed; uncommitted revision retained.", code: 6) }
         try Store.atomicJSON(StoredManifest(manifest,modes:includedModes), directory.appendingPathComponent("manifest.json")); try Store.syncDirectory(directory); try Store.syncDirectory(directory.deletingLastPathComponent());try parent.sync()
         return revision
@@ -694,7 +995,11 @@ enum SnapshotRetention {
             let pending = references(durable).subtracting(keep).sorted()
             durable.retiringRevisions = pending
             durable.priorRevision = nil
-            if durable.phase == .idle { durable.initialRevision = nil; durable.restoreRevision = nil }
+            if durable.phase == .idle {
+                durable.initialRevision = nil; durable.restoreRevision = nil
+                durable.initialSourceManifest = nil; durable.restoreManifest = nil
+                durable.originalRename = nil; durable.publicationRename = nil
+            }
             if durable.phase == .idle || durable.siblingCleanup == nil { durable.cleanupWarning = nil }
             try store.write(durable, for: folder.id)
             journal = durable

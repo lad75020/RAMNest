@@ -6,9 +6,63 @@
 using ramnest::MemoryFS;
 namespace fs=std::filesystem;
 static std::string readBytes(const fs::path& p){int fd=::open(p.c_str(),O_RDONLY|O_NOFOLLOW);assert(fd>=0);char bytes[128]{};auto n=::read(fd,bytes,sizeof bytes);assert(n>=0);::close(fd);return {bytes,size_t(n)};}
+static std::map<std::string,std::string> observedAttributes(const fs::path& path){
+    auto count=::listxattr(path.c_str(),nullptr,0,XATTR_NOFOLLOW);assert(count>=0);
+    std::vector<char> names(count);if(count)assert(::listxattr(path.c_str(),names.data(),names.size(),XATTR_NOFOLLOW)==count);
+    std::map<std::string,std::string> attrs;
+    for(size_t at=0;at<names.size();){std::string name(names.data()+at);at+=name.size()+1;
+        auto size=::getxattr(path.c_str(),name.c_str(),nullptr,0,0,XATTR_NOFOLLOW);assert(size>=0&&size<=1024*1024);
+        std::string value(size,0);assert(::getxattr(path.c_str(),name.c_str(),value.data(),value.size(),0,XATTR_NOFOLLOW)==size);attrs.emplace(name,std::move(value));}
+    return attrs;
+}
+static void provenanceCopies(const fs::path& root){
+    auto source=root/"provenance-source";fs::create_directory(source);
+    auto payload=source/".DS_Store";{int fd=::open(payload.c_str(),O_CREAT|O_EXCL|O_RDWR,0600);assert(fd>=0&&::write(fd,"owned",5)==5);::close(fd);}
+    const std::string custom="ordinary exact bytes", quarantine="0081;65000000;RAMNestFixture;";
+    assert(::setxattr(payload.c_str(),"user.ramnest-control",custom.data(),custom.size(),0,XATTR_NOFOLLOW)==0);
+    assert(::setxattr(payload.c_str(),"com.apple.quarantine",quarantine.data(),quarantine.size(),0,XATTR_NOFOLLOW)==0);
+    auto attrs=observedAttributes(payload);struct stat before{};assert(::lstat(payload.c_str(),&before)==0);
+    MemoryFS tree(16*1024*1024,false);assert(tree.importTree(source)==0);
+    std::string runtime;
+    for(auto&[key,value]:attrs)assert(tree.getxattr("/.DS_Store",key,runtime)==0&&runtime==value);
+    assert(tree.accountingOracleForTest());
+    auto revision=root/"provenance-revision";fs::create_directory(revision);
+    assert(tree.exportTree(revision/"data",false,"",0,true)==0);
+    fs::rename((revision/"data").string()+".modes",revision/"modes.bin");
+    auto file=revision/"data/.DS_Store";auto copied=observedAttributes(file);
+    auto expected=attrs;expected.erase("com.apple.provenance");auto ordinary=copied;ordinary.erase("com.apple.provenance");assert(ordinary==expected);
+    const auto generation=tree.lastExportStats().generation;
+    assert(tree.exportTree(root/"provenance-noop",false,revision/"data",generation,true)==0&&tree.lastExportStats().reused);
+    for(auto field:{"extra","quarantine","mode","flags","content"}){
+        struct stat st{};assert(::lstat(file.c_str(),&st)==0);
+        if(std::string(field)=="extra")assert(::setxattr(file.c_str(),"user.extra","x",1,0,XATTR_NOFOLLOW)==0);
+        else if(std::string(field)=="quarantine")assert(::setxattr(file.c_str(),"com.apple.quarantine","x",1,0,XATTR_NOFOLLOW)==0);
+        else if(std::string(field)=="mode")assert(::chmod(file.c_str(),0644)==0);
+        else if(std::string(field)=="flags")assert(::chflags(file.c_str(),UF_NODUMP)==0);
+        else {int fd=::open(file.c_str(),O_RDWR);assert(fd>=0&&::pwrite(fd,"other",5,0)==5);::close(fd);}
+        assert(tree.exportTree(root/(std::string("reject-")+field),false,revision/"data",generation,true)<0);
+        if(std::string(field)=="extra")assert(::removexattr(file.c_str(),"user.extra",XATTR_NOFOLLOW)==0);
+        else if(std::string(field)=="quarantine")assert(::setxattr(file.c_str(),"com.apple.quarantine",quarantine.data(),quarantine.size(),0,XATTR_NOFOLLOW)==0);
+        else if(std::string(field)=="mode")assert(::chmod(file.c_str(),0600)==0);
+        else if(std::string(field)=="flags")assert(::chflags(file.c_str(),0)==0);
+        else {int fd=::open(file.c_str(),O_RDWR);assert(fd>=0&&::pwrite(fd,"owned",5,0)==5);::close(fd);}
+        timespec times[2]={st.st_atimespec,st.st_mtimespec};assert(::utimensat(AT_FDCWD,file.c_str(),times,AT_SYMLINK_NOFOLLOW)==0);
+        assert(tree.exportTree(root/(std::string("retry-")+field),false,revision/"data",generation,true)==0);
+    }
+    assert(observedAttributes(payload)==attrs);struct stat after{};assert(::lstat(payload.c_str(),&after)==0);
+    assert(before.st_ino==after.st_ino&&before.st_ctimespec.tv_sec==after.st_ctimespec.tv_sec&&before.st_ctimespec.tv_nsec==after.st_ctimespec.tv_nsec);
+    assert(tree.accountingOracleForTest());
+    uint64_t actual=ramnest::pageSize;
+    for(auto path:{revision/"data",file})for(auto&[key,value]:observedAttributes(path))actual+=key.size()+value.size();
+    const auto held=tree.metrics().logical;assert(tree.resize(held)==0);
+    const auto boundary=tree.exportTree(root/"provenance-capacity",false,revision/"data",generation,true);
+    assert(boundary==(actual>held?-ENOSPC:0));assert(tree.resize(16*1024*1024)==0);
+    std::cout<<"PASS provenance copy: authentic import/runtime attrs, own export receipt/no-op, strict ordinary/quarantine/content/mode/flag controls, exact source immutability\n";
+}
 int main(){
     auto base=getenv("RAMNEST_TEST_ROOT");assert(base);fs::create_directories(base);
     std::string pattern=std::string(base)+"/storage-XXXXXX";assert(mkdtemp(pattern.data()));fs::path root=pattern;
+    provenanceCopies(root);
     MemoryFS tree(16*1024*1024,false);
     assert(tree.create("/RestrictedData",S_IFDIR|0700)==0);
     assert(tree.create("/RestrictedData/nested",S_IFDIR|0700)==0);

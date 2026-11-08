@@ -56,6 +56,10 @@ public struct Journal: Codable, Equatable, Sendable {
     public var evacuatedEntries: [String] = []
     public var restoredEntries: [String] = []
     public var restoreRevision: String?
+    var initialSourceManifest: Manifest?
+    var originalRename: VerifiedRenameReceipt?
+    var publicationRename: VerifiedRenameReceipt?
+    var restoreManifest: Manifest?
     public var restoreStage: String?
     public var restoreStageDevice: UInt64?
     public var restoreStageInode: UInt64?
@@ -78,9 +82,10 @@ public struct Journal: Codable, Equatable, Sendable {
         case phase, session, backend, socket, initialRevision, revision, priorRevision
         case nativeGeneration, quiescedRevision, quiescedSession, quiescedHelperPID, quiescedNativeInstance
         case retiringRevisions, cleanupWarning, siblingCleanup, evacuation, evacuationDevice, evacuationInode
-        case evacuatedEntries, restoredEntries, restoreRevision, restoreStage, restoreStageDevice, restoreStageInode
+        case evacuatedEntries, restoredEntries, initialSourceManifest, restoreManifest, restoreRevision, restoreStage, restoreStageDevice, restoreStageInode
         case restoreDataDevice, restoreDataInode, publicationReceipt, mountedDevice, populationVerified
         case startupProtocol, startupHelperPID, startupRetired, lastError, updated, fsKitLink
+        case originalRename, publicationRename
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -123,6 +128,23 @@ public struct Journal: Codable, Equatable, Sendable {
         evacuatedEntries = try values.decode([String].self, forKey: .evacuatedEntries)
         restoredEntries = try values.decode([String].self, forKey: .restoredEntries)
         restoreRevision = try values.decodeIfPresent(String.self, forKey: .restoreRevision)
+        initialSourceManifest = values.contains(.initialSourceManifest) ? try values.decode(Manifest.self, forKey: .initialSourceManifest) : nil
+        originalRename = values.contains(.originalRename) ? try values.decode(VerifiedRenameReceipt.self, forKey: .originalRename) : nil
+        publicationRename = values.contains(.publicationRename) ? try values.decode(VerifiedRenameReceipt.self, forKey: .publicationRename) : nil
+        for receipt in [originalRename, publicationRename].compactMap({ $0 }) {
+            guard receipt.session == session else { throw NestError("Rename receipt session mismatch; retained.", code: 6) }
+        }
+        if let originalRename {
+            guard originalRename.operation == .evacuation, initialSourceManifest == originalRename.before.manifest,
+                  evacuation != nil, evacuationDevice == originalRename.destinationDevice,
+                  evacuationInode == originalRename.destinationInode else {
+                throw NestError("Rename receipt source binding mismatch; retained.", code: 6)
+            }
+        }
+        if let publicationRename, publicationRename.operation == .evacuation {
+            throw NestError("Invalid publication rename operation; retained.", code: 6)
+        }
+        restoreManifest = values.contains(.restoreManifest) ? try values.decode(Manifest.self, forKey: .restoreManifest) : nil
         restoreStage = try values.decodeIfPresent(String.self, forKey: .restoreStage)
         restoreStageDevice = try values.decodeIfPresent(UInt64.self, forKey: .restoreStageDevice)
         restoreStageInode = try values.decodeIfPresent(UInt64.self, forKey: .restoreStageInode)

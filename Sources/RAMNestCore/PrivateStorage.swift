@@ -309,3 +309,62 @@ struct StorageModes {
         return try StorageModes(records:records)
     }
 }
+
+// Relocation keeps immutable revision files byte-for-byte. This store-level
+// record binds each changed physical copy to the unchanged manifest and modes.
+struct SnapshotCopyObservations: Codable {
+    static let name = ".ramnest-copy-observations.json"
+    struct Record: Codable {
+        var manifestDigest: String
+        var modeMapDigest: String?
+        var basis: Manifest
+        var observed: Manifest
+    }
+    var version = 1
+    var device: UInt64
+    var inode: UInt64
+    var revisions: [String: Record]
+
+    static func location(_ data: URL) throws -> (URL, String) {
+        let revision = data.deletingLastPathComponent()
+        let revisions = revision.deletingLastPathComponent()
+        let volume = revisions.deletingLastPathComponent()
+        let volumes = volume.deletingLastPathComponent()
+        guard data.lastPathComponent == "data", UUID(uuidString: revision.lastPathComponent) != nil,
+              revisions.lastPathComponent == "revisions", UUID(uuidString: volume.lastPathComponent) != nil,
+              volumes.lastPathComponent == "volumes" else { throw NestError("Invalid revision observation path.", code: 6) }
+        return (volumes.deletingLastPathComponent(), volume.lastPathComponent + "/" + revision.lastPathComponent)
+    }
+    static func read(_ root: URL) throws -> SnapshotCopyObservations? {
+        let directory = try DirectoryHandle.open(root)
+        guard try directory.exists(name) else { return nil }
+        let identity = try directory.identity()
+        try directory.requireOwnedDirectory(device: identity.device, privateMode: true)
+        let before = try directory.entryStat(name)
+        let value = try StorageRelocation.read(Self.self, in: directory, name: name)
+        let after = try directory.entryStat(name)
+        guard before.st_dev == after.st_dev, before.st_ino == after.st_ino, before.st_ctimespec == after.st_ctimespec,
+              before.st_size == after.st_size, before.st_mode == after.st_mode else { throw NestError("Relocation observations changed during read.", code: 6) }
+        guard value.version == 1, value.device == identity.device, value.inode == identity.inode,
+              value.revisions.count <= 100_000 else { throw NestError("Invalid relocated copy observations.", code: 6) }
+        for key in value.revisions.keys {
+            let parts = key.split(separator: "/", omittingEmptySubsequences: false)
+            guard parts.count == 2, parts.allSatisfy({ UUID(uuidString: String($0)) != nil }) else { throw NestError("Malformed relocated revision key.", code: 6) }
+        }
+        return value
+    }
+    static func applying(to metadata: StoredManifest, data: URL) throws -> StoredManifest {
+        guard let (root, key) = try? location(data) else { return metadata }
+        guard let record = try read(root)?.revisions[key] else { return metadata }
+        let container = try DirectoryHandle.open(data.deletingLastPathComponent())
+        let manifestBytes = try Snapshot.manifestFileBytes(container)
+        guard Snapshot.digest(manifestBytes) == record.manifestDigest,
+              metadata.modeMapDigest == record.modeMapDigest,
+              record.basis.matchesExpected(try metadata.logical.excludingTrashDirectories()),
+              try record.observed.matchesCopy(of: record.basis) else { throw NestError("Relocated revision copy observation is not bound to its immutable manifest.", code: 6) }
+        var result = metadata
+        let entries = Dictionary(uniqueKeysWithValues: record.observed.entries.map { ($0.path, $0) })
+        result.entries = metadata.entries.map { entries[$0.path] ?? $0 }; result.publicRoot = record.observed.publicRoot
+        return result
+    }
+}

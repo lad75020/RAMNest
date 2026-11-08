@@ -4,6 +4,9 @@ options:
     macOS: '27.0'
   createIntermediateGroups: true
 settings:
+  configs:
+    Debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG"
   base:
     SWIFT_VERSION: '6.0'
     MACOSX_DEPLOYMENT_TARGET: '27.0'
@@ -57,6 +60,11 @@ targets:
           - $(PROJECT_DIR)/scripts/native-provenance.py
           - $(PROJECT_DIR)/Native/MemoryFS.cpp
           - $(PROJECT_DIR)/Native/MemoryFS.hpp
+          - $(PROJECT_DIR)/Native/NativeChecksumIntegrityTests.cpp
+          - $(PROJECT_DIR)/Native/NativeIoOptimizationTests.cpp
+          - $(PROJECT_DIR)/Native/NativeIoBenchmark.cpp
+          - $(PROJECT_DIR)/Native/DebugProfile.hpp
+          - $(PROJECT_DIR)/Native/DebugProfileTests.cpp
           - $(PROJECT_DIR)/Native/StorageModes.hpp
           - $(PROJECT_DIR)/Native/TrashExclusionTests.cpp
           - $(PROJECT_DIR)/Native/StorageFormatFixture.cpp

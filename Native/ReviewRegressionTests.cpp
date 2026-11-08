@@ -46,7 +46,8 @@ int main(){
         assert(atomic.metrics().mapped==allocation.mapped&&atomic.accountingOracleForTest());
     }
     MappedPage::failAllocationForTest(-1);
-    assert(atomic.corruptBlockForTest("/atomic",1)==0&&atomic.write("/atomic",replacement.data(),replacement.size(),0)==-EIO);
+    assert(atomic.flipPayloadByteForTest("/atomic",1)==0&&atomic.write("/atomic",replacement.data(),replacement.size(),0)==-EIO);
+    assert(atomic.flipPayloadByteForTest("/atomic",1)==0&&atomic.read("/atomic",readback.data(),readback.size(),0)==int(readback.size())&&readback==original);
     std::cout<<"PASS item9 deterministic staged page ENOMEM and corruption atomicity\n";
     MemoryFS random(256*1024*1024);std::mt19937 rng(77123);
     for(int step=0;step<12000;step++){

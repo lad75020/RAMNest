@@ -1,4 +1,5 @@
 #include "MemoryFS.hpp"
+#include "DebugProfile.hpp"
 #include <fuse.h>
 #include <fuse_opt.h>
 #include <atomic>
@@ -26,6 +27,10 @@ using ramnest::MemoryFS;
 static std::unique_ptr<MemoryFS> tree;
 static std::atomic<bool> mounted=false, stopped=false, populated=false, activated=false;
 static std::atomic<int> interval=0;
+#ifdef RAMNEST_DEBUG_PROFILING
+static std::string profileBackend="nfs";
+static bool profileCompression=true;
+#endif
 static const std::string helperIncarnation=[] {uuid_t bytes;char text[37];uuid_generate_random(bytes);uuid_unparse_lower(bytes,text);return std::string(text);}();
 static std::string identifier, volume, mountpoint, socketPath, cliPath, storePath, sourcePath;
 static constexpr const char* startupVersion="pre-mount-population-v1";
@@ -90,8 +95,24 @@ static int mk(const char*p,mode_t m){return tree->create(p,S_IFDIR|m);}
 static int mn(const char*p,mode_t m,dev_t){return S_ISREG(m)?tree->create(p,m):-ENOTSUP;}
 static int op(const char*p,struct fuse_file_info*f){int e=tree->open(p,f->fh,f->flags);f->direct_io=1;return e;}
 static int rel(const char*,struct fuse_file_info*f){return tree->close(f->fh);}
-static int readFile(const char*p,char*b,size_t n,off_t o,struct fuse_file_info*f){return tree->read(p?p:"",b,n,o,f?f->fh:0);}
-static int writeFile(const char*p,const char*b,size_t n,off_t o,struct fuse_file_info*f){try{return tree->write(p?p:"",b,n,o,f?f->fh:0);}catch(const std::bad_alloc&){return -ENOMEM;}}
+static int readFile(const char*p,char*b,size_t n,off_t o,struct fuse_file_info*f){
+#ifdef RAMNEST_DEBUG_PROFILING
+    ramnest::profile::Scope scope(ramnest::profile::Metric::callback_read,n);
+    int result;try{result=tree->read(p?p:"",b,n,o,f?f->fh:0);}catch(const std::bad_alloc&){result=-ENOMEM;}catch(...){result=-EIO;}
+    scope.result(result);return result;
+#else
+    return tree->read(p?p:"",b,n,o,f?f->fh:0);
+#endif
+}
+static int writeFile(const char*p,const char*b,size_t n,off_t o,struct fuse_file_info*f){
+#ifdef RAMNEST_DEBUG_PROFILING
+    ramnest::profile::Scope scope(ramnest::profile::Metric::callback_write,n);
+    int result;try{result=tree->write(p?p:"",b,n,o,f?f->fh:0);}catch(const std::bad_alloc&){result=-ENOMEM;}catch(...){result=-EIO;}
+    scope.result(result);return result;
+#else
+    try{return tree->write(p?p:"",b,n,o,f?f->fh:0);}catch(const std::bad_alloc&){return -ENOMEM;}
+#endif
+}
 static int tr(const char*p,off_t s){return tree->truncate(p,s);}
 static int ftr(const char*p,off_t s,struct fuse_file_info*f){return tree->truncate(p?p:"",s,f?f->fh:0);}
 static int fga(const char*p,struct stat*s,struct fuse_file_info*f){return tree->stat(p?p:"",s,f?f->fh:0);}
@@ -158,10 +179,25 @@ static int child(const std::vector<std::string>&args){
 static std::mutex mutationQueue;
 static std::string command(const std::string& input,pid_t peer=0){
     auto split=input.find('\t');auto cmd=input.substr(0,split);auto arg=split==std::string::npos?"":input.substr(split+1);
+#ifdef RAMNEST_DEBUG_PROFILING
+    if(cmd=="profile-begin"||cmd=="profile-end"||cmd=="profile-snapshot"||cmd=="profile-release"){
+        if(cmd=="profile-release"){
+            auto delimiter=arg.find('\t');auto run=arg.substr(0,delimiter);
+            if(!ramnest::profile::validUUID(run))return "ERR\t22";
+            struct stat observed{};const int result=tree->stat("/.ramnest-debug-io-"+run,&observed);
+            if(result!=-ENOENT)return "ERR\t16";
+        }
+        return ramnest::profile::command(cmd,arg,profileBackend,profileCompression,interval,mounted&&activated);
+    }
+#endif
     if(cmd=="metrics"){auto m=tree->metrics();return "OK\t"+std::to_string(m.logical)+"\t"+std::to_string(m.content)+"\t"+std::to_string(m.payload)+"\t"+std::to_string(m.mapped);}
     if(cmd=="status")return "OK\t"+identifier+"\t"+std::to_string(getpid())+"\t"+(mounted?"mounted":"retained")+"\t"+std::to_string(tree->used())+"\t"+std::to_string(tree->limit())+"\t"+(activated?"active":"guarded");
     if(cmd=="checkpoint-status"){auto [generation,frozen]=tree->checkpointState();return "OK\t"+helperIncarnation+"\t"+std::to_string(generation)+"\t"+(frozen?"frozen":"writable");}
-    if(cmd=="capabilities")return "OK\tincremental-v1\tprivate-storage-v2\ttrash-directory-exclusion-v1\tpre-mount-population-v1";
+    if(cmd=="capabilities")return "OK\tincremental-v1\tprivate-storage-v2\ttrash-directory-exclusion-v1\tpre-mount-population-v1"
+#ifdef RAMNEST_DEBUG_PROFILING
+        "\tdebug-io-profile-v2\tdebug-benchmark-reservation-v1"
+#endif
+        ;
     if(cmd=="startup-status"||cmd=="abort-startup"||cmd=="mount-populated"){
         std::lock_guard lock(startup.mutex);
         if(!arg.empty()||!startup.enabled)return "ERR\t22";
@@ -175,6 +211,13 @@ static std::string command(const std::string& input,pid_t peer=0){
         return std::string("OK\t")+startupVersion+"\tmount-requested";
     }
     std::lock_guard mutationGuard(mutationQueue);
+#ifdef RAMNEST_DEBUG_PROFILING
+    std::unique_lock<std::mutex> profileCheckpointGuard;
+    if(cmd=="export"||cmd=="quiesce"||cmd=="export2"||cmd=="quiesce2"||cmd=="export3"||cmd=="quiesce3"){
+        profileCheckpointGuard=std::unique_lock(ramnest::profile::controlMutex);
+        if(!ramnest::profile::fixtureRun.empty())return "ERR\t16";
+    }
+#endif
     if(cmd=="export2"||cmd=="quiesce2"||cmd=="export3"||cmd=="quiesce3"){
         auto delimiter=arg.find('\t');auto stage=arg.substr(0,delimiter);
         std::string previous;uint64_t token=0;
@@ -203,7 +246,14 @@ static std::string command(const std::string& input,pid_t peer=0){
         activated=true;tree->freeze(false);return "OK";
     }
     if(cmd=="resize"){try{auto n=std::stoull(arg);int e=tree->resize(n);return e?"ERR\t"+std::to_string(-e):"OK";}catch(...){return "ERR\t22";}}
-    if(cmd=="period"){try{interval=std::stoi(arg);return "OK";}catch(...){return "ERR\t22";}}
+    if(cmd=="period"){try{
+        const int next=std::stoi(arg);
+#ifdef RAMNEST_DEBUG_PROFILING
+        std::lock_guard lock(ramnest::profile::controlMutex);
+        if(next>0&&!ramnest::profile::fixtureRun.empty())return "ERR\t16";
+#endif
+        interval=next;return "OK";
+    }catch(...){return "ERR\t22";}}
     // Temporary eject must stop writers without exporting volatile payloads.
     if(cmd=="freeze"){if(!arg.empty())return "ERR\t22";if(!activated)return "ERR\t16";tree->freeze(true);return "OK";}
     if(cmd=="thaw"){if(!activated)return "ERR\t16";tree->freeze(false);return "OK";}
@@ -269,7 +319,11 @@ static void serveControl(int fd){
         auto verb=data.substr(0,data.find('\t'));
         // Startup state has its own lock. In particular, mount-populated must
         // not race the import worker releasing its reservation after sending OK.
-        const bool separateQueue=verb=="status"||verb=="metrics"||verb=="capabilities"||verb=="checkpoint-status"||verb=="startup-status"||verb=="abort-startup"||verb=="mount-populated";
+        const bool separateQueue=
+#ifdef RAMNEST_DEBUG_PROFILING
+            verb=="profile-begin"||verb=="profile-end"||verb=="profile-snapshot"||
+#endif
+            verb=="status"||verb=="metrics"||verb=="capabilities"||verb=="checkpoint-status"||verb=="startup-status"||verb=="abort-startup"||verb=="mount-populated";
         pid_t peer=0;socklen_t peerSize=sizeof peer;
         if(startup.enabled&&getsockopt(fd,SOL_LOCAL,LOCAL_PEERPID,&peer,&peerSize))return;
         struct Reservation {bool held=false;~Reservation(){if(held)controlMutationBusy=false;}} reservation;
@@ -388,6 +442,9 @@ int main(int argc,char**argv){
     if(identifier.empty()||socketPath.size()>=sizeof(sockaddr_un::sun_path)||mountpoint.empty())return 64;
     std::vector<std::string>args;
     try{args=mountArguments(a);tree=std::make_unique<MemoryFS>(std::stoull(a["--size"]),a["--compression"]!="false");}catch(...){return 64;}
+#ifdef RAMNEST_DEBUG_PROFILING
+    profileBackend=selectedBackend(a);profileCompression=a["--compression"]!="false";
+#endif
     sourcePath=a["--source"];tree->freeze(true);
     startup.enabled=a.contains("--guarded-startup");
     // A kernel process-exit subscription pins the owner incarnation (no polling
@@ -404,7 +461,15 @@ int main(int argc,char**argv){
     int server=socket(AF_UNIX,SOCK_STREAM,0);if(server<0)return 1;fcntl(server,F_SETFD,FD_CLOEXEC);sockaddr_un addr{};addr.sun_family=AF_UNIX;strlcpy(addr.sun_path,socketPath.c_str(),sizeof addr.sun_path);
     // Never unlink a live predecessor's socket. Core allocates a fresh path per session.
     if(bind(server,reinterpret_cast<sockaddr*>(&addr),sizeof addr)||listen(server,8)){close(server);return 1;}chmod(socketPath.c_str(),0600);
-    std::thread controller(control,server);std::thread periodic([]{auto last=std::chrono::steady_clock::now();while(!stopped){std::this_thread::sleep_for(std::chrono::seconds(1));auto n=interval.load();if(mounted&&n>0&&std::chrono::steady_clock::now()-last>=std::chrono::minutes(n)){child({cliPath,"--store",storePath,"save",identifier});last=std::chrono::steady_clock::now();}}});
+    std::thread controller(control,server);std::thread periodic([]{auto last=std::chrono::steady_clock::now();while(!stopped){std::this_thread::sleep_for(std::chrono::seconds(1));auto n=interval.load();if(mounted&&n>0&&std::chrono::steady_clock::now()-last>=std::chrono::minutes(n)){
+#ifdef RAMNEST_DEBUG_PROFILING
+        if(!ramnest::profile::claimPeriodic(interval))continue;
+#endif
+        child({cliPath,"--store",storePath,"save",identifier});last=std::chrono::steady_clock::now();
+#ifdef RAMNEST_DEBUG_PROFILING
+        ramnest::profile::finishPeriodic();
+#endif
+    }}});
     std::thread ownerWatcher;
     if(startup.enabled)ownerWatcher=std::thread([ownerEvents]{
         struct kevent event;int count;do{count=kevent(ownerEvents,nullptr,0,&event,1,nullptr);}while(count<0&&errno==EINTR);

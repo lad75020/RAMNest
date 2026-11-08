@@ -36,11 +36,11 @@ import RAMNestCore
         var args = Array(CommandLine.arguments.dropFirst())
         let json = args.contains("--json")
         do {
-            let root: URL
+            let root: URL?
             if let i = args.firstIndex(of: "--store") {
                 guard i+1 < args.count else { throw NestError("--store requires a directory.", code: 64) }
                 root = URL(fileURLWithPath: args[i+1]); args.removeSubrange(i...i+1)
-            } else { root = Store.defaultRoot }
+            } else { root = nil }
             if args.isEmpty || ["--help", "help", "-h"].contains(args[0]) { print(help); return }
             if args[0] == "--version" { print("RAMNest 1.0.0"); return }
             let command = args.removeFirst()
@@ -69,7 +69,7 @@ import RAMNestCore
                 if let method = values["--file-comparison-method"] { guard let c = Comparison(rawValue: method) else { throw NestError("Unknown comparison method.", code: 64) }; o.comparison = c }
                 return o
             }
-            let engine = Engine(store: try Store(root: root))
+            let engine = Engine(store: try StoreLocation().open(explicitRoot: root))
             switch command {
             case "list", "ls":
                 try require(0)

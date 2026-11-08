@@ -1,5 +1,10 @@
 #pragma once
 #include <array>
+#ifdef RAMNEST_IO_TESTING
+#include <condition_variable>
+#include <chrono>
+#include <thread>
+#endif
 #include <atomic>
 #include <map>
 #include <memory>
@@ -22,6 +27,24 @@ constexpr uint64_t metadataBudget(uint64_t capacity){return capacity/4<65536?655
 constexpr bool metadataFits(uint64_t capacity,uint64_t used,uint64_t extra){
     auto maximum=metadataBudget(capacity);return extra<=maximum&&used<=maximum-extra;
 }
+#ifdef RAMNEST_IO_TESTING
+// Dedicated fixture ABI only; neither production library nor helper defines it.
+struct IoTestHooks {
+    enum class Point { readCaptured, writeStaged, exportCaptured };
+    std::mutex mutex; std::condition_variable cv;
+    Point point=Point::readCaptured; unsigned remaining=0; uint64_t hits=0,released=0;
+    std::thread::id owner{}; std::atomic<int> allocationFailure{-1};
+    std::atomic<uint64_t> copied{0},zeroed{0},shaBytes{0},retries{0},fallbacks{0},mappedPeak{0};
+    void arm(Point p,unsigned count=1){std::lock_guard g(mutex);point=p;remaining=count;owner={};}
+    bool wait(uint64_t n){std::unique_lock g(mutex);return cv.wait_for(g,std::chrono::seconds(5),[&]{return hits>=n;});}
+    void release(uint64_t n){std::lock_guard g(mutex);released=n;cv.notify_all();}
+    void pause(Point p){std::unique_lock g(mutex);if(p!=point||!remaining||(owner!=std::thread::id{}&&owner!=std::this_thread::get_id()))return;
+        owner=std::this_thread::get_id();remaining--;auto ticket=++hits;cv.notify_all();
+        cv.wait_for(g,std::chrono::seconds(5),[&]{return released>=ticket;});}
+    void failAfter(int n){std::lock_guard g(mutex);allocationFailure=n;}
+    bool fail(){if(allocationFailure.load(std::memory_order_relaxed)<0)return false;std::lock_guard g(mutex);if(allocationFailure<0)return false;if(!allocationFailure)return true;allocationFailure--;return false;}
+};
+#endif
 struct Accounting;
 struct DirectorySnapshot {
     std::vector<std::string> names;
@@ -37,7 +60,6 @@ struct MappedPage {
     char* bytes=nullptr;
     size_t mapped=0, payload=0;
     bool compressed=false;
-    uint64_t checksum=0;
     std::array<unsigned char,32> strongChecksum{};
     MappedPage()=default;
     std::shared_ptr<Backing> storage;
@@ -46,19 +68,21 @@ struct MappedPage {
     static void failAllocationForTest(int);
     int encode(const char*,bool,std::shared_ptr<Accounting> = {});
     int decode(char*) const;
+    int verifyRaw() const;
+    int readSlice(char*,size_t,size_t) const;
 };
 struct Attributes {uint32_t valid=0;mode_t mode=0;uid_t uid=0;gid_t gid=0;int64_t size=0;timespec access{},modify{},birth{},change{},backup{};uint32_t flags=0;};
 struct Metrics { uint64_t logical=0, content=0, payload=0, mapped=0; };
 struct Accounting {
     mutable std::recursive_mutex mutex;
     std::vector<std::weak_ptr<Backing>> backings;
-    uint64_t backingLive=0,directoryLive=0,mappedLimit=UINT64_MAX;
+    uint64_t backingLive=0,directoryLive=0,mappedLimit=UINT64_MAX,captureBytes=0;
     std::atomic<uint64_t> directoryBytes{0};
     std::vector<std::weak_ptr<DirectorySnapshot>> directories;
     std::atomic<uint64_t> logical{0},content{0},payload{0},mapped{0},metadata{0},live{0};
 };
 struct Node {
-    uint64_t dataGeneration=1,metadataGeneration=1;
+    uint64_t dataGeneration=1,metadataGeneration=1,shapeEpoch=1;
     uint64_t ino; mode_t mode; uid_t uid; gid_t gid; uint64_t links=1; int64_t size=0;
     timespec atime{}, mtime{}, ctime{}, birth{}, backup{}; uint32_t flags=0;
     std::map<uint64_t, MappedPage> pages;
@@ -87,6 +111,15 @@ class MemoryFS {
     uint64_t nextIno=1, nextHandle=1;
     std::atomic<uint64_t> capacity;
     int openAllocationFailure=-1;
+    uint64_t freezeEpoch=1,namespaceEpoch=1;
+    void setFrozenUnlocked(bool value){frozen=value;++freezeEpoch;}
+    uint64_t captureLimitUnlocked()const;
+    struct IoCapture;
+    int captureWriteUnlocked(const std::string&,size_t,int64_t,uint64_t,IoCapture&);
+    void capturePagesUnlocked(IoCapture&);
+    int stageWrite(const IoCapture&,const char*,size_t,std::map<uint64_t,MappedPage>&);
+    int commitWriteUnlocked(const std::shared_ptr<Node>&,int64_t,size_t,std::map<uint64_t,MappedPage>&);
+    int writeSerializedUnlocked(const std::string&,const char*,size_t,int64_t,uint64_t=0);
     bool frozen=false;
     bool compression=true;
     std::shared_ptr<Node> make(mode_t mode);
@@ -110,7 +143,13 @@ class MemoryFS {
     static_assert(std::atomic<uint64_t>::is_always_lock_free);
     std::atomic<uint64_t> progress{0};
     void advanced(){progress.fetch_add(1,std::memory_order_relaxed);}
+#ifdef RAMNEST_IO_TESTING
+    std::shared_ptr<IoTestHooks> ioHooks;
+#endif
 public:
+#ifdef RAMNEST_IO_TESTING
+    void setIoHooksForTest(std::shared_ptr<IoTestHooks> hooks){std::lock_guard g(mutex);ioHooks=std::move(hooks);}
+#endif
     explicit MemoryFS(uint64_t bytes,bool compressionEnabled=true);
     Metrics metrics() const;
     bool accountingOracleForTest() const;
@@ -121,7 +160,12 @@ public:
     void setImportReaderForTest(ImportReader reader){importReader=reader;}
     void setImportAttributesForTest(AttributeLister list,AttributeReader read){importAttributeLister=list;importAttributeReader=read;}
     uint64_t operationProgress() const {return progress.load(std::memory_order_relaxed);}
-    int corruptBlockForTest(const std::string&,uint64_t);
+#ifdef RAMNEST_IO_TESTING
+    // Reversible XOR faults for owned fixtures only, with no generation change.
+    // Call only while no worker can access the affected backing bytes.
+    int flipPayloadByteForTest(const std::string&,uint64_t,size_t=0);
+    int flipDigestByteForTest(const std::string&,uint64_t,size_t=0);
+#endif
     int stat(const std::string&,struct stat*,uint64_t h=0);
     int entries(const std::string&,std::vector<std::string>&);
     int create(const std::string&, mode_t, uint64_t* handle=nullptr, int flags=O_RDWR);

@@ -15,10 +15,42 @@ public struct SiblingCleanupCandidate: Codable, Equatable, Sendable {
     var fsid: [Int32]?
     var initialRevision: String?
     var completedRevision: String?
+    var sourceManifest: Manifest? = nil
+    var completedSourceManifest: Manifest? = nil
+    var originalRename: VerifiedRenameReceipt? = nil
+    var completedRename: VerifiedRenameReceipt? = nil
     var emptyOnly: Bool
     var dataDevice: UInt64?
     var dataInode: UInt64?
     var plan: CleanupTreePlan?
+    private enum CodingKeys: String, CodingKey {
+        case kind, path, device, inode, parentDevice, parentInode, fsid, initialRevision, completedRevision
+        case sourceManifest, completedSourceManifest, originalRename, completedRename, emptyOnly, dataDevice, dataInode, plan
+    }
+}
+
+extension SiblingCleanupCandidate {
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try c.decode(Kind.self, forKey: .kind); path = try c.decode(String.self, forKey: .path)
+        device = try c.decodeIfPresent(UInt64.self, forKey: .device); inode = try c.decodeIfPresent(UInt64.self, forKey: .inode)
+        parentDevice = try c.decodeIfPresent(UInt64.self, forKey: .parentDevice); parentInode = try c.decodeIfPresent(UInt64.self, forKey: .parentInode)
+        fsid = try c.decodeIfPresent([Int32].self, forKey: .fsid)
+        initialRevision = try c.decodeIfPresent(String.self, forKey: .initialRevision); completedRevision = try c.decodeIfPresent(String.self, forKey: .completedRevision)
+        sourceManifest = try c.decodeIfPresent(Manifest.self, forKey: .sourceManifest)
+        completedSourceManifest = c.contains(.completedSourceManifest) ? try c.decode(Manifest.self, forKey: .completedSourceManifest) : nil
+        originalRename = c.contains(.originalRename) ? try c.decode(VerifiedRenameReceipt.self, forKey: .originalRename) : nil
+        completedRename = c.contains(.completedRename) ? try c.decode(VerifiedRenameReceipt.self, forKey: .completedRename) : nil
+        guard originalRename == nil || (originalRename?.operation == .evacuation && originalRename?.after != nil),
+              completedRename == nil || (completedRename?.operation != .evacuation && completedRename?.after != nil),
+              !c.contains(.completedSourceManifest) || completedRename != nil,
+              completedRename == nil || completedSourceManifest == completedRename?.after?.manifest else {
+            throw NestError("Incomplete completed rename authority; sibling retained.", code: 6)
+        }
+        emptyOnly = try c.decode(Bool.self, forKey: .emptyOnly)
+        dataDevice = try c.decodeIfPresent(UInt64.self, forKey: .dataDevice); dataInode = try c.decodeIfPresent(UInt64.self, forKey: .dataInode)
+        plan = try c.decodeIfPresent(CleanupTreePlan.self, forKey: .plan)
+    }
 }
 
 struct CleanupTreePlan: Codable, Equatable, Sendable {
@@ -53,8 +85,18 @@ enum SiblingCleanup {
                 emptyOnly: kind == .restoreStage || (kind == .fsKitOriginal ? journal.fsKitLink?.restoration == .original : !folder.options.sync || !journal.populationVerified),
                 dataDevice: kind == .fsKitOriginal ? journal.fsKitLink?.source.device : kind == .restoreStage ? journal.restoreDataDevice : nil,
                 dataInode: kind == .fsKitOriginal ? journal.fsKitLink?.source.inode : kind == .restoreStage ? journal.restoreDataInode : nil)
+            var recorded = candidate
+            if kind == .original || kind == .fsKitOriginal {
+                if var observed = journal.originalRename?.after?.manifest {
+                    if journal.originalRename?.wholeRoot == false { observed.publicRoot = journal.initialSourceManifest?.publicRoot }
+                    recorded.sourceManifest = observed
+                } else { recorded.sourceManifest = journal.initialSourceManifest }
+            }
+            recorded.completedSourceManifest = journal.publicationRename?.after?.manifest
+            recorded.originalRename = journal.originalRename?.after == nil ? nil : journal.originalRename
+            recorded.completedRename = journal.publicationRename?.after == nil ? nil : journal.publicationRename
             var queue = journal.siblingCleanup ?? []
-            if !queue.contains(where: { $0.path == path && $0.device == device && $0.inode == inode }) { queue.append(candidate) }
+            if !queue.contains(where: { $0.path == path && $0.device == device && $0.inode == inode }) { queue.append(recorded) }
             journal.siblingCleanup = queue
         }
         if let path = journal.evacuation {
@@ -91,7 +133,16 @@ enum SiblingCleanup {
                 guard let completed = sourceRevision ?? candidate.completedRevision else { throw NestError("Missing completed-session snapshot; sibling retained: \(candidate.path)", code: 6) }
                 let (_, restored) = try Snapshot.verified(store: store, id: folder.id, revision: completed)
                 let selected = try DirectoryHandle.open(URL(fileURLWithPath: folder.path)); try selected.verify(folder)
-                guard try Snapshot.manifest(URL(fileURLWithPath: folder.path), matching: restored).matchesExpected(restored) else { throw NestError("Selected contents changed since restore; sibling retained.", code: 6) }
+                let selectedExpected = candidate.completedSourceManifest ?? restored
+                if let receipt = candidate.completedRename {
+                    guard receipt.folder == folder.id else { throw NestError("Completed rename folder mismatch; sibling retained.", code: 6) }
+                    _ = try receipt.verify(at: URL(fileURLWithPath: folder.path))
+                }
+                if let recorded = candidate.completedSourceManifest {
+                    let data = try Snapshot.dataURL(store: store, id: folder.id, revision: completed)
+                    guard try recorded.matchesCopy(of: Snapshot.materializationManifest(data, expected: restored, context: .managedRevision)) else { throw NestError("Completed rename is not bound to its revision; sibling retained.", code: 6) }
+                }
+                guard try Snapshot.manifest(URL(fileURLWithPath: folder.path), matching: selectedExpected).matchesExpected(selectedExpected) else { throw NestError("Selected contents changed since restore; sibling retained.", code: 6) }
                 if candidate.completedRevision != completed {
                     candidate.completedRevision = completed
                     var next = journal; next.siblingCleanup?[index] = candidate
@@ -115,9 +166,20 @@ enum SiblingCleanup {
                     if let plan = candidate.plan {
                         try root.validateCleanupRemainder(inventory, plan: plan)
                     } else {
+                        if let receipt = candidate.originalRename, !candidate.emptyOnly {
+                            guard receipt.folder == folder.id, receipt.destinationDevice == device,
+                                  receipt.destinationInode == inode else { throw NestError("Original rename cleanup binding changed; retained.", code: 6) }
+                            _ = try receipt.verify(at: candidate.kind == .fsKitOriginal ? path.appendingPathComponent("data") : path)
+                        }
                         if candidate.kind == .original || candidate.kind == .fsKitOriginal {
                             guard let initial = candidate.initialRevision else { throw NestError("Missing initial snapshot; original holding retained.", code: 6) }
-                            let (_, original) = try Snapshot.verified(store: store, id: folder.id, revision: initial)
+                            let (data, snapshot) = try Snapshot.verified(store: store, id: folder.id, revision: initial)
+                            var original = snapshot
+                            if let recorded = candidate.sourceManifest {
+                                let observed = try Snapshot.materializationManifest(data, expected: snapshot, context: .managedRevision)
+                                guard try recorded.matchesCopy(of: observed) else { throw NestError("Original cleanup observation is not bound to its initial revision; retained.", code: 6) }
+                                original = recorded
+                            }
                             var expected = original
                             if candidate.kind == .fsKitOriginal, !candidate.emptyOnly {
                                 guard let dataDevice = candidate.dataDevice, let dataInode = candidate.dataInode,
@@ -219,6 +281,7 @@ extension DirectoryHandle {
                   before.st_mode == st.st_mode else { throw NestError("Cleanup entry identity changed.", code: 6) }
             var entry = Entry(path: path, kind: kind == S_IFDIR ? "directory" : kind == S_IFREG ? "file" : "symlink", size: 0,
                 mode: UInt16(st.st_mode & 0o7777), mtimeSeconds: 0, mtimeNanos: 0, checksum: "", attributes: [:], hardlink: nil, flags: flags, attributeBytes: 0)
+            entry.provenanceBytes = 0
             let count = flistxattr(descriptor, nil, 0, 0)
             guard count >= 0 else { throw NestError("Cannot inspect cleanup attributes.", code: 6) }
             if count > 0 {
@@ -233,7 +296,12 @@ extension DirectoryHandle {
                     guard size >= 0, size <= 1 << 20 else { throw NestError("Invalid cleanup attribute.", code: 6) }
                     var data = Data(count: size)
                     guard data.withUnsafeMutableBytes({ fgetxattr(descriptor, attribute, $0.baseAddress, size, 0, 0) }) == size else { throw NestError("Cleanup attribute changed.", code: 6) }
-                    entry.attributes[attribute] = Snapshot.digest(data); entry.attributeBytes += UInt64(size + attribute.utf8.count)
+                    entry.attributes[attribute] = Snapshot.digest(data)
+                    let cost = UInt64(size + attribute.utf8.count)
+                    let sum = entry.attributeBytes.addingReportingOverflow(cost)
+                    guard !sum.overflow else { throw NestError("Cleanup attribute accounting overflow; retained.", code: 6) }
+                    entry.attributeBytes = sum.partialValue
+                    if attribute == Snapshot.provenanceName { entry.provenanceBytes = cost }
                 }
             }
             let record = CleanupTreePlan.Identity(path: path, device: device, inode: UInt64(st.st_ino), type: UInt16(kind))
