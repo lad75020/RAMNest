@@ -20,6 +20,7 @@
 #include <sys/statvfs.h>
 #include <sys/xattr.h>
 namespace ramnest {
+enum class FileVerification { sha256, sizeAndModTime };
 constexpr uint64_t pageSize = 65536; // logical compression block, four arm64 VM pages
 constexpr uint64_t vmPageSize = 16384;
 // A quota only: metadata and payload backing still grow with actual content.
@@ -57,11 +58,17 @@ struct Backing {
     ~Backing();
 };
 struct MappedPage {
+private:
+    // Bound when a backing is created; descriptor copies/captures carry it.
+    // No runtime policy setter: replacing a page replaces the whole descriptor.
+    FileVerification fileVerification;
+public:
     char* bytes=nullptr;
     size_t mapped=0, payload=0;
     bool compressed=false;
     std::array<unsigned char,32> strongChecksum{};
-    MappedPage()=default;
+    explicit MappedPage(FileVerification policy=FileVerification::sha256):fileVerification(policy){}
+    FileVerification verificationPolicy()const {return fileVerification;}
     std::shared_ptr<Backing> storage;
     MappedPage(const MappedPage&)=default; MappedPage& operator=(const MappedPage&)=default;
     MappedPage(MappedPage&&)=default; MappedPage& operator=(MappedPage&&)=default;
@@ -122,6 +129,7 @@ class MemoryFS {
     int writeSerializedUnlocked(const std::string&,const char*,size_t,int64_t,uint64_t=0);
     bool frozen=false;
     bool compression=true;
+    const FileVerification fileVerification;
     std::shared_ptr<Node> make(mode_t mode);
     std::shared_ptr<Node> lookup(const std::string& path) const;
     std::pair<std::shared_ptr<Node>,std::string> parent(const std::string& path) const;
@@ -150,7 +158,8 @@ public:
 #ifdef RAMNEST_IO_TESTING
     void setIoHooksForTest(std::shared_ptr<IoTestHooks> hooks){std::lock_guard g(mutex);ioHooks=std::move(hooks);}
 #endif
-    explicit MemoryFS(uint64_t bytes,bool compressionEnabled=true);
+    explicit MemoryFS(uint64_t bytes,bool compressionEnabled=true,FileVerification verification=FileVerification::sha256);
+    FileVerification verificationPolicy()const {return fileVerification;}
     Metrics metrics() const;
     bool accountingOracleForTest() const;
     size_t registrySizeForTest() const {std::lock_guard g(mutex);return nodes.size();}
@@ -207,7 +216,7 @@ public:
     int populate(const std::string&,const std::string& modeDigest="");
     bool isFrozen() const;
     std::pair<uint64_t,bool> checkpointState()const {std::lock_guard g(mutex);return {generation,frozen};}
-    struct ExportStats {uint64_t generation=0,written=0,readback=0,decoded=0,clonedFiles=0,files=0;bool reused=false;std::string modeMapDigest;};
+    struct ExportStats {uint64_t generation=0,written=0,readback=0,decoded=0,clonedFiles=0,files=0,fileVerificationSHA256Bytes=0;bool reused=false;std::string modeMapDigest;};
     ExportStats lastExportStats()const {std::lock_guard g(mutex);return exportStats;}
     void setCaptureLimitForTest(uint64_t limit){std::lock_guard g(mutex);captureLimitForTest=limit;}
     void setBackingLimitForTest(uint64_t limit){std::lock_guard g(accounting->mutex);accounting->mappedLimit=limit;}

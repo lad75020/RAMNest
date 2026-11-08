@@ -24,6 +24,7 @@
 #include <uuid/uuid.h>
 extern char **environ;
 using ramnest::MemoryFS;
+using ramnest::FileVerification;
 static std::unique_ptr<MemoryFS> tree;
 static std::atomic<bool> mounted=false, stopped=false, populated=false, activated=false;
 static std::atomic<int> interval=0;
@@ -187,13 +188,14 @@ static std::string command(const std::string& input,pid_t peer=0){
             struct stat observed{};const int result=tree->stat("/.ramnest-debug-io-"+run,&observed);
             if(result!=-ENOENT)return "ERR\t16";
         }
-        return ramnest::profile::command(cmd,arg,profileBackend,profileCompression,interval,mounted&&activated);
+        return ramnest::profile::command(cmd,arg,profileBackend,profileCompression,interval,mounted&&activated,tree->verificationPolicy()==FileVerification::sha256?"sha256":"sizeAndModTime");
     }
 #endif
     if(cmd=="metrics"){auto m=tree->metrics();return "OK\t"+std::to_string(m.logical)+"\t"+std::to_string(m.content)+"\t"+std::to_string(m.payload)+"\t"+std::to_string(m.mapped);}
     if(cmd=="status")return "OK\t"+identifier+"\t"+std::to_string(getpid())+"\t"+(mounted?"mounted":"retained")+"\t"+std::to_string(tree->used())+"\t"+std::to_string(tree->limit())+"\t"+(activated?"active":"guarded");
     if(cmd=="checkpoint-status"){auto [generation,frozen]=tree->checkpointState();return "OK\t"+helperIncarnation+"\t"+std::to_string(generation)+"\t"+(frozen?"frozen":"writable");}
-    if(cmd=="capabilities")return "OK\tincremental-v1\tprivate-storage-v2\ttrash-directory-exclusion-v1\tpre-mount-population-v1"
+    if(cmd=="verification-policy")return arg.empty()?std::string("OK\tfile-verification-v1\t")+(tree->verificationPolicy()==FileVerification::sha256?"sha256":"sizeAndModTime"):"ERR\t22";
+    if(cmd=="capabilities")return "OK\tincremental-v1\tprivate-storage-v2\ttrash-directory-exclusion-v1\tpre-mount-population-v1\tfile-verification-v1"
 #ifdef RAMNEST_DEBUG_PROFILING
         "\tdebug-io-profile-v2\tdebug-benchmark-reservation-v1"
 #endif
@@ -323,7 +325,7 @@ static void serveControl(int fd){
 #ifdef RAMNEST_DEBUG_PROFILING
             verb=="profile-begin"||verb=="profile-end"||verb=="profile-snapshot"||
 #endif
-            verb=="status"||verb=="metrics"||verb=="capabilities"||verb=="checkpoint-status"||verb=="startup-status"||verb=="abort-startup"||verb=="mount-populated";
+            verb=="status"||verb=="metrics"||verb=="capabilities"||verb=="verification-policy"||verb=="checkpoint-status"||verb=="startup-status"||verb=="abort-startup"||verb=="mount-populated";
         pid_t peer=0;socklen_t peerSize=sizeof peer;
         if(startup.enabled&&getsockopt(fd,SOL_LOCAL,LOCAL_PEERPID,&peer,&peerSize))return;
         struct Reservation {bool held=false;~Reservation(){if(held)controlMutationBusy=false;}} reservation;
@@ -416,13 +418,15 @@ static std::map<std::string,std::string> parseHelperOptions(int argc,char**argv,
         if(key=="--daemonize"){detach=true;continue;}
         const bool startupKey=key=="--guarded-startup"||key=="--startup-owner";
         if((key.starts_with("--backend")&&key!="--backend")||
+           (key.starts_with("--file-verification")&&key!="--file-verification")||
            (key.starts_with("--guarded-startup")&&key!="--guarded-startup")||
            (key.starts_with("--startup-owner")&&key!="--startup-owner")||
-           i+1>=argc||((key=="--backend"||startupKey)&&options.contains(key)))
+           i+1>=argc||((key=="--backend"||key=="--file-verification"||startupKey)&&options.contains(key)))
             throw std::invalid_argument("Malformed helper option");
         options[key]=argv[++i];
     }
     (void)selectedBackend(options); // Validate before daemonization or any state changes.
+    if(options.contains("--file-verification")&&options.at("--file-verification")!="sha256"&&options.at("--file-verification")!="sizeAndModTime")throw std::invalid_argument("Invalid file verification policy");
     if(options.contains("--guarded-startup")||options.contains("--startup-owner")){
         if(!options.contains("--guarded-startup")||options.at("--guarded-startup")!=startupVersion||!options.contains("--startup-owner"))throw std::invalid_argument("Invalid guarded startup version");
         const auto& owner=options.at("--startup-owner");
@@ -435,13 +439,14 @@ static std::map<std::string,std::string> parseHelperOptions(int argc,char**argv,
 int main(int argc,char**argv){
     if(argc==2&&std::string(argv[1])=="--storage-capabilities"){std::cout<<"private-storage-v2"<<std::endl;return 0;}
     if(argc==2&&std::string(argv[1])=="--startup-capabilities"){std::cout<<startupVersion<<std::endl;return 0;}
+    if(argc==2&&std::string(argv[1])=="--verification-capabilities"){std::cout<<"file-verification-v1"<<std::endl;return 0;}
     std::map<std::string,std::string>a;bool detach=false;
     try{a=parseHelperOptions(argc,argv,detach);}catch(const std::invalid_argument&){return 64;}
     if(detach){pid_t p=fork();if(p<0)return 1;if(p>0)return 0;setsid();p=fork();if(p<0)_exit(1);if(p>0)_exit(0);chdir("/");for(int descriptor=3,maximum=getdtablesize();descriptor<maximum;descriptor++)close(descriptor);int fd=open("/dev/null",O_RDWR);for(int i=0;i<3;i++)dup2(fd,i);if(fd>2)close(fd);}
     umask(0077);signal(SIGPIPE,SIG_IGN);identifier=a["--id"];volume=a["--volume"];mountpoint=a["--mount"];socketPath=a["--socket"];cliPath=a["--cli"];storePath=a["--store"];
     if(identifier.empty()||socketPath.size()>=sizeof(sockaddr_un::sun_path)||mountpoint.empty())return 64;
     std::vector<std::string>args;
-    try{args=mountArguments(a);tree=std::make_unique<MemoryFS>(std::stoull(a["--size"]),a["--compression"]!="false");}catch(...){return 64;}
+    try{args=mountArguments(a);tree=std::make_unique<MemoryFS>(std::stoull(a["--size"]),a["--compression"]!="false",a.contains("--file-verification")&&a.at("--file-verification")=="sizeAndModTime"?FileVerification::sizeAndModTime:FileVerification::sha256);}catch(...){return 64;}
 #ifdef RAMNEST_DEBUG_PROFILING
     profileBackend=selectedBackend(a);profileCompression=a["--compression"]!="false";
 #endif

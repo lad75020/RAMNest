@@ -23,6 +23,8 @@ import RAMNestCore
     @Published var menuBarMode = false
     @Published private(set) var backend = Configuration.Backend.nfs
     @Published private(set) var backendError: String?
+    @Published private(set) var fileVerification = FileVerification.sha256
+    @Published private(set) var fileVerificationError: String?
     @Published var memoryUsed: Double = 0
     @Published private(set) var engine: Engine?
     @Published private(set) var snapshotStoragePath = ""
@@ -58,6 +60,7 @@ import RAMNestCore
             let store = try repository ?? (explicit.map { try Store(root: $0) } ?? storageManager!.open())
             let config = try store.locked { try store.load() }
             engine = Engine(store: store); menuBarMode = config.menuBarMode; backend = config.backend; snapshotStoragePath = store.root.path
+            fileVerification = config.fileVerification
             if let storageManager { let state = try storageManager.state(); storagePending = state.pending }
         } catch {
             engine = nil; self.error = error.localizedDescription; backendError = error.localizedDescription; storageError = error.localizedDescription
@@ -88,14 +91,17 @@ import RAMNestCore
         guard !busy, let engine else { return }
         let generation = engineGeneration, reader = refreshRead
         do {
-            let (current, preference) = try await Task.detached {
-                if let reader { return try await reader(engine) }
-                return (try engine.statuses(), try engine.backend())
+            let (current, preference, verification) = try await Task.detached {
+                let result: ([FolderStatus], Configuration.Backend)
+                if let reader { result = try await reader(engine) }
+                else { result = (try engine.statuses(), try engine.backend()) }
+                return (result.0, result.1, try engine.fileVerification())
             }.value
             guard !busy, generation == engineGeneration, self.engine === engine else { return }
             let wasDirty = dirty
             statuses = current
             backend = preference
+            fileVerification = verification
             if selected == nil { selected = current.first?.id }
             if !wasDirty { draft = selectedStatus?.folder }
             memoryUsed = MemoryReading.usedFraction()
@@ -155,6 +161,7 @@ import RAMNestCore
         do {
             let store = try manager.open(), config = try store.locked { try store.load() }
             self.engine = Engine(store: store); menuBarMode = config.menuBarMode; backend = config.backend
+            fileVerification = config.fileVerification
         } catch {
             // A committed-but-not-retired destination stays fenced. Settings
             // remains usable for Retry, while all folder mutators lose authority.
@@ -269,6 +276,18 @@ import RAMNestCore
                 try await Task.detached { try engine.setMenuBarMode(value) }.value
                 menuBarMode = value
             } catch { self.error = error.localizedDescription }
+        }
+    }
+    func setFileVerification(_ value: FileVerification) {
+        guard !busy, let engine else { return }
+        busy = true; progress = "Saving next mount file verification…"; fileVerificationError = nil
+        Task {
+            defer { busy = false; progress = "" }
+            do { fileVerification = try await Task.detached { try engine.setFileVerification(value) }.value }
+            catch {
+                fileVerificationError = error.localizedDescription
+                if let saved = try? await Task.detached(operation: { try engine.fileVerification() }).value { fileVerification = saved }
+            }
         }
     }
     func setBackend(_ value: Configuration.Backend) {

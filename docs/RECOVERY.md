@@ -1,5 +1,7 @@
 # Local recovery
 
+Content-checksum references in this recovery guide describe the default SHA-256 mode. Verification and retirement use each revision's recorded [file verification policy](FILE_VERIFICATION.md). Size/mtime mode permits a same-size edit with restored modification time to go undetected; changing Settings cannot upgrade an existing revision or reinterpret recovery authority.
+
 First stop writers and inspect status. Do not replace a snapshot from an empty or stale mountpoint.
 
 Long helper operations report completed work while population/export/quiesce

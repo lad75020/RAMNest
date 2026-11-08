@@ -162,7 +162,15 @@ enum SiblingCleanup {
                     let root = try parent.child(path.lastPathComponent)
                     try root.requireCleanupRoot(device: device, inode: inode, fsid: fsid)
                     if candidate.kind == .fsKitOriginal { try FSKitLinks.requirePrivateDirectory(root, device: device, checkACL: false) }
-                    let inventory = try root.cleanupInventory(matching: candidate.plan?.manifest)
+                    var inventoryExpected = candidate.plan?.manifest ?? candidate.sourceManifest ?? selectedExpected
+                    if candidate.plan == nil, candidate.sourceManifest == nil,
+                       candidate.kind == .original || candidate.kind == .fsKitOriginal {
+                        // Legacy holdings inherit their initial revision, never a
+                        // later selected snapshot that may use another policy.
+                        guard let initial = candidate.initialRevision else { throw NestError("Missing initial snapshot; original holding retained.", code: 6) }
+                        inventoryExpected = try Snapshot.verified(store: store, id: folder.id, revision: initial).1
+                    }
+                    let inventory = try root.cleanupInventory(matching: inventoryExpected)
                     if let plan = candidate.plan {
                         try root.validateCleanupRemainder(inventory, plan: plan)
                     } else {
@@ -189,10 +197,10 @@ enum SiblingCleanup {
                                 expected = Manifest(entries: [dataRoot] + original.entries.map { entry in
                                     var projected = entry; projected.path = "data/" + entry.path
                                     projected.hardlink = entry.hardlink.map { "data/" + $0 }; return projected
-                                })
+                                }, fileVerification: original.fileVerification)
                                 expected.entries.sort { $0.path < $1.path }
                             }
-                            guard inventory.manifest.contentsMatchExpected(candidate.emptyOnly ? Manifest(entries: []) : expected) else {
+                            guard inventory.manifest.contentsMatchExpected(candidate.emptyOnly ? Manifest(entries: [], fileVerification: expected.fileVerification) : expected) else {
                                 throw NestError("Original holding changed or contains unknown entries; retained.", code: 6)
                             }
                         } else {
@@ -313,7 +321,8 @@ extension DirectoryHandle {
             } else if kind == S_IFREG {
                 entry.size = st.st_size; entry.mtimeSeconds = Int64(st.st_mtimespec.tv_sec); entry.mtimeNanos = Int64(st.st_mtimespec.tv_nsec)
                 let prior = expected?.entries.first { $0.path == path }
-                let scan = try SparseContent.scan(descriptor, size: st.st_size, legacy: prior.map { !$0.checksum.hasPrefix("sparse64-v1:") } ?? false)
+                let policy = expected?.fileVerification ?? .sha256
+                let scan = try SparseContent.scan(descriptor, size: st.st_size, legacy: policy == .sha256 && (prior.map { !$0.checksum.hasPrefix("sparse64-v1:") } ?? false), verification: policy)
                 entry.checksum = scan.checksum; entry.allocatedBytes = scan.allocated
                 if st.st_nlink > 1 { fileLinks[path] = "\(st.st_dev):\(st.st_ino)" }
             } else {
@@ -345,7 +354,7 @@ extension DirectoryHandle {
                 entries[index].hardlink = first == entries[index].path ? nil : first
             }
         }
-        return CleanupTreePlan(manifest: Manifest(entries: entries), identities: records.values.sorted { $0.path < $1.path })
+        return CleanupTreePlan(manifest: Manifest(entries: entries, fileVerification: expected?.fileVerification ?? .sha256), identities: records.values.sorted { $0.path < $1.path })
     }
     func validateCleanupRemainder(_ actual: CleanupTreePlan, plan: CleanupTreePlan) throws {
         guard Set(plan.manifest.entries.map(\.path)).count == plan.manifest.entries.count,
@@ -382,7 +391,7 @@ extension DirectoryHandle {
                   UInt16(now.st_mode & S_IFMT) == record.type else { throw NestError("Cleanup entry replaced; stopped.", code: 6) }
             var leafExpected = expectedEntries[record.path]
             leafExpected?.path = leaf
-            let leafInventory = try directory.cleanupInventory(only: leaf, matching: leafExpected.map { Manifest(entries: [$0]) })
+            let leafInventory = try directory.cleanupInventory(only: leaf, matching: leafExpected.map { Manifest(entries: [$0], fileVerification: plan.manifest.fileVerification) })
             guard leafInventory.manifest.entries.count == 1,
                   var expected = expectedEntries[record.path] else { throw NestError("Cleanup leaf gained entries; stopped.", code: 6) }
             var actualEntry = leafInventory.manifest.entries[0]

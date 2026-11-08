@@ -37,10 +37,11 @@ public struct DebugHelperProfile: Codable, Sendable {
     public let metrics: [DebugHelperMetric]
     public func seconds(for id: String) -> Double? {
         if id.hasPrefix("lz4_") && !compression { return nil }
+        if id == "sha256" && integrityAlgorithm == FileVerification.sizeAndModTime.rawValue { return nil }
         guard let m = metrics.first(where: { $0.id == id }) else { return nil }
         return Double(m.ns) / 1e9
     }
-    static func parse(_ fields: [String], run: UUID, phase: String) throws -> Self {
+    static func parse(_ fields: [String], run: UUID, phase: String, verification: FileVerification = .sha256) throws -> Self {
         guard fields.count == 1, fields[0].utf8.count < 8192 else { throw NestError("Invalid Debug profile frame.") }
         let data = Data(fields[0].utf8)
         let rootKeys: Set<String> = ["version", "integrityAlgorithm", "run", "phase", "backend", "compression", "periodicMinutes", "debugBuild", "clock", "elapsedNS", "stopped", "expired", "inFlight", "metrics"]
@@ -48,13 +49,18 @@ public struct DebugHelperProfile: Codable, Sendable {
               let rows = object["metrics"] as? [[String: Any]], rows.count == metricNames.count,
               rows.allSatisfy({ Set($0.keys) == ["id", "calls", "ns", "requested", "returned", "errors", "histogram"] }) else { throw NestError("Unknown or missing Debug profile fields.") }
         let result = try JSONDecoder().decode(Self.self, from: data)
-        guard result.version == 2, result.integrityAlgorithm == "sha256", result.run == run, result.phase == phase,
+        guard result.version == 2, result.integrityAlgorithm == verification.rawValue, result.run == run, result.phase == phase,
               ["nfs", "fskit", "smb"].contains(result.backend), result.debugBuild,
               result.clock == "steady_clock_ns", result.periodicMinutes <= UInt64(Int32.max),
               result.elapsedNS <= 600_000_000_000, result.inFlight <= 1_000_000,
               result.metrics.map(\.id) == metricNames,
               result.metrics.allSatisfy({ $0.histogram.count == 5 && [$0.calls, $0.ns, $0.requested, $0.returned, $0.errors].allSatisfy { $0 <= 9_000_000_000_000_000 } && $0.histogram.allSatisfy { $0 <= 9_000_000_000_000_000 } }) else {
             throw NestError("Invalid, stale or unsupported Debug profile response.")
+        }
+        if verification == .sizeAndModTime {
+            guard let sha = result.metrics.first(where: { $0.id == "sha256" }), sha.calls == 0, sha.requested == 0 else {
+                throw NestError("Metadata verification profile unexpectedly hashed payload bytes.")
+            }
         }
         return result
     }
@@ -108,7 +114,7 @@ public struct DebugBenchmarkReport: Encodable, Sendable {
         "native_read/write": "callback child depth 1, inclusive MemoryFS wall",
         "tree_wait/hold": "native acquisition regions; cumulative wait and hold wall across capture, revalidation, commit and fallback; hold ends before unlock",
         "lz4_encode/decode": "native work, usually outside tree_hold (serialized fallback/import may hold it); actual codec calls only; disabled = N/A, not measured zero; requested input and returned output bytes",
-        "sha256": "native work, usually outside tree_hold; SHA-256 only; full logical 64 KiB integrity hashing on every verification; requested is hashed bytes",
+        "sha256": "native work, usually outside tree_hold; full logical 64 KiB integrity hashing in SHA sessions only; disabled in sizeAndModTime sessions; requested is actual hashed bytes",
         "mmap/memcpy/account": "native work, inside or outside tree_hold; selected page allocation/copies and Node.account; other copies/metadata not individually instrumented",
         "compressed_block/raw_block": "outcome counts, requested logical bytes and returned payload bytes; duration is not a performance layer",
         "availability": "Zero enabled-codec calls means no observed calls; in-flight/expired windows can omit unfinished work; window-wide background clients are possible"
@@ -142,7 +148,7 @@ public struct DebugBenchmarkReport: Encodable, Sendable {
             lines.append(String(format: "Separate post-write full readback verification outside throughput: %.6f s", p.externalVerificationSeconds))
             lines.append("write includes open + pwrite + fsync + checked close; read includes open + pread + checked close. F_NOCACHE accepted=\(p.cacheNoCacheAccepted), errno=\(p.cacheErrno)")
             if let h = p.helper {
-                lines.append("Running helper integrity: \(h.integrityAlgorithm); debug-io-profile-v2 (JSON version \(h.version)); full logical 64 KiB per verification.")
+                lines.append("Running helper integrity: \(h.integrityAlgorithm); debug-io-profile-v2 (JSON version \(h.version)); \(h.integrityAlgorithm == "sha256" ? "full logical 64 KiB SHA per verification" : "regular-file payload SHA disabled; structural decode and metadata checks only").")
                 lines.append("helper window stopped=\(h.stopped), expired=\(h.expired), in-flight roots at snapshot=\(h.inFlight). Partial in-flight scopes may be omitted; background contamination is possible.")
                 lines.append("layer [parent/depth] | inclusive seconds | calls | requested/returned bytes | errors")
                 for m in h.metrics {
@@ -153,7 +159,7 @@ public struct DebugBenchmarkReport: Encodable, Sendable {
                     case "tree_wait", "tree_hold": parent = "native/2"
                     default: parent = "native work; may be outside tree_hold or from other clients"
                     }
-                    let duration = m.id.hasSuffix("_block") ? "N/A (block outcome count only)" : h.seconds(for: m.id).map { String(format: "%.9f", $0) } ?? "N/A (codec disabled)"
+                    let duration = m.id.hasSuffix("_block") ? "N/A (block outcome count only)" : h.seconds(for: m.id).map { String(format: "%.9f", $0) } ?? (m.id == "sha256" ? "N/A (payload SHA disabled)" : "N/A (codec disabled)")
                     lines.append("\(m.id) [\(parent)] | \(duration) | \(m.calls) | \(m.requested)/\(m.returned) | \(m.errors)")
                 }
                 let reads = h.metrics.first { $0.id == "callback_read" }

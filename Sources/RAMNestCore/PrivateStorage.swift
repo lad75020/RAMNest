@@ -6,15 +6,19 @@ struct StoredManifest: Codable {
     var publicRoot: Entry?
     var storageFormat: Int?
     var modeMapDigest: String?
-    var logical: Manifest { Manifest(entries:entries,publicRoot:publicRoot) }
+    var fileVerification: FileVerification
+    var logical: Manifest { Manifest(entries:entries,publicRoot:publicRoot,fileVerification:fileVerification) }
     init(_ manifest: Manifest, modes: StorageModes? = nil) {
         entries = manifest.entries;publicRoot = manifest.publicRoot
+        fileVerification = manifest.fileVerification
         storageFormat = modes == nil ? nil : 2;modeMapDigest = modes.map { Snapshot.digest($0.encoded) }
     }
-    enum CodingKeys: String, CodingKey { case entries, publicRoot, storageFormat, modeMapDigest }
+    enum CodingKeys: String, CodingKey { case entries, publicRoot, storageFormat, modeMapDigest, fileVerification }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy:CodingKeys.self)
         entries = try c.decode([Entry].self,forKey:.entries);publicRoot = try c.decodeIfPresent(Entry.self,forKey:.publicRoot)
+        fileVerification = c.contains(.fileVerification) ? try c.decode(FileVerification.self,forKey:.fileVerification) : .sha256
+        try logical.validateVerification()
         if c.contains(.storageFormat) {
             storageFormat = try c.decode(Int.self,forKey:.storageFormat)
             modeMapDigest = try c.decode(String.self,forKey:.modeMapDigest)
@@ -188,7 +192,7 @@ struct StorageModes {
             guard let r = modes[e.path], r.kind == e.kind, e.mode == Self.physical(r) else { throw NestError("Private storage physical policy mismatch at \(Snapshot.diagnosticLabel(e.path.isEmpty ? "." : e.path)).", code: 6) }
             var result = e;result.mode = r.mode;return result
         }
-        return try Manifest(entries:observed.entries.map(entry),publicRoot:entry(observed.publicRoot!))
+        return try Manifest(entries:observed.entries.map(entry),publicRoot:entry(observed.publicRoot!),fileVerification:observed.fileVerification)
     }
     static func read(_ url: URL) throws -> Data {
         let fd = open(url.path,O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)

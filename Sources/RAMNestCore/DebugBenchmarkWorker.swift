@@ -201,17 +201,18 @@ public enum DebugBenchmarkWorker {
         var activePhase: String?
         var reservationAttempted = false
         var socket: String?
+        var verification = FileVerification.sha256
         func rpc(_ verb: String, _ phase: String) throws -> DebugHelperProfile {
             guard let socket else { throw NestError("No Debug helper socket.") }
             let fields = try request(socket, "\(verb)\t\(run.uuidString)\t\(phase)")
-            return try DebugHelperProfile.parse(fields, run: run, phase: phase)
+            return try DebugHelperProfile.parse(fields, run: run, phase: phase, verification: verification)
         }
         do {
             guard bytes > 0, bytes <= decimalGB, (1_048_576...8_388_608).contains(block) else { throw NestError("Invalid bounded benchmark configuration.") }
             try cancellation.check()
-            let target = try acquire(); socket = target.socket
+            let target = try acquire(); socket = target.socket; verification = target.journal.fileVerification
             let caps = try request(target.socket, "capabilities")
-            guard caps.contains("debug-io-profile-v2"), caps.contains("debug-benchmark-reservation-v1") else { throw NestError("Mounted helper lacks the SHA-256-only Debug v2 profiling/reservation capability; eject and remount with the current SHA-only Debug helper before benchmarking.") }
+            guard caps.contains("debug-io-profile-v2"), caps.contains("debug-benchmark-reservation-v1") else { throw NestError("Mounted helper lacks the Debug v2 profiling/reservation capability; eject and remount with the current Debug helper before benchmarking.") }
             let initialPhase = mode == .read ? "read" : "write"
             // Probe the actual running interval/compression before creating even a directory.
             let begin: DebugHelperProfile

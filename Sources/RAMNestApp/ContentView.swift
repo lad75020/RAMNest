@@ -117,7 +117,7 @@ struct FolderDetail: View {
                         Toggle("Real-time LZ4 compression", isOn: option(\.compression, fallback: true))
                         Text("Compresses each 64 KiB content block as you write. Incompressible blocks stay raw. This option and Finder visibility take effect at the next mount.").font(.callout).foregroundStyle(.secondary)
                         Picker("Snapshot comparison", selection: option(\.comparison, fallback: .sizeAndModTime)) { Text("Size & modification time").tag(Comparison.sizeAndModTime); Text("File checksum").tag(Comparison.checksum) }.frame(maxWidth: 430)
-                        Text("Every promoted snapshot is verified with checksums. A metadata comparison that misses an edit causes verification to fail safely.").font(.caption).foregroundStyle(.secondary)
+                        Text("Controls incremental file selection. File integrity uses the policy recorded when this session mounted; choose the policy for future mounts in Settings.").font(.caption).foregroundStyle(.secondary)
                         Label("FSEvents suppression is unavailable", systemImage: "info.circle").font(.callout)
                         Text("RAMNest does not request FSEvents suppression. Folder watcher behavior depends on the mount backend.").font(.caption).foregroundStyle(.secondary)
                         Label("Local persistence only", systemImage: "internaldrive").font(.callout)
@@ -198,6 +198,11 @@ struct AppSettingsView: View {
                 Text("FSKit requires the FUSE-T extension to be enabled through /Applications/fuse-t.app. New mounts use a private internal location and a symlink at your folder’s original path, including for external-volume folders. RAMNest does not fall back to another backend.").font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
             if let error = model.backendError { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+            Picker("File verification for next mount", selection: Binding(get: { model.fileVerification }, set: { model.setFileVerification($0) })) {
+                ForEach(FileVerification.allCases, id: \.self) { policy in Text(policy.displayName).tag(policy) }
+            }.disabled(model.busy || model.engine == nil)
+            Text("Applies to new mounts for all folders. Running sessions and retained snapshots keep their recorded policy. Size and modification time skips regular-file content SHA-256; an edit with the same size and restored modification time can go undetected. RAM payload corruption can also go undetected when structural decoding succeeds. Bounds, decompression checks, symlinks, extended attributes and control metadata retain their checks.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let error = model.fileVerificationError { Text(error).foregroundStyle(.red).textSelection(.enabled) }
             Toggle("Show in menu bar instead of Dock", isOn: Binding(get: { model.menuBarMode }, set: { model.setMenuMode($0) })).disabled(model.busy || model.engine == nil)
             Toggle("Open at login", isOn: $login).disabled(model.busy).onChange(of: login) { _, enabled in
                 do { if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } }

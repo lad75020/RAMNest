@@ -31,7 +31,8 @@ Scope: macOS 27.0+, Apple Silicon, FUSE-T with app-wide NFS/FSKit/SMB3 selection
 | Normal/Advanced Apply/Discard safeguards | Yes | Builds | Native dialogs on selection/mount/eject/quit | Host interaction |
 | Defaults and interval choices | Yes | CLI options/default assertions | Detached helper performs periodic saves even with GUI absent | Actual 5-minute schedule |
 | FSEvents suppression | Explicitly unsupported | UI/CLI explain limitation | No unsupported FUSE option sent | Watcher behavior depends on bridge |
-| Size+mtime/checksum comparison | Yes | Snapshot verification tests | All promoted revisions checksum-verified; export from RAM is full, not a delta stream | Performance at scale |
+| Size+mtime/checksum comparison | Yes | Snapshot verification tests | Incremental selection remains separate from session verification | Performance at scale |
+| Selectable file verification | Yes | Standalone Swift/native/Settings regressions | SHA-256 default; size+mtime skips file verification SHA and has a same-size/restored-mtime blind spot; RAM payload SHA is also disabled; structurally valid RAM corruption may pass | Mounted GUI lifecycle in both modes |
 | True detached in-process RAM storage | Yes | Native engine; parent actual mount | Anonymous pages remain subject to OS swap | Final helper crash-survival rerun |
 | Lazy backing grows/shrinks with content | Yes, mmap/munmap | Mach RSS random/truncate/unlink test; independent parent native test | Metadata/workspace/kernel overhead separate | Final mounted RSS rerun |
 | Real-time compression/default-on option | Yes, system LZ4 | Native roundtrip/random/partial/corrupt/concurrent; CLI persistence | 64 KiB logical blocks; next-mount setting; raw fallback | Final mounted compressed remount |

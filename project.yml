@@ -61,6 +61,7 @@ targets:
           - $(PROJECT_DIR)/Native/MemoryFS.cpp
           - $(PROJECT_DIR)/Native/MemoryFS.hpp
           - $(PROJECT_DIR)/Native/NativeChecksumIntegrityTests.cpp
+          - $(PROJECT_DIR)/Native/FileVerificationTests.cpp
           - $(PROJECT_DIR)/Native/NativeIoOptimizationTests.cpp
           - $(PROJECT_DIR)/Native/NativeIoBenchmark.cpp
           - $(PROJECT_DIR)/Native/DebugProfile.hpp

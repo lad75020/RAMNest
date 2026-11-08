@@ -14,10 +14,10 @@ inline constexpr std::array names={"callback_read","callback_write","native_read
 inline uint64_t now(){return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
 struct Counter {std::atomic<uint64_t> calls{0},ns{0},requested{0},returned{0},errors{0};std::array<std::atomic<uint64_t>,5> histogram{};};
 struct Window {
-    std::string run,phase,backend;bool compression;int periodic;
+    std::string run,phase,backend,integrityAlgorithm;bool compression;int periodic;
     uint64_t start=now(),deadline=start+300000000000ULL;
     std::atomic<uint64_t> inFlight{0};std::array<Counter,size_t(Metric::count)> counters;
-    Window(std::string r,std::string p,std::string b,bool c,int i):run(std::move(r)),phase(std::move(p)),backend(std::move(b)),compression(c),periodic(i){}
+    Window(std::string r,std::string p,std::string b,bool c,int i,std::string algorithm="sha256"):run(std::move(r)),phase(std::move(p)),backend(std::move(b)),integrityAlgorithm(std::move(algorithm)),compression(c),periodic(i){}
 };
 // Apple's libc++ does not yet provide atomic<shared_ptr<T>>. The shared_ptr
 // atomic free functions retain the same lifetime/admission guarantees.
@@ -74,12 +74,12 @@ public:
 };
 inline bool validUUID(const std::string& s){uuid_t u;return s.size()==36&&uuid_parse(s.c_str(),u)==0;}
 inline std::string render(const Window& w,bool stopped){
-    std::string out="OK\t{\"version\":2,\"integrityAlgorithm\":\"sha256\",\"run\":\""+w.run+"\",\"phase\":\""+w.phase+"\",\"backend\":\""+w.backend+"\",\"compression\":"+(w.compression?"true":"false")+",\"periodicMinutes\":"+std::to_string(w.periodic)+",\"debugBuild\":true,\"clock\":\"steady_clock_ns\",\"elapsedNS\":"+std::to_string(now()-w.start)+",\"stopped\":"+(stopped?"true":"false")+",\"expired\":"+(now()>=w.deadline?"true":"false")+",\"inFlight\":"+std::to_string(w.inFlight.load())+",\"metrics\":[";
+    std::string out="OK\t{\"version\":2,\"integrityAlgorithm\":\""+w.integrityAlgorithm+"\",\"run\":\""+w.run+"\",\"phase\":\""+w.phase+"\",\"backend\":\""+w.backend+"\",\"compression\":"+(w.compression?"true":"false")+",\"periodicMinutes\":"+std::to_string(w.periodic)+",\"debugBuild\":true,\"clock\":\"steady_clock_ns\",\"elapsedNS\":"+std::to_string(now()-w.start)+",\"stopped\":"+(stopped?"true":"false")+",\"expired\":"+(now()>=w.deadline?"true":"false")+",\"inFlight\":"+std::to_string(w.inFlight.load())+",\"metrics\":[";
     for(size_t i=0;i<names.size();i++){if(i)out+=",";auto& c=w.counters[i];out+="{\"id\":\""+std::string(names[i])+"\",\"calls\":"+std::to_string(c.calls.load())+",\"ns\":"+std::to_string(c.ns.load())+",\"requested\":"+std::to_string(c.requested.load())+",\"returned\":"+std::to_string(c.returned.load())+",\"errors\":"+std::to_string(c.errors.load())+",\"histogram\":[";
         for(size_t j=0;j<5;j++){if(j)out+=",";out+=std::to_string(c.histogram[j].load());}out+="]}";}
     return out+"]}";
 }
-inline std::string command(const std::string& verb,const std::string& arg,const std::string& backend,bool compression,const std::atomic<int>& runningPeriod,bool ready){
+inline std::string command(const std::string& verb,const std::string& arg,const std::string& backend,bool compression,const std::atomic<int>& runningPeriod,bool ready,const std::string& integrityAlgorithm="sha256"){
     auto sep=arg.find('\t');if(sep==std::string::npos)return "ERR\t22";
     auto run=arg.substr(0,sep),phase=arg.substr(sep+1);
     if(!validUUID(run)||(phase!="write"&&phase!="read"))return "ERR\t22";
@@ -92,7 +92,7 @@ inline std::string command(const std::string& verb,const std::string& arg,const 
     }
     if(verb=="profile-begin"){
         if(w||(retired&&retired->inFlight.load())||!ready||periodic!=0||periodicInFlight||(!fixtureRun.empty()&&fixtureRun!=run))return "ERR\t16";
-        auto next=std::make_shared<Window>(run,phase,backend,compression,periodic);fixtureRun=run;retired.reset();active.store(next);return render(*next,false);
+        auto next=std::make_shared<Window>(run,phase,backend,compression,periodic,integrityAlgorithm);fixtureRun=run;retired.reset();active.store(next);return render(*next,false);
     }
     if(!w||w->run!=run||w->phase!=phase)return "ERR\t22";
     if(verb=="profile-snapshot")return render(*w,false);

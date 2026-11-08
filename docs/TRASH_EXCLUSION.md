@@ -12,7 +12,7 @@ New native and Swift revisions omit the entries and their mode-map records.
 Old committed revisions remain immutable: the complete version discriminator,
 manifest namespace, mode map, digest and map/manifest correspondence are checked
 before constructing an excluded view. Included namespace, physical policy,
-checksums, attributes, quarantine, hardlinks and exact equality still apply.
+the recorded file verification policy, attributes, quarantine, hardlinks and exact equality still apply. SHA-256 is the default; see [file verification](FILE_VERIFICATION.md) for the optional size/mtime contract.
 An old excluded directory can be physically restrictive without being opened.
 Malformed excluded metadata still fails complete map/manifest validation.
 

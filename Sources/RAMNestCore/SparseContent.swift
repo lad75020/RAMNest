@@ -6,7 +6,7 @@ import Darwin
 // hashes include apparent size and every nonzero 64 KiB logical page. Zero pages
 // normalize to holes in both the native tree and this quota policy.
 enum SparseContent {
-    struct Result { var checksum: String; var allocated: UInt64; var bytesRead: UInt64 }
+    struct Result { var checksum: String; var allocated: UInt64; var bytesRead: UInt64; var sha256Bytes: UInt64 = 0 }
     typealias ExtentSeeker = (Int32, off_t, Int32) -> off_t
     // SEEK_DATA is optional on filesystems such as FUSE-T NFS. Other errors
     // still fail closed; ENXIO retains its separate end-of-data meaning.
@@ -48,12 +48,14 @@ enum SparseContent {
         }
         guard ftruncate(destination, size) == 0 else { throw NestError("Sparse copy length failed.", code: 6) }
     }
-    static func scan(_ fd: Int32, size: Int64, legacy: Bool = false,
+    static func scan(_ fd: Int32, size: Int64, legacy: Bool = false, verification: FileVerification = .sha256,
                      seekExtent: ExtentSeeker = Darwin.lseek) throws -> Result {
         guard size >= 0 else { throw NestError("Invalid sparse length.", code: 6) }
         let sparseHash = size > 1 << 20 && !legacy
-        var hash = SHA256(), allocated: UInt64 = 0, bytesRead: UInt64 = 0
-        if sparseHash { hash.update(data: Data("RAMNest sparse64 v1 length=\(size)\n".utf8)) }
+        // nil is a real no-content-SHA path, including sparse page hashes.
+        var hash: SHA256? = verification == .sha256 ? SHA256() : nil
+        var allocated: UInt64 = 0, bytesRead: UInt64 = 0, sha256Bytes: UInt64 = 0
+        if sparseHash { hash?.update(data: Data("RAMNest sparse64 v1 length=\(size)\n".utf8)) }
         var info = stat();guard fstat(fd, &info) == 0 else { throw NestError("Cannot inspect sparse source.", code: 6) }
         var position: Int64 = 0, extents = sparseHash && info.st_flags & UInt32(UF_COMPRESSED) == 0
         var buffer = [UInt8](repeating: 0, count: 65536)
@@ -79,15 +81,16 @@ enum SparseContent {
             }
             let nonzero = buffer.contains { $0 != 0 }
             if nonzero { allocated += 65536 }
-            if sparseHash {
+            if hash != nil && sparseHash {
                 if nonzero {
-                    hash.update(data: Data("page=\(position/65536)\n".utf8))
-                    hash.update(data: Data(SHA256.hash(data: Data(buffer))))
+                    hash?.update(data: Data("page=\(position/65536)\n".utf8))
+                    hash?.update(data: Data(SHA256.hash(data: Data(buffer))))
+                    sha256Bytes += 65536
                 }
-            } else { hash.update(data: Data(buffer.prefix(count))) }
+            } else if hash != nil { hash?.update(data: Data(buffer.prefix(count))); sha256Bytes += UInt64(count) }
             position += Int64(count)
         }
-        let checksum = hash.finalize().map { String(format: "%02x", $0) }.joined()
-        return Result(checksum: (sparseHash ? "sparse64-v1:" : "") + checksum, allocated: allocated, bytesRead: bytesRead)
+        let checksum = hash.map { $0.finalize().map { String(format: "%02x", $0) }.joined() }
+        return Result(checksum: checksum.map { (sparseHash ? "sparse64-v1:" : "") + $0 } ?? "", allocated: allocated, bytesRead: bytesRead, sha256Bytes: sha256Bytes)
     }
 }

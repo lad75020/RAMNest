@@ -373,6 +373,14 @@ enum StorageRelocation {
         var kind: UInt16; var mode: UInt16; var uid: UInt32; var gid: UInt32
         var flags: UInt32; var size: Int64; var modifiedSeconds: Int64; var modifiedNanos: Int64
         var attributes: [String: Data]; var acl: String; var digest: String?; var link: Data?
+        var fileVerification: FileVerification? = nil // Missing is legacy SHA; only payload entries may be weak.
+        enum CodingKeys: String, CodingKey { case path, device, inode, kind, mode, uid, gid, flags, size, modifiedSeconds, modifiedNanos, attributes, acl, digest, link, fileVerification }
+        static func revisionPayload(_ path: String) -> Bool {
+            let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+            return parts.count >= 6 && parts[0] == "volumes" && UUID(uuidString: parts[1]) != nil &&
+                parts[2] == "revisions" && UUID(uuidString: parts[3]) != nil && parts[4] == "data" &&
+                parts.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("\0") }
+        }
         func sameCopyContent(_ other: Item, directoryTimes: Bool = true) -> Bool {
             var source = self, destination = other
             source.attributes.removeValue(forKey: Snapshot.provenanceName)
@@ -383,7 +391,7 @@ enum StorageRelocation {
             path == other.path && kind == other.kind && mode == other.mode && uid == other.uid && gid == other.gid &&
             flags == other.flags && (kind == UInt16(S_IFDIR) || size == other.size) &&
             ((!directoryTimes && kind == UInt16(S_IFDIR)) || (modifiedSeconds == other.modifiedSeconds && modifiedNanos == other.modifiedNanos)) &&
-            attributes == other.attributes && acl == other.acl && digest == other.digest && link == other.link
+            attributes == other.attributes && acl == other.acl && digest == other.digest && link == other.link && fileVerification == other.fileVerification
         }
     }
     struct Receipt: Codable {
@@ -489,6 +497,25 @@ enum StorageRelocation {
                   !partial.temporary.contains("/"), !partial.temporary.utf8.contains(0) else { throw NestError("Malformed partial copy receipt; both stores retained.", code: 6) }
         }
         return receipt
+    }
+}
+
+extension StorageRelocation.Item {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        path = try c.decode(String.self, forKey: .path); device = try c.decode(UInt64.self, forKey: .device); inode = try c.decode(UInt64.self, forKey: .inode)
+        kind = try c.decode(UInt16.self, forKey: .kind); mode = try c.decode(UInt16.self, forKey: .mode)
+        uid = try c.decode(UInt32.self, forKey: .uid); gid = try c.decode(UInt32.self, forKey: .gid); flags = try c.decode(UInt32.self, forKey: .flags)
+        size = try c.decode(Int64.self, forKey: .size); modifiedSeconds = try c.decode(Int64.self, forKey: .modifiedSeconds); modifiedNanos = try c.decode(Int64.self, forKey: .modifiedNanos)
+        attributes = try c.decode([String: Data].self, forKey: .attributes); acl = try c.decode(String.self, forKey: .acl)
+        digest = try c.decodeIfPresent(String.self, forKey: .digest); link = try c.decodeIfPresent(Data.self, forKey: .link)
+        fileVerification = c.contains(.fileVerification) ? try c.decode(FileVerification.self, forKey: .fileVerification) : nil
+        if fileVerification != nil {
+            guard fileVerification == .sizeAndModTime, kind == UInt16(S_IFREG), digest == nil,
+                  Self.revisionPayload(path) else { throw NestError("Invalid storage payload verification authority; retained.", code: 6) }
+        } else if kind == UInt16(S_IFREG) {
+            guard let digest, digest.utf8.count == 64, digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { throw NestError("Missing storage file SHA authority; retained.", code: 6) }
+        }
     }
 }
 
@@ -705,7 +732,7 @@ extension StorageRelocation {
                 try matchSource(receipt)
                 if receipt.destinationInventory == nil { try copy(&receipt, cancellation: cancellation) }
                 try checkpoint("hash")
-                let copied = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name], cancellation: cancellation)
+                let copied = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name], cancellation: cancellation, matching: receipt.inventory)
                 guard destinationMatches(receipt, copied), ownedCopies(receipt, copied), try rootMatches(receipt, root: receipt.destination) else { throw NestError("Opaque storage copy verification failed. Source and partial destination retained; retry or preserve both for recovery.", code: 6) }
                 receipt.destinationInventory = copied
                 let destinationURL = URL(fileURLWithPath: receipt.destination.path)
@@ -721,7 +748,7 @@ extension StorageRelocation {
                 try verifyCopyObservation(receipt)
                 try cancellation.check(); progress("Verifying before committing storage selection…")
                 try matchSource(receipt)
-                let copied = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name], cancellation: cancellation)
+                let copied = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name], cancellation: cancellation, matching: receipt.inventory)
                 guard destinationMatches(receipt, copied), ownedCopies(receipt, copied), try rootMatches(receipt, root: receipt.destination) else { throw NestError("Verified destination changed. Both stores retained.", code: 6) }
                 let source = try receipt.source.open()
                 let fence = StorageRelocation.Fence(transaction: receipt.transaction, bootstrap: receipt.bootstrap.path, destination: receipt.destination.path)
@@ -737,7 +764,7 @@ extension StorageRelocation {
                 let fence = StorageRelocation.Fence(transaction: receipt.transaction, bootstrap: receipt.bootstrap.path, destination: receipt.destination.path)
                 try durableFence(fence, directory: source, name: StorageRelocation.fenceName)
                 try durableFence(fence, directory: receipt.destination.open(), name: StorageRelocation.incomingName)
-                let copied = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name])
+                let copied = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name], matching: receipt.inventory)
                 guard try StorageRelocation.read(StorageRelocation.Fence.self, in: source, name: StorageRelocation.fenceName) == StorageRelocation.Fence(transaction: receipt.transaction, bootstrap: receipt.bootstrap.path, destination: receipt.destination.path),
                       destinationMatches(receipt, copied), ownedCopies(receipt, copied), try rootMatches(receipt, root: receipt.destination) else { throw NestError("Fenced move cannot be proven. Preserve both stores and retry after restoring access.", code: 6) }
                 try checkpoint("publication")
@@ -773,7 +800,7 @@ extension StorageRelocation {
             }
         }
         func matchSource(_ receipt: Receipt) throws {
-            let actual = try scan(receipt.source, excluding: excluded(receipt.source).union([StorageRelocation.fenceName]))
+            let actual = try scan(receipt.source, excluding: excluded(receipt.source).union([StorageRelocation.fenceName]), matching: receipt.inventory)
             let source = try receipt.source.open()
             if let recorded = receipt.sourceObservation {
                 guard try inspect(source, name: SnapshotCopyObservations.name, relative: SnapshotCopyObservations.name, device: receipt.source.device) == recorded else { throw NestError("Source copy observations changed; both stores retained.", code: 6) }
@@ -859,16 +886,30 @@ extension StorageRelocation.Transaction {
         }
         return (result, last)
     }
-    func scan(_ root: Root, excluding: Set<String>, cancellation: StorageMoveCancellation = .init()) throws -> [Item] {
+    func scan(_ root: Root, excluding: Set<String>, cancellation: StorageMoveCancellation = .init(), matching: [Item]? = nil) throws -> [Item] {
         let handle = try root.open(); try writableLocal(handle)
         var fs = statfs(); guard fstatfs(handle.fd, &fs) == 0 else { throw NestError("Cannot inspect storage filesystem.", code: 6) }
         var pending = try handle.names().filter { !excluding.contains($0) }
         var result: [Item] = []
+        let recorded = Dictionary(uniqueKeysWithValues: (matching ?? []).map { ($0.path, $0) })
+        var policies: [String: FileVerification] = [:]
         while let path = pending.popLast() {
             try cancellation.check()
             guard result.count < 100_000 else { throw NestError("Storage inventory exceeds safe entry bound; source retained.", code: 6) }
             let (directory, name) = try parent(handle, path: path)
-            let item = try inspect(directory, name: name, relative: path, device: root.device, cancellation: cancellation)
+            var policy = recorded[path]?.fileVerification ?? .sha256
+            let components = path.split(separator: "/").map(String.init)
+            if matching == nil, components.count >= 6, components[0] == "volumes", UUID(uuidString: components[1]) != nil,
+               components[2] == "revisions", UUID(uuidString: components[3]) != nil, components[4] == "data" {
+                let key = components.prefix(4).joined(separator: "/")
+                if policies[key] == nil {
+                    let (container, leaf) = try parent(handle, path: key + "/manifest.json")
+                    let metadata = try container.readJSON(StoredManifest.self, leaf)
+                    policies[key] = metadata.fileVerification
+                }
+                policy = policies[key]!
+            }
+            let item = try inspect(directory, name: name, relative: path, device: root.device, cancellation: cancellation, verification: policy)
             result.append(item)
             if item.kind == UInt16(S_IFDIR) {
                 let child = try directory.child(name)
@@ -885,8 +926,9 @@ extension StorageRelocation.Transaction {
         return result.sorted { $0.path < $1.path }
     }
     func inspect(_ parent: DirectoryHandle, name: String, relative: String, device: UInt64,
-                 cancellation: StorageMoveCancellation = .init()) throws -> Item {
+                 cancellation: StorageMoveCancellation = .init(), verification: FileVerification = .sha256) throws -> Item {
         let st = try parent.entryStat(name), kind = st.st_mode & S_IFMT
+        guard verification == .sha256 || kind != S_IFREG || Item.revisionPayload(relative) else { throw NestError("Control storage files require SHA verification; retained.", code: 6) }
         guard Paths.deviceID(st.st_dev) == device, st.st_uid == getuid(),
               [S_IFDIR, S_IFREG, S_IFLNK].contains(kind),
               kind == S_IFDIR || st.st_nlink == 1,
@@ -927,7 +969,7 @@ extension StorageRelocation.Transaction {
         } else if errno == ENOENT || errno == ENOTSUP { acl = "" }
         else { throw NestError("Cannot establish opaque storage ACL; source retained.", code: 6) }
         var digest: String?, link: Data?
-        if kind == S_IFREG {
+        if kind == S_IFREG && verification == .sha256 {
             var hash = SHA256(), buffer = [UInt8](repeating: 0, count: 1 << 20), total: Int64 = 0
             while true {
                 try cancellation.check()
@@ -954,7 +996,7 @@ extension StorageRelocation.Transaction {
         return Item(path: relative, device: device, inode: UInt64(st.st_ino), kind: UInt16(kind), mode: UInt16(st.st_mode & 0o7777),
             uid: st.st_uid, gid: st.st_gid, flags: st.st_flags, size: st.st_size,
             modifiedSeconds: Int64(st.st_mtimespec.tv_sec), modifiedNanos: Int64(st.st_mtimespec.tv_nsec),
-            attributes: attributes, acl: acl, digest: digest, link: link)
+            attributes: attributes, acl: acl, digest: digest, link: link, fileVerification: kind == S_IFREG && verification != .sha256 ? verification : nil)
     }
     func copy(_ receipt: inout Receipt, cancellation: StorageMoveCancellation) throws {
         let source = try receipt.source.open(), destination = try receipt.destination.open()
@@ -975,7 +1017,7 @@ extension StorageRelocation.Transaction {
                 guard try p.identity() == (partial.parent.device, partial.parent.inode) else { throw NestError("Interrupted copy parent changed; both stores retained.", code: 6) }
                 if try p.exists(name) {
                     guard let original = expected[partial.finalPath] else { throw NestError("Unknown interrupted copy; retained.", code: 6) }
-                    let found = try inspect(p, name: name, relative: partial.finalPath, device: receipt.destination.device)
+                    let found = try inspect(p, name: name, relative: partial.finalPath, device: receipt.destination.device, verification: original.fileVerification ?? .sha256)
                     guard found.device == partial.device, found.inode == partial.inode, original.sameCopyContent(found), (partial.attributes == nil ? original.attributes == found.attributes : partial.attributes == found.attributes) else { throw NestError("Interrupted publication is not proven; retain both stores.", code: 6) }
                     receipt.allocations[partial.finalPath] = StorageRelocation.Allocation(device: found.device, inode: found.inode, kind: found.kind, attributes: found.attributes)
                 } else {
@@ -987,7 +1029,7 @@ extension StorageRelocation.Transaction {
             }
             receipt.partialFile = nil; try write(receipt)
         }
-        let existing = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name])
+        let existing = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name], matching: receipt.inventory)
         for item in existing {
             guard let original = expected[item.path], ownedCopies(receipt, [item]),
                   item.kind == UInt16(S_IFDIR) || (receipt.allocations[item.path]?.attributes == nil ? original.sameContent(item, directoryTimes: false) : original.sameCopyContent(item, directoryTimes: false)) else { throw NestError("Partial destination contains an unproven entry: \(item.path). Preserve it and source; automatic overwrite is refused.", code: 6) }
@@ -1014,7 +1056,7 @@ extension StorageRelocation.Transaction {
                 let src = URL(fileURLWithPath: receipt.source.path).appendingPathComponent(item.path)
                 let dst = URL(fileURLWithPath: receipt.destination.path).appendingPathComponent(item.path)
                 guard copyfile(src.path, dst.path, nil, copyfile_flags_t(COPYFILE_ALL | COPYFILE_NOFOLLOW_SRC | COPYFILE_NOFOLLOW_DST | COPYFILE_EXCL)) == 0 else { throw NestError("Cannot preserve stored symlink metadata; both stores retained.", code: 6) }
-                let allocated = try inspect(dstParent, name: dstName, relative: item.path, device: receipt.destination.device)
+                let allocated = try inspect(dstParent, name: dstName, relative: item.path, device: receipt.destination.device, verification: item.fileVerification ?? .sha256)
                 guard item.sameCopyContent(allocated) else { throw NestError("Stored symlink copy differs; both stores retained.", code: 6) }
                 receipt.allocations[item.path] = StorageRelocation.Allocation(device: allocated.device, inode: allocated.inode, kind: item.kind, attributes: allocated.attributes)
                 try dstParent.sync(); try write(receipt)
@@ -1050,7 +1092,7 @@ extension StorageRelocation.Transaction {
                 }
                 try metadata(from: input, to: output, item: item)
                 guard fsync(output) == 0 else { throw NestError("Cannot sync complete storage metadata; both stores retained.", code: 6) }
-                let copied = try inspect(dstParent, name: temporary, relative: item.path, device: receipt.destination.device, cancellation: cancellation)
+                let copied = try inspect(dstParent, name: temporary, relative: item.path, device: receipt.destination.device, cancellation: cancellation, verification: item.fileVerification ?? .sha256)
                 guard item.sameCopyContent(copied) else { throw NestError("Storage file readback failed; recorded partial copy retained for Retry.", code: 6) }
                 receipt.partialFile?.attributes = copied.attributes; try write(receipt)
                 try dstParent.renameNoReplace(temporary, to: dstParent, as: dstName); try dstParent.sync()
@@ -1154,8 +1196,8 @@ extension StorageRelocation.Transaction {
             locks.append(try lock(volume, "transaction.lock", nonblocking: true))
         }
         let expected = Dictionary(uniqueKeysWithValues: receipt.inventory.map { ($0.path, $0) })
-        let remaining = try scan(receipt.source, excluding: excluded(receipt.source).union([StorageRelocation.fenceName]))
-        let copied = Dictionary(uniqueKeysWithValues: try scan(receipt.destination, excluding: ["repository.lock", StorageRelocation.incomingName, SnapshotCopyObservations.name]).map { ($0.path, $0) })
+        let remaining = try scan(receipt.source, excluding: excluded(receipt.source).union([StorageRelocation.fenceName]), matching: receipt.inventory)
+        let copied = Dictionary(uniqueKeysWithValues: try scan(receipt.destination, excluding: ["repository.lock", StorageRelocation.incomingName, SnapshotCopyObservations.name], matching: receipt.inventory).map { ($0.path, $0) })
         if let recorded = receipt.sourceObservation {
             if try source.exists(SnapshotCopyObservations.name) {
                 guard try inspect(source, name: SnapshotCopyObservations.name, relative: SnapshotCopyObservations.name, device: receipt.source.device) == recorded else { throw NestError("Obsolete copy observation changed; retained.", code: 6) }
@@ -1181,10 +1223,10 @@ extension StorageRelocation.Transaction {
             let st = try directory.entryStat(name)
             guard Paths.deviceID(st.st_dev) == item.device, UInt64(st.st_ino) == item.inode, UInt16(st.st_mode & S_IFMT) == item.kind else { throw NestError("Cleanup entry changed; pending cleanup retained.", code: 6) }
             if item.kind != UInt16(S_IFDIR) {
-                let current = try inspect(directory, name: name, relative: item.path, device: receipt.source.device)
+                let current = try inspect(directory, name: name, relative: item.path, device: receipt.source.device, verification: item.fileVerification ?? .sha256)
                 guard current.sameContent(item) else { throw NestError("Cleanup file changed; retained.", code: 6) }
                 let (targetParent, targetName) = try parent(destination, path: item.path, inventory: copied)
-                guard let own = ownDestination[item.path], try inspect(targetParent, name: targetName, relative: item.path, device: receipt.destination.device).sameContent(own) else { throw NestError("Selected copy changed before retirement; obsolete data retained.", code: 6) }
+                guard let own = ownDestination[item.path], try inspect(targetParent, name: targetName, relative: item.path, device: receipt.destination.device, verification: item.fileVerification ?? .sha256).sameContent(own) else { throw NestError("Selected copy changed before retirement; obsolete data retained.", code: 6) }
             }
             try checkpoint("cleanup-entry")
             guard unlinkat(directory.fd, name, item.kind == UInt16(S_IFDIR) ? AT_REMOVEDIR : 0) == 0 else { throw NestError("Storage selected, but obsolete payload cleanup needs Retry: \(String(cString: strerror(errno))).", code: 6) }

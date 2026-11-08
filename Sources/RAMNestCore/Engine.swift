@@ -62,6 +62,22 @@ enum GuardedPopulationStartup {
     }
 }
 
+enum HelperFileVerification {
+    static let version = "file-verification-v1"
+    static func negotiate(_ policy: FileVerification, query: () throws -> String) throws {
+        guard policy != .sha256 else { return } // Legacy helpers are SHA-only.
+        guard try query().trimmingCharacters(in: .whitespacesAndNewlines) == version else {
+            throw NestError("Helper cannot honor size/mtime file verification. Originals retained.", code: 6)
+        }
+    }
+    static func verify(_ journal: Journal, request: (String) throws -> [String]) throws {
+        guard journal.fileVerification != .sha256 else { return }
+        guard try request("verification-policy") == [version, journal.fileVerification.rawValue] else {
+            throw NestError("Helper session file verification policy mismatch; retained.", code: 6)
+        }
+    }
+}
+
 // Kept internal so the post-populate decision can be exercised without mounts.
 enum PopulationReadiness {
     static func verify(expected: Manifest, read: () throws -> Manifest,
@@ -199,7 +215,7 @@ public final class Engine: @unchecked Sendable {
         let st = try Paths.validate(url, store: store, folders: initialConfig.folders)
         let label = (name ?? url.lastPathComponent).trimmingCharacters(in: .whitespacesAndNewlines)
         try validateName(label, excluding: nil, config: initialConfig)
-        let manifest = try Snapshot.manifest(url, maximumLogical: capacity)
+        let manifest = try Snapshot.manifest(url, maximumLogical: capacity, verification: initialConfig.fileVerification)
         try manifest.preflight(capacity: capacity)
         let bookmark = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
         return try store.locked {
@@ -234,6 +250,15 @@ public final class Engine: @unchecked Sendable {
     }
     public func setMenuBarMode(_ enabled: Bool) throws { try store.locked { var c = try store.load(); c.menuBarMode = enabled; try store.save(c) } }
     public func backend() throws -> Configuration.Backend { try store.locked { try store.load().backend } }
+    public func fileVerification() throws -> FileVerification { try store.locked { try store.load().fileVerification } }
+    @discardableResult public func setFileVerification(_ policy: FileVerification) throws -> FileVerification {
+        try store.locked {
+            var config = try store.load(); config.fileVerification = policy; try store.save(config)
+            let saved = try store.load().fileVerification
+            guard saved == policy else { throw NestError("File verification preference could not be verified.", code: 6) }
+            return saved
+        }
+    }
     @discardableResult public func setBackend(_ backend: Configuration.Backend) throws -> Configuration.Backend {
         try store.locked {
             var config = try store.load(); config.backend = backend
@@ -254,6 +279,7 @@ public final class Engine: @unchecked Sendable {
     }
     private func requireLive(_ folder: Folder, _ j: Journal, allowUnpublished: Bool = false) throws -> HelperStatus {
         let status = try session.status(j, folder.id)
+        if let socket = j.socket { try HelperFileVerification.verify(j) { try session.request(socket, $0) } }
         if allowUnpublished, !j.populationVerified, let layout = j.fsKitLink {
             _ = try FSKitLinks.parent(layout, folder: folder, root: session.fsKitMountRoot)
             _ = try FSKitLinks.root(layout)
@@ -281,7 +307,7 @@ public final class Engine: @unchecked Sendable {
     func helperArguments(_ folder: Folder, journal: Journal, source: URL) throws -> [String] {
         guard let backend = journal.backend, let socket = journal.socket else { throw NestError("Missing prepared session backend or socket.", code: 6) }
         if let layout = journal.fsKitLink { _ = try FSKitLinks.parent(layout, folder: folder, root: session.fsKitMountRoot); _ = try FSKitLinks.root(layout) }
-        return ["--id", folder.id.uuidString, "--volume", try store.volume(folder.id).path, "--mount", journal.fsKitLink?.mountPath ?? folder.path, "--source", source.path, "--size", String(folder.capacity), "--socket", socket, "--cli", cli.path, "--store", store.root.path, "--nobrowse", String(folder.options.nobrowse), "--compression", String(folder.options.compression), "--backend", backend.rawValue]
+        return ["--id", folder.id.uuidString, "--volume", try store.volume(folder.id).path, "--mount", journal.fsKitLink?.mountPath ?? folder.path, "--source", source.path, "--size", String(folder.capacity), "--socket", socket, "--cli", cli.path, "--store", store.root.path, "--nobrowse", String(folder.options.nobrowse), "--compression", String(folder.options.compression), "--backend", backend.rawValue] + (journal.fileVerification == .sha256 ? [] : ["--file-verification", journal.fileVerification.rawValue])
     }
     public func mount(_ ref: String) throws {
         try volumeTransaction(ref) { current in
@@ -290,7 +316,7 @@ public final class Engine: @unchecked Sendable {
                 guard j.populationVerified, j.phase == .mounted else { throw NestError("A guarded mount needs recovery; eject it before restoring the initial snapshot.", code: 6) }
                 if !status.active {
                     guard let revision = j.initialRevision else { throw NestError("Missing verified population revision.", code: 6) }
-                    let (_, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision)
+                    let (_, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
                     guard try Snapshot.manifest(URL(fileURLWithPath: j.fsKitLink?.mountPath ?? f.path), matching: expected).matchesExpected(expected) else { throw NestError("Guarded mount changed. Recovery required.", code: 6) }
                     if let layout = j.fsKitLink {
                         let parent = try FSKitLinks.parent(layout, folder: f, root: session.fsKitMountRoot)
@@ -328,6 +354,7 @@ public final class Engine: @unchecked Sendable {
             SnapshotRetention.remember(&j)
             j.restoreRevision = nil
             j.phase = .preparing; j.lastError = nil; j.session = UUID(); j.backend = config.backend; j.mountedDevice = nil; j.populationVerified = false; j.initialRevision = nil; j.initialSourceManifest = nil; j.restoreStage = nil; j.restoreManifest = nil; j.restoredEntries = []; j.evacuatedEntries = []
+            j.fileVerification = config.fileVerification
             j.startupProtocol = nil; j.startupHelperPID = nil; j.startupRetired = nil
             j.originalRename = nil; j.publicationRename = nil
             j.fsKitLink = nil
@@ -341,14 +368,15 @@ public final class Engine: @unchecked Sendable {
             var guardedStartup = false
             var startupPID: Int32?
             do {
-                let sourceBefore = try VerifiedRenameReceipt.observe(URL(fileURLWithPath: f.path))
+                try HelperFileVerification.negotiate(j.fileVerification) { try Control.run(helper.path, ["--verification-capabilities"]) }
+                let sourceBefore = try VerifiedRenameReceipt.observe(URL(fileURLWithPath: f.path), verification: j.fileVerification)
                 let originalObservation = sourceBefore.manifest
-                let revision = try Snapshot.capture(store: store, folder: f, source: URL(fileURLWithPath: f.path), previous: j.revision)
-                guard try Snapshot.manifest(URL(fileURLWithPath: f.path)) == originalObservation,
-                      try VerifiedRenameReceipt.observe(URL(fileURLWithPath: f.path)) == sourceBefore else { throw NestError("Original source changed during capture; originals retained.", code: 6) }
+                let revision = try Snapshot.capture(store: store, folder: f, source: URL(fileURLWithPath: f.path), previous: j.revision, verification: j.fileVerification)
+                guard try Snapshot.manifest(URL(fileURLWithPath: f.path), matching: originalObservation) == originalObservation,
+                      try VerifiedRenameReceipt.observe(URL(fileURLWithPath: f.path), matching: originalObservation) == sourceBefore else { throw NestError("Original source changed during capture; originals retained.", code: 6) }
                 j.initialSourceManifest = originalObservation
                 j.priorRevision = j.revision; j.revision = revision; j.nativeGeneration = nil; j.quiescedRevision = nil; j.initialRevision = revision; try store.write(j, for: f.id)
-                let (data, manifest) = try Snapshot.verified(store: store, id: f.id, revision: revision)
+                let (data, manifest) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
                 // The disk representation must be understood BEFORE any original
                 // namespace is evacuated. This query never mounts/starts a server.
                 let storage = try Snapshot.storedMetadata(data)
@@ -356,6 +384,7 @@ public final class Engine: @unchecked Sendable {
                     guard try Control.run(helper.path,["--storage-capabilities"]).trimmingCharacters(in:.whitespacesAndNewlines) == "private-storage-v2" else { throw NestError("Helper does not support private snapshot storage format 2. Originals retained.", code: 6) }
                 }
                 guardedStartup = try GuardedPopulationStartup.negotiate { try Control.run(helper.path, ["--startup-capabilities"]) }
+                guard j.fileVerification == .sha256 || guardedStartup else { throw NestError("Size/mtime verification requires a helper with guarded policy negotiation. Originals retained.", code: 6) }
                 guard j.fsKitLink == nil || guardedStartup else { throw NestError("Internal FSKit layout requires guarded pre-mount population. Originals retained.", code: 6) }
                 let (sourceHandle,original) = try evacuateOriginal(f,journal:&j,expected:j.initialSourceManifest ?? manifest, sourceBefore: sourceBefore)
                 j.phase = .mounting
@@ -371,6 +400,7 @@ public final class Engine: @unchecked Sendable {
                 try GuardedPopulationStartup.populate(enabled: guardedStartup, digest: storage?.modeMapDigest, controlReady: {
                     startupPID = try self.waitForGuardedControl(j, id: f.id)
                     j.startupHelperPID = startupPID
+                    try HelperFileVerification.verify(j) { try self.session.request(socket, $0) }
                     try self.store.write(j, for: f.id)
                 }, request: { command in
                     if guardedStartup {
@@ -459,7 +489,7 @@ public final class Engine: @unchecked Sendable {
         let sourceHandle = try DirectoryHandle.open(URL(fileURLWithPath:f.path));try sourceHandle.verify(f)
         let names = try sourceHandle.names()
         j.evacuatedEntries = names; j.phase = .evacuated; try store.write(j, for: f.id)
-        guard try Snapshot.manifest(URL(fileURLWithPath: f.path)) == expected else { throw NestError("Source changed before evacuation.", code: 6) }
+        guard try Snapshot.manifest(URL(fileURLWithPath: f.path), matching: expected) == expected else { throw NestError("Source changed before evacuation.", code: 6) }
         var receipt = try VerifiedRenameReceipt(operation: .evacuation, folder: f, journal: j,
             source: URL(fileURLWithPath: f.path), destination: originalHandle)
         guard receipt.before.manifest == expected, receipt.names == names else { throw VerifiedRenameReceipt.failure(".", "source changed before rename intent") }
@@ -481,14 +511,14 @@ public final class Engine: @unchecked Sendable {
         try Paths.checkedIdentity(f)
         guard try DirectoryHandle.open(original).identity() == originalHandle.identity() else { throw VerifiedRenameReceipt.failure(".", "holding path replaced") }
         if let name = try sourceHandle.names().first { throw VerifiedRenameReceipt.failure(name, "new source entry") }
-        guard try Snapshot.manifest(URL(fileURLWithPath: f.path)).publicRoot == expected.publicRoot else { throw VerifiedRenameReceipt.failure(".", "selected root metadata changed") }
+        guard try Snapshot.manifest(URL(fileURLWithPath: f.path), matching: expected).publicRoot == expected.publicRoot else { throw VerifiedRenameReceipt.failure(".", "selected root metadata changed") }
         var selectedStat = stat()
         guard fstat(sourceHandle.fd, &selectedStat) == 0, let rootBefore = receipt.before.nodes.first,
               selectedStat.st_uid == rootBefore.owner, selectedStat.st_gid == rootBefore.group else { throw VerifiedRenameReceipt.failure(".", "selected root owner changed") }
         try receipt.complete(at: original)
         try Paths.checkedIdentity(f)
         if let name = try sourceHandle.names().first { throw VerifiedRenameReceipt.failure(name, "new source entry after readback") }
-        guard try Snapshot.manifest(URL(fileURLWithPath: f.path)).publicRoot == expected.publicRoot else { throw VerifiedRenameReceipt.failure(".", "selected root metadata changed after readback") }
+        guard try Snapshot.manifest(URL(fileURLWithPath: f.path), matching: expected).publicRoot == expected.publicRoot else { throw VerifiedRenameReceipt.failure(".", "selected root metadata changed after readback") }
         j.originalRename = receipt; try store.write(j, for: f.id)
         return (sourceHandle,original)
     }
@@ -591,7 +621,7 @@ public final class Engine: @unchecked Sendable {
             guard j.originalRename == nil, j.publicationRename == nil, j.evacuation == nil, j.evacuatedEntries.isEmpty else { throw VerifiedRenameReceipt.failure(".", "missing initial revision; recovery requires review") }
             j.phase = .idle; try store.write(j, for: f.id); return
         }
-        let (_, snapshotExpected) = try Snapshot.verified(store: store, id: f.id, revision: revision)
+        let (_, snapshotExpected) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
         let expected = j.initialSourceManifest ?? snapshotExpected
         let selectedHandle = try DirectoryHandle.open(URL(fileURLWithPath: f.path)); try selectedHandle.verify(f)
         let selectedURL = URL(fileURLWithPath: f.path)
@@ -697,6 +727,7 @@ public final class Engine: @unchecked Sendable {
     @discardableResult private func exportRAM(_ f: Folder, _ committed: inout Journal, quiesce: Bool) throws -> String {
         var j = committed
         guard let socket = j.socket else { throw NestError("No helper session.", code: 2) }
+        try HelperFileVerification.verify(j) { try session.request(socket, $0) }
         let stage = try store.volume(f.id).appendingPathComponent("stage-\(UUID().uuidString)")
         let capabilities = (try? session.request(socket, "capabilities")) ?? []
         let supportsIncremental = capabilities.contains("incremental-v1")
@@ -707,14 +738,15 @@ public final class Engine: @unchecked Sendable {
         var previous: URL?
         if privateStorage, exclusionAware, supportsIncremental, let revision = j.revision, j.nativeGeneration != nil {
             let candidate = try Snapshot.dataURL(store:store,id:f.id,revision:revision)
-            let format = try Snapshot.storedMetadata(candidate)?.storageFormat
+            let metadata = try Snapshot.storedMetadata(candidate)
+            let format = metadata?.storageFormat
             // Old helpers always perform an ordinary full export. Do not even
             // read incompatible prior payloads: a damaged/restrictive old prior
             // must not prevent a fresh verified capture of authoritative RAM.
             // New helpers authenticate a compatible prior before reuse; unknown
             // discriminators fail above. Old helpers never receive/read a prior.
-            if format == 2 {
-                previous = try Snapshot.verified(store:store,id:f.id,revision:revision).0
+            if format == 2, metadata?.fileVerification == j.fileVerification {
+                previous = try Snapshot.verified(store:store,id:f.id,revision:revision,verification:j.fileVerification).0
             }
         }
         let verb = quiesce ? (privateStorage ? "quiesce3" : supportsIncremental ? "quiesce2" : "quiesce") : (privateStorage ? "export3" : supportsIncremental ? "export2" : "export")
@@ -734,7 +766,7 @@ public final class Engine: @unchecked Sendable {
                     // Full old metadata/map integrity was checked before reuse.
                     // The native receipt binds its included view, while an old
                     // committed full map remains immutable on disk.
-                    let (_,priorView) = try Snapshot.verified(store:store,id:f.id,revision:revision)
+                    let (_,priorView) = try Snapshot.verified(store:store,id:f.id,revision:revision,verification:j.fileVerification)
                     guard try Snapshot.digest(StorageModes(priorView).encoded) == response[5] else { throw NestError("Native no-op original logical-mode receipt mismatch.", code: 6) }
                 }
                 j.nativeGeneration = response[0]
@@ -745,7 +777,7 @@ public final class Engine: @unchecked Sendable {
                 try store.write(j, for: f.id); committed = j; return revision
             }
         }
-        let revision = try Snapshot.adoptExport(store: store, folder: f, stage: stage, privateStorage:privateStorage,modeMapDigest:privateStorage ? response[5] : nil)
+        let revision = try Snapshot.adoptExport(store: store, folder: f, stage: stage, privateStorage:privateStorage,modeMapDigest:privateStorage ? response[5] : nil,verification:j.fileVerification)
         j.nativeGeneration = supportsIncremental ? response[0] : nil
         j.quiescedRevision = quiesce ? revision : nil
         if quiesce { try recordQuiesceIdentity(f, journal: &j, response: supportsIncremental ? response : []) }
@@ -866,7 +898,7 @@ public final class Engine: @unchecked Sendable {
                             if try !validQuiesceReceipt(j, live: live) {
                                 _ = try exportRAM(f, &j, quiesce: true)
                             } else if let revision = j.quiescedRevision {
-                                _ = try Snapshot.verified(store: store, id: f.id, revision: revision)
+                                _ = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
                             }
                             j.restoreRevision = j.revision
                         } else { j.restoreRevision = j.initialRevision }
@@ -884,7 +916,7 @@ public final class Engine: @unchecked Sendable {
         if j.fsKitLink != nil { try restoreLinkedOriginal(f, journal: &j, temporary: false); return }
         try Paths.checkedIdentity(f)
         guard let revision = j.restoreRevision ?? j.revision else { throw NestError("No committed snapshot. Export originals instead.", code: 6) }
-        let (source, authenticated) = try Snapshot.verified(store: store, id: f.id, revision: revision)
+        let (source, authenticated) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
         let original = try Snapshot.materializationManifest(source,expected:authenticated,context:.managedRevision)
         if let receipt = j.publicationRename {
             try receipt.bound(to: f, journal: j, operation: .publication)
@@ -1202,7 +1234,7 @@ public final class Engine: @unchecked Sendable {
                 _ = try session.request(j.socket!, "resize\t\(capacity)")
             } else {
                 guard j.phase == .idle else { throw NestError("Recover the session before resizing.", code: 6) }
-                guard try Snapshot.manifest(URL(fileURLWithPath: f.path)).allocatedEstimate <= capacity else { throw NestError("Cannot shrink below folder contents.", code: 6) }
+                guard try Snapshot.manifest(URL(fileURLWithPath: f.path), verification: fileVerification()).allocatedEstimate <= capacity else { throw NestError("Cannot shrink below folder contents.", code: 6) }
             }
             f.capacity = capacity
             try store.locked {
@@ -1331,7 +1363,7 @@ public final class Engine: @unchecked Sendable {
         if layout.stage != .publishing {
             let revision = useOriginal ? j.initialRevision : (j.restoreRevision ?? j.revision)
             guard let revision else { throw NestError("Missing verified restore revision; backup and RAM retained.", code: 6) }
-            let (source, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision)
+            let (source, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
             j.restoreRevision = revision
             if useOriginal {
                 try layout.source.verify(FSKitLinks.holding(layout, parent: parent).child("data"))
@@ -1430,7 +1462,7 @@ public final class Engine: @unchecked Sendable {
         }
         try restored.verify(parent.child(selected.lastPathComponent))
         if let revision = j.restoreRevision {
-            let (_, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision)
+            let (_, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
             let publicationExpected = j.restoreManifest ?? expected
             let bound = j.restoreManifest == nil ? true : try publicationExpected.matchesCopy(of: Snapshot.materializationManifest(try Snapshot.dataURL(store: store, id: f.id, revision: revision), expected: expected, context: .managedRevision))
             guard bound, try Snapshot.manifest(selected, matching: publicationExpected).matchesExpected(publicationExpected) else { throw NestError("Published restore readback failed; backup and RAM retained.", code: 6) }
@@ -1450,7 +1482,7 @@ public final class Engine: @unchecked Sendable {
             _ = try receipt.verify(at: selected)
         }
         if let revision = j.restoreRevision {
-            let (_, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision)
+            let (_, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
             let publicationExpected = j.restoreManifest ?? expected
             let bound = j.restoreManifest == nil ? true : try publicationExpected.matchesCopy(of: Snapshot.materializationManifest(try Snapshot.dataURL(store: store, id: f.id, revision: revision), expected: expected, context: .managedRevision))
             guard bound, try Snapshot.manifest(selected, matching: publicationExpected).matchesExpected(publicationExpected) else { throw NestError("Restored directory changed before configuration commit; retained.", code: 6) }

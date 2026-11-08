@@ -83,6 +83,18 @@ int main(){
         }else{assert(beginReply=="ERR\t16"&&periodReply=="OK");}
         assert(command("period\t0")=="OK");
     }
+    for(bool compression:{false,true}){
+        tree=std::make_unique<MemoryFS>(32*1024*1024,compression,FileVerification::sizeAndModTime);profileCompression=compression;
+        assert(command("profile-begin\t"+token+"\twrite").starts_with("OK\t{"));
+        assert(!tree->create("/weak-owned",S_IFREG|0600));
+        assert(tree->write("/weak-owned",input.data(),input.size(),0)==65536);
+        assert(tree->read("/weak-owned",output.data(),output.size(),0)==65536&&input==output);
+        assert(!tree->truncate("/weak-owned",31));
+        auto weak=command("profile-end\t"+token+"\twrite");
+        assert(weak.find("\"integrityAlgorithm\":\"sizeAndModTime\"")!=std::string::npos);
+        assert(weak.find("\"id\":\"sha256\",\"calls\":0,\"ns\":0,\"requested\":0")!=std::string::npos);
+        assert(command("profile-release\t"+token+"\twrite")=="OK\t"+token);
+    }
 #else
     assert(command("capabilities").find("debug-io-profile-v2")==std::string::npos);
     assert(command("profile-begin\t"+token+"\twrite")=="ERR\t22");

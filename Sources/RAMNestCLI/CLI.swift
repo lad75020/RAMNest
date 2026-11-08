@@ -23,6 +23,7 @@ import RAMNestCore
       recover REF
       export REF DESTINATION [--revision UUID] [--live]
       busy REF
+      file-verification [sha256|sizeAndModTime]
       install-cli DIRECTORY
     REF is a name, original path, UUID, or ram://percent-encoded-name.
     create uses an existing directory; defaults: sync/nobrowse/startup on,
@@ -71,6 +72,14 @@ import RAMNestCore
             }
             let engine = Engine(store: try StoreLocation().open(explicitRoot: root))
             switch command {
+            case "file-verification":
+                guard positional.count <= 1 else { throw NestError("file-verification accepts one policy.", code: 64) }
+                if let raw = positional.first {
+                    guard let policy = FileVerification(rawValue: raw) else { throw NestError("Unknown file verification policy.", code: 64) }
+                    _ = try engine.setFileVerification(policy)
+                }
+                let policy = try engine.fileVerification()
+                if json { try output(policy) } else { print("\(policy.rawValue) (next mount; existing sessions and revisions retain their policy)") }
             case "list", "ls":
                 try require(0)
                 let statuses = try engine.statuses().filter { flags.contains("--all") || flags.contains("-a") || $0.mounted }

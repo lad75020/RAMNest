@@ -7,6 +7,11 @@ public struct NestError: Error, LocalizedError, Sendable {
     public var errorDescription: String? { message }
 }
 public enum Comparison: String, Codable, CaseIterable, Sendable { case sizeAndModTime, checksum }
+// Immutable per-session/revision authority, independent of incremental selection.
+public enum FileVerification: String, Codable, CaseIterable, Sendable {
+    case sha256, sizeAndModTime
+    public var displayName: String { self == .sha256 ? "SHA-256" : "Size and modification time" }
+}
 public struct FolderOptions: Codable, Equatable, Sendable {
     public var compression = true
     public var mountAtLaunch = true
@@ -36,6 +41,7 @@ public struct Journal: Codable, Equatable, Sendable {
     public var phase = Phase.idle
     public var session: UUID?
     public var backend: Configuration.Backend?
+    public var fileVerification = FileVerification.sha256
     public var socket: String?
     public var initialRevision: String?
     public var revision: String?
@@ -79,7 +85,7 @@ public struct Journal: Codable, Equatable, Sendable {
     public var updated = Date()
     public init() {}
     private enum CodingKeys: String, CodingKey {
-        case phase, session, backend, socket, initialRevision, revision, priorRevision
+        case phase, session, backend, fileVerification, socket, initialRevision, revision, priorRevision
         case nativeGeneration, quiescedRevision, quiescedSession, quiescedHelperPID, quiescedNativeInstance
         case retiringRevisions, cleanupWarning, siblingCleanup, evacuation, evacuationDevice, evacuationInode
         case evacuatedEntries, restoredEntries, initialSourceManifest, restoreManifest, restoreRevision, restoreStage, restoreStageDevice, restoreStageInode
@@ -89,6 +95,7 @@ public struct Journal: Codable, Equatable, Sendable {
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        fileVerification = values.contains(.fileVerification) ? try values.decode(FileVerification.self, forKey: .fileVerification) : .sha256
         // Validate the wire discriminator before any recovery branch can see a
         // nil protocol. Explicit null is not an old journal; nor is a partial
         // startup record, even if its remaining startup values are null.
@@ -145,6 +152,9 @@ public struct Journal: Codable, Equatable, Sendable {
             throw NestError("Invalid publication rename operation; retained.", code: 6)
         }
         restoreManifest = values.contains(.restoreManifest) ? try values.decode(Manifest.self, forKey: .restoreManifest) : nil
+        for manifest in [initialSourceManifest, restoreManifest, originalRename?.before.manifest, publicationRename?.before.manifest].compactMap({ $0 }) {
+            guard manifest.fileVerification == fileVerification else { throw NestError("Journal file verification policy disagrees with transaction authority; retained.", code: 6) }
+        }
         restoreStage = try values.decodeIfPresent(String.self, forKey: .restoreStage)
         restoreStageDevice = try values.decodeIfPresent(UInt64.self, forKey: .restoreStageDevice)
         restoreStageInode = try values.decodeIfPresent(UInt64.self, forKey: .restoreStageInode)
@@ -226,8 +236,9 @@ public struct Configuration: Codable, Sendable {
     public var menuBarMode = false
     public var folders: [Folder] = []
     public var backend = Backend.nfs
+    public var fileVerification = FileVerification.sha256
     public init() {}
-    private enum CodingKeys: String, CodingKey { case version, menuBarMode, folders, backend }
+    private enum CodingKeys: String, CodingKey { case version, menuBarMode, folders, backend, fileVerification }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         version = try values.decode(Int.self, forKey: .version)
@@ -235,6 +246,7 @@ public struct Configuration: Codable, Sendable {
         folders = try values.decode([Folder].self, forKey: .folders)
         // Only absence means legacy NFS. Explicit null and invalid values fail.
         backend = values.contains(.backend) ? try values.decode(Backend.self, forKey: .backend) : .nfs
+        fileVerification = values.contains(.fileVerification) ? try values.decode(FileVerification.self, forKey: .fileVerification) : .sha256
     }
 }
 public struct FolderStatus: Codable, Identifiable, Sendable {

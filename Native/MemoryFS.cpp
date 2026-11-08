@@ -116,18 +116,19 @@ int MappedPage::encode(const char*source,bool enabled,std::shared_ptr<Accounting
 #ifdef RAMNEST_DEBUG_PROFILING
     {ramnest::profile::Scope kind(compressed?profile::Metric::compressed_block:profile::Metric::raw_block,pageSize);kind.result(int64_t(payload));}
 #endif
-    {ioCopy(bytes,compressed?static_cast<const void*>(workspace.encoded.data()):static_cast<const void*>(source),payload);}strongChecksum=strongHash(source);return 0;
+    {ioCopy(bytes,compressed?static_cast<const void*>(workspace.encoded.data()):static_cast<const void*>(source),payload);}
+    strongChecksum=fileVerification==FileVerification::sha256?strongHash(source):std::array<unsigned char,32>{};return 0;
 }catch(const std::bad_alloc&){if(bytes&&!storage){munmap(bytes,mapped);bytes=nullptr;}return -ENOMEM;}
 Backing::~Backing(){if(bytes)munmap(bytes,mapped);if(accounting){std::lock_guard g(accounting->mutex);accounting->payload.fetch_sub(payload);accounting->mapped.fetch_sub(mapped);accounting->backingLive--;}}
 int MappedPage::decode(char*dest)const{
     if(!bytes||payload==0||payload>mapped||mapped>pageSize)return -EIO;
     if(compressed){RN_PROFILE_BYTES(profileCodec,lz4_decode,payload);auto result=compression_decode_buffer(reinterpret_cast<uint8_t*>(dest),pageSize,reinterpret_cast<const uint8_t*>(bytes),payload,nullptr,COMPRESSION_LZ4);RN_PROFILE_RESULT(profileCodec,result==pageSize?int64_t(result):-EIO);if(result!=pageSize)return -EIO;}
     else{if(payload!=pageSize)return -EIO;ioCopy(dest,bytes,pageSize);}
-    return strongHash(dest)==strongChecksum?0:-EIO;
+    return fileVerification!=FileVerification::sha256||strongHash(dest)==strongChecksum?0:-EIO;
 }
 int MappedPage::verifyRaw()const{
     if(!bytes||compressed||payload!=pageSize||mapped!=pageSize)return -EIO;
-    return strongHash(bytes)==strongChecksum?0:-EIO;
+    return fileVerification!=FileVerification::sha256||strongHash(bytes)==strongChecksum?0:-EIO;
 }
 int MappedPage::readSlice(char* dest,size_t offset,size_t count)const{
     if(offset>pageSize||count>pageSize-offset)return -EIO;
@@ -164,7 +165,7 @@ static uint64_t backingBudget(uint64_t capacity){
     const uint64_t extra=std::min(capacity,uint64_t(64*1024*1024))+4*1024*1024;
     return capacity>UINT64_MAX-extra?UINT64_MAX:capacity+extra;
 }
-MemoryFS::MemoryFS(uint64_t bytes,bool compressionEnabled):capacity(bytes),compression(compressionEnabled){accounting->mappedLimit=backingBudget(bytes);root=make(S_IFDIR|0755);}
+MemoryFS::MemoryFS(uint64_t bytes,bool compressionEnabled,FileVerification verification):capacity(bytes),compression(compressionEnabled),fileVerification(verification){accounting->mappedLimit=backingBudget(bytes);root=make(S_IFDIR|0755);}
 std::shared_ptr<Node> MemoryFS::make(mode_t mode){
     if(nodes.size()>=std::max(uint64_t(1024),accounting->live.load()*2))nodes.erase(std::remove_if(nodes.begin(),nodes.end(),[](auto& w){return w.expired();}),nodes.end());
     if(accounting->live.load()>=100000) throw std::bad_alloc();
@@ -318,14 +319,14 @@ int MemoryFS::stageWrite(const IoCapture& capture,const char*b,size_t count,std:
     for(size_t done=0;done<count;){auto pos=uint64_t(capture.offset)+done,index=pos/pageSize;auto length=std::min(count-done,size_t(pageSize-pos%pageSize));
         const auto& old=capture.blocks[index-capture.first];const char* source=nullptr;
         if(pos%pageSize==0&&length==pageSize){
-            // Full replacement still checks old corruption, including zero writes.
+            // Validate the old page under its bound policy, including zero writes.
             if(old.bytes){int e=old.compressed?old.decode(workspace.decodeBuffer()):old.verifyRaw();if(e)return e;}
             source=b+done;
         }else{
             auto decoded=workspace.decodeBuffer();if(old.bytes){int e=old.decode(decoded);if(e)return e;}else ioZero(decoded,pageSize);
             ioCopy(decoded+pos%pageSize,b+done,length);source=decoded;
         }
-        MappedPage block;if(std::any_of(source,source+pageSize,[](char c){return c!=0;})){int e=block.encode(source,compression,accounting);if(e)return e;}
+        MappedPage block(fileVerification);if(std::any_of(source,source+pageSize,[](char c){return c!=0;})){int e=block.encode(source,compression,accounting);if(e)return e;}
         if(RN_IO_FAIL())throw std::bad_alloc();staged.emplace(index,std::move(block));done+=length;
     }return 0;
 }catch(const std::bad_alloc&){return -ENOMEM;}
@@ -350,7 +351,7 @@ int MemoryFS::writeSerializedUnlocked(const std::string&p,const char*b,size_t co
     return commitWriteUnlocked(capture.identity.lock(),capture.offset,count,staged);
 }
 static bool samePage(const MappedPage&a,const MappedPage&b){
-    return a.storage==b.storage&&a.bytes==b.bytes&&a.mapped==b.mapped&&a.payload==b.payload&&a.compressed==b.compressed&&a.strongChecksum==b.strongChecksum;
+    return a.storage==b.storage&&a.bytes==b.bytes&&a.mapped==b.mapped&&a.payload==b.payload&&a.compressed==b.compressed&&a.verificationPolicy()==b.verificationPolicy()&&(a.verificationPolicy()!=FileVerification::sha256||a.strongChecksum==b.strongChecksum);
 }
 int MemoryFS::write(const std::string&p,const char*b,size_t count,int64_t off,uint64_t h){
     RN_PROFILE_BYTES(profileNative,native_write,count);RN_IO_SCOPE();
@@ -382,9 +383,10 @@ int MemoryFS::write(const std::string&p,const char*b,size_t count,int64_t off,ui
     RN_PROFILE_RETURN(profileNative,-EIO); // bounded loop always returns at fallback
 }
 int MemoryFS::truncate(const std::string&p,int64_t size,uint64_t h){
+    RN_IO_SCOPE();
     std::lock_guard g(mutex);if(frozen)return -EBUSY;if(size<0)return -EINVAL;auto n=file(p,h);NodeChange accountGuard{n};if(!n)return h?-EBADF:-ENOENT;if(h&&(handleFlags[h]&O_ACCMODE)==O_RDONLY)return -EBADF;if(n->flags&(UF_IMMUTABLE|UF_APPEND))return -EPERM;if(!S_ISREG(n->mode))return -EISDIR;
     uint64_t keep=(uint64_t(size)+pageSize-1)/pageSize;
-    if(size<n->size&&size%pageSize){auto i=n->pages.find(uint64_t(size)/pageSize);if(i!=n->pages.end()){try{auto decoded=workspace.decodeBuffer();int e=i->second.decode(decoded);if(e)return e;memset(decoded+size%pageSize,0,pageSize-size%pageSize);MappedPage replacement;e=replacement.encode(decoded,compression,accounting);if(e)return e;n->payloadBytes+=replacement.payload-i->second.payload;n->mappedBytes+=replacement.mapped-i->second.mapped;if(std::any_of(decoded,decoded+pageSize,[](char c){return c!=0;}))i->second=std::move(replacement);
+    if(size<n->size&&size%pageSize){auto i=n->pages.find(uint64_t(size)/pageSize);if(i!=n->pages.end()){try{auto decoded=workspace.decodeBuffer();int e=i->second.decode(decoded);if(e)return e;memset(decoded+size%pageSize,0,pageSize-size%pageSize);MappedPage replacement(fileVerification);e=replacement.encode(decoded,compression,accounting);if(e)return e;n->payloadBytes+=replacement.payload-i->second.payload;n->mappedBytes+=replacement.mapped-i->second.mapped;if(std::any_of(decoded,decoded+pageSize,[](char c){return c!=0;}))i->second=std::move(replacement);
             else{n->payloadBytes-=replacement.payload;n->mappedBytes-=replacement.mapped;n->pages.erase(i);}}catch(const std::bad_alloc&){return -ENOMEM;}}}
     for(auto i=n->pages.lower_bound(keep);i!=n->pages.end();i++){n->payloadBytes-=i->second.payload;n->mappedBytes-=i->second.mapped;}
     n->pages.erase(n->pages.lower_bound(keep),n->pages.end());++n->shapeEpoch;n->size=size;n->mtime=n->ctime=now();changed(n,true);return 0;
@@ -474,6 +476,7 @@ static int supportedSecurity(const fs::path& path){
     return result<0&&errno==EINVAL?0:-ENOTSUP;
 }
 int MemoryFS::importTree(const std::string& path,const std::string& modeDigest){
+    RN_IO_SCOPE();
     std::lock_guard g(mutex);
     try{
         if(modeDigest.empty()&&fs::path(path).filename()=="data"){
@@ -676,8 +679,14 @@ int MemoryFS::exportTree(const std::string&path,bool keepFrozen,const std::strin
         };
         // Independent disk readback covers data in unexpected extents as well as
         // expected pages. Sparse holes cannot conceal injected nonzero content.
-        auto validateData=[&](const std::shared_ptr<Node>&n,int fd)->int{
+        auto validateData=[&](const std::shared_ptr<Node>&n,int fd,bool checkTime=true)->int{
             struct stat st{};if(::fstat(fd,&st))return -errno;if(st.st_size!=n->size||!S_ISREG(st.st_mode))return -ESTALE;
+            // RAM pages and disk readback follow the immutable session policy.
+            // Metadata mode retains structural decode and size/mtime validation.
+            if(fileVerification==FileVerification::sizeAndModTime){
+                if(checkTime&&(st.st_mtimespec.tv_sec!=n->mtime.tv_sec||st.st_mtimespec.tv_nsec!=n->mtime.tv_nsec))return -ESTALE;
+                return 0;
+            }
             std::set<uint64_t> pages;for(auto&[index,_]:n->pages)pages.insert(index);
             int64_t offset=0;bool extents=(st.st_flags&UF_COMPRESSED)==0;
             while(offset<n->size){
@@ -689,7 +698,7 @@ int MemoryFS::exportTree(const std::string&path,bool keepFrozen,const std::strin
                 while(done<count){auto got=::pread(fd,disk.data()+done,count-done,off_t(index*pageSize+done));if(got<0&&errno==EINTR)continue;if(got<=0)return got<0?-errno:-EIO;done+=size_t(got);stats.readback+=size_t(got);advanced();}
                 auto block=n->pages.find(index);
                 if(block==n->pages.end()){if(std::any_of(disk.begin(),disk.end(),[](char c){return c!=0;}))return -EIO;}
-                else if(strongHash(disk.data())!=block->second.strongChecksum)return -EIO;
+                else {stats.fileVerificationSHA256Bytes+=pageSize;if(strongHash(disk.data())!=block->second.strongChecksum)return -EIO;}
             }
             return 0;
         };
@@ -755,7 +764,8 @@ int MemoryFS::exportTree(const std::string&path,bool keepFrozen,const std::strin
             stats.files++;links[n->ino]=dest;newCheckpoint.emplace(n->ino,Checkpoint{n->dataGeneration,n->metadataGeneration,relative});
             int e=0;bool cloned=false;
             auto old=oldCheckpoint.find(n->ino);
-            if(oldRoot.value>=0&&previousGeneration==checkpointGeneration&&old!=oldCheckpoint.end()&&old->second.data==n->dataGeneration){
+            if(oldRoot.value>=0&&previousGeneration==checkpointGeneration&&old!=oldCheckpoint.end()&&old->second.data==n->dataGeneration&&
+               (fileVerification==FileVerification::sha256||old->second.metadata==n->metadataGeneration)){
                 // Old checkpoints can have anchored an included alias inside
                 // excluded Trash. Never open that path or widen its inode.
                 auto components=parts(old->second.path);if(components.size()>1&&std::find(components.begin(),components.end()-1,".Trashes")!=components.end()-1)return -EXDEV;
@@ -788,7 +798,7 @@ int MemoryFS::exportTree(const std::string&path,bool keepFrozen,const std::strin
                 }
             }
             if((!cloned&&::ftruncate(fd.value,n->size))||::fsync(fd.value))return -errno;
-            e=validateData(n,fd.value);if(e)return e;
+            e=validateData(n,fd.value,false);if(e)return e;
         }
         // Metadata is applied postorder while descriptors still permit inode
         // fsync, including mode 000 directories. The enclosing stage is private.
@@ -819,6 +829,10 @@ int MemoryFS::exportTree(const std::string&path,bool keepFrozen,const std::strin
             timespec ts[2]={n->atime,n->mtime};if(::utimensat(AT_FDCWD,dest.c_str(),ts,AT_SYMLINK_NOFOLLOW))return -errno;
             if(::lchflags(dest.c_str(),n->flags))return -errno;
             if(fd.value>=0&&::fsync(fd.value))return -errno;
+            if(fileVerification==FileVerification::sizeAndModTime){
+                struct stat observed{};if(::lstat(dest.c_str(),&observed))return -errno;
+                if(S_ISREG(n->mode)&&(observed.st_size!=n->size||observed.st_mtimespec.tv_sec!=n->mtime.tv_sec||observed.st_mtimespec.tv_nsec!=n->mtime.tv_nsec))return -ESTALE;
+            }
             advanced();
         }
         if(privateStorage){int e=writeStorageModes(path+".modes",modes);if(e)return e;}
