@@ -28,18 +28,32 @@ import RAMNestCore
     var storagePicker: (@MainActor () -> URL?)?
     // Injectable asynchronous read boundary for stale-completion regression tests.
     var refreshRead: (@Sendable (Engine) async throws -> ([FolderStatus], Configuration.Backend))?
+    @Published private(set) var resetting = false
+    @Published private(set) var resetCommitted = false
+    @Published private(set) var resetError: String?
+    private(set) var resetTerminationAllowed = false
+    var resetConfirmation: (@MainActor () -> Bool)?
+    var resetRelaunch: (@MainActor () async throws -> Void)?
+    var resetTerminate: (@MainActor () -> Void)?
+    private typealias RefreshResult = ([FolderStatus], Configuration.Backend, FileVerification)
+    private var activeRefreshes: [UUID: Task<RefreshResult, Error>] = [:]
     private var engineGeneration: UInt64 = 0
     private var storageCancellation: StorageMoveCancellation?
     var refreshTask: Task<Void, Never>?
     var selectedStatus: FolderStatus? { statuses.first { $0.id == selected } }
     var dirty: Bool { guard let draft, let selectedStatus else { return false }; return draft != selectedStatus.folder }
     var canMoveSnapshotStorage: Bool {
-        storageManager != nil && engine != nil && !busy && !dirty && storagePending == nil &&
+        storageManager != nil && engine != nil && !busy && !resetCommitted && !dirty && storagePending == nil &&
         statuses.allSatisfy { $0.journal.phase == .idle && !$0.connected && !$0.mounted && $0.helperActive != true }
     }
     init(repository: Store? = nil, storageManager injectedManager: SnapshotStorageManager? = nil,
          storagePicker: (@MainActor () -> URL?)? = nil) {
         self.storagePicker = storagePicker
+        // Isolated model fixtures must explicitly inject lifecycle callbacks.
+        if repository == nil {
+            resetRelaunch = { try await AppRelaunch.open() }
+            resetTerminate = { NSApplication.shared.terminate(nil) }
+        }
         let args = CommandLine.arguments
         let explicit: URL?
         if repository == nil, let i = args.firstIndex(of: "--store"), args.count > i+1 { explicit = URL(fileURLWithPath: args[i+1]) }
@@ -50,6 +64,11 @@ import RAMNestCore
         do {
             if repository == nil, args.last == "--store" { throw NestError("--store requires a directory.", code: 64) }
             let store = try repository ?? (explicit.map { try Store(root: $0) } ?? storageManager!.open())
+            engine = Engine(store: store); snapshotStoragePath = store.root.path
+            if store.resetPending {
+                resetError = "An interrupted RESET needs Retry RESET. Folder operations remain paused."
+                return
+            }
             let config = try store.locked { try store.load() }
             engine = Engine(store: store); menuBarMode = config.menuBarMode; backend = .tmpfs; snapshotStoragePath = store.root.path
             fileVerification = config.fileVerification
@@ -62,37 +81,45 @@ import RAMNestCore
     func start() {
         // Launch belongs to AppDelegate, not view appearance. Reopening a window
         // cannot start another auto-mount pass or a second refresh loop.
-        guard refreshTask == nil else { return }
+        guard refreshTask == nil, !resetting, !resetCommitted, engine?.store.resetPending != true else { return }
         refreshTask = Task { [weak self] in
             guard let self else { return }
             await refresh()
-            if let engine, engineGeneration == 0, !movingStorage, storagePending == nil {
+            if statuses.contains(where: { $0.journal.resetUnmountPending }) {
+                resetError = "An interrupted RESET needs Retry RESET. Automatic mounting remains paused."
+                return
+            }
+            if let engine, engineGeneration == 0, !Task.isCancelled, !resetting, !movingStorage, storagePending == nil {
                 for status in statuses where status.journal.nativeTmpfs != nil && status.mounted && !status.connected && status.journal.phase == .mounted && status.journal.populationVerified {
-                    guard engineGeneration == 0, !movingStorage, storagePending == nil, self.engine === engine else { break }
+                    guard engineGeneration == 0, !Task.isCancelled, !resetting, !movingStorage, storagePending == nil, self.engine === engine else { break }
                     await perform("Reconnecting \(status.folder.name)…") { try engine.reconnect(status.id.uuidString) }
                 }
                 let unclean = statuses.contains { !$0.connected && $0.journal.phase != .idle }
                 if unclean { error = "A previous session did not finish cleanly. Automatic mounting is paused. Recover or export each affected folder first." }
                 else {
                     for status in statuses where !status.mounted && status.journal.phase == .idle && status.folder.options.mountAtLaunch {
-                        guard engineGeneration == 0, !movingStorage, storagePending == nil, self.engine === engine else { break }
+                        guard engineGeneration == 0, !Task.isCancelled, !resetting, !movingStorage, storagePending == nil, self.engine === engine else { break }
                         await perform("Mounting \(status.folder.name)…") { try engine.mount(status.id.uuidString) }
                     }
                 }
             }
-            while !Task.isCancelled { try? await Task.sleep(for: .seconds(2)); if !busy { await refresh() } }
+            while !Task.isCancelled { try? await Task.sleep(for: .seconds(2)); if !Task.isCancelled && !busy && !resetCommitted { await refresh() } }
         }
     }
     func refresh() async {
-        guard !busy, let engine else { return }
+        guard !busy, !resetting, !resetCommitted, let engine, !engine.store.resetPending else { return }
         let generation = engineGeneration, reader = refreshRead
+        let id = UUID()
+        let read = Task.detached { () throws -> RefreshResult in
+            let result: ([FolderStatus], Configuration.Backend)
+            if let reader { result = try await reader(engine) }
+            else { result = (try engine.statuses(), try engine.backend()) }
+            return (result.0, result.1, try engine.fileVerification())
+        }
+        activeRefreshes[id] = read
+        defer { activeRefreshes.removeValue(forKey: id) }
         do {
-            let (current, preference, verification) = try await Task.detached {
-                let result: ([FolderStatus], Configuration.Backend)
-                if let reader { result = try await reader(engine) }
-                else { result = (try engine.statuses(), try engine.backend()) }
-                return (result.0, result.1, try engine.fileVerification())
-            }.value
+            let (current, preference, verification) = try await read.value
             guard !busy, generation == engineGeneration, self.engine === engine else { return }
             let wasDirty = dirty
             statuses = current
@@ -136,14 +163,14 @@ import RAMNestCore
         operation: @escaping @Sendable (StorageMoveCancellation, @Sendable (String) -> Void) throws -> SnapshotStorageState) async {
         // Queued Retry tasks must recheck admission on the main actor, before
         // this operation first suspends. Only one generation owns completion.
-        guard !busy, !dirty else { return }
+        guard !busy, !resetCommitted, !dirty else { return }
         busy = true; movingStorage = true; storageError = nil; engineGeneration &+= 1
         let generation = engineGeneration
         progress = "Preparing snapshot storage move…"
         let cancellation = StorageMoveCancellation(); storageCancellation = cancellation
         let model = self
         do {
-            let state = try await Task.detached(priority: .userInitiated) {
+            let state = try await Task.detached(priority: .userInitiated) { [model] in
                 try operation(cancellation, { message in Task { @MainActor [weak model] in if model?.movingStorage == true && model?.engineGeneration == generation { model?.progress = message } } })
             }.value
             guard generation == engineGeneration, movingStorage else { return }
@@ -167,13 +194,13 @@ import RAMNestCore
         await refresh()
     }
     func perform(_ label: String, operation: @escaping @Sendable () throws -> Void) async {
-        guard !busy else { return }; busy = true; progress = label
+        guard !busy, !resetCommitted, !resetting else { return }; busy = true; progress = label
         do { try await Task.detached(priority: .userInitiated) { try operation() }.value }
         catch { self.error = error.localizedDescription }
         busy = false; progress = ""; await refresh()
     }
     func guarded(_ action: @escaping @MainActor () -> Void) {
-        guard !busy else { return }
+        guard !busy, !resetCommitted, !resetting else { return }
         guard dirty else { action(); return }
         let alert = NSAlert(); alert.messageText = "Save option changes?"; alert.informativeText = "Apply or discard your changes before continuing."
         alert.addButton(withTitle: "Apply"); alert.addButton(withTitle: "Discard"); alert.addButton(withTitle: "Cancel")
@@ -181,6 +208,7 @@ import RAMNestCore
         case .alertFirstButtonReturn:
             guard let edited = draft, let engine else { return }
             Task {
+                guard !busy, !resetCommitted else { return }
                 busy = true; progress = "Applying options…"
                 do { try await Task.detached { try engine.update(edited) }.value; busy = false; await refresh(); action() }
                 catch { busy = false; self.error = error.localizedDescription }
@@ -199,10 +227,13 @@ import RAMNestCore
         guard s.canMount || s.canEject else { return }
         guarded {
             guard let engine = self.engine else { return }
+            let generation = self.engineGeneration
             Task {
+                guard !self.busy, generation == self.engineGeneration else { return }
                 if s.mounted {
                     do {
                         let processes = try await Task.detached { try engine.busyProcesses(s.id.uuidString) }.value
+                        guard !self.busy, generation == self.engineGeneration else { return }
                         if !processes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             let alert = NSAlert(); alert.messageText = "Files are in use"; alert.informativeText = "Close the listed processes to finish their writes, or Ignore to attempt a normal eject. RAMNest will not terminate them.\n\n" + processes
                             alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Ignore")
@@ -267,9 +298,9 @@ import RAMNestCore
         }
     }
     func setMenuMode(_ value: Bool) {
-        guard !busy, let engine else { return }
+        guard !busy, !resetCommitted, let engine else { return }
+        busy = true; progress = "Updating app appearance…"
         Task {
-            busy = true; progress = "Updating app appearance…"
             defer { busy = false; progress = "" }
             do {
                 try await Task.detached { try engine.setMenuBarMode(value) }.value
@@ -278,7 +309,7 @@ import RAMNestCore
         }
     }
     func setFileVerification(_ value: FileVerification) {
-        guard !busy, let engine else { return }
+        guard !busy, !resetCommitted, let engine else { return }
         busy = true; progress = "Saving next mount file verification…"; fileVerificationError = nil
         Task {
             defer { busy = false; progress = "" }
@@ -298,8 +329,62 @@ import RAMNestCore
         }
         return "Next mount: native macOS tmpfs"
     }
+    var resetButtonTitle: String { resetCommitted ? "Retry Restart…" : engine?.store.resetPending == true ? "Retry RESET…" : "RESET RAMNest…" }
+    var canReset: Bool { engine != nil && !busy && !resetting && storagePending == nil }
+    func confirmReset() {
+        guard canReset else { return }
+        let accepted: Bool
+        if let resetConfirmation { accepted = resetConfirmation() }
+        else {
+            let alert = NSAlert(); alert.alertStyle = .critical
+            alert.messageText = resetCommitted ? "Restart RAMNest?" : "RESET RAMNest and delete all snapshots?"
+            alert.informativeText = "All managed RAM folders will be ejected normally. Sync folders save their contents; temporary folders discard RAM changes and restore their originals. All RAM-folder records and saved snapshots, including retained snapshots, will be permanently deleted. Original folders and unrelated drives are preserved. RAMNest then restarts using the selected storage location. Close files first. Any recovery or cleanup error stops reset."
+            alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: resetCommitted ? "Restart" : "RESET and Restart")
+            alert.buttons[0].keyEquivalent = "\r"; alert.buttons[1].keyEquivalent = ""
+            alert.buttons[1].hasDestructiveAction = !resetCommitted
+            accepted = alert.runModal() == .alertSecondButtonReturn
+        }
+        guard accepted else { return }
+        // Admission is synchronous: queued actions cannot slip ahead of reset.
+        busy = true; resetting = true
+        Task { await runReset() }
+    }
+    private func runReset() async {
+        guard let engine else { busy = false; resetting = false; return }
+        resetError = nil; engineGeneration &+= 1
+        refreshTask?.cancel(); refreshTask = nil
+        let reads = Array(activeRefreshes.values)
+        for read in reads { read.cancel() }
+        for read in reads { _ = await read.result }
+        progress = resetCommitted ? "Restarting RAMNest…" : "Ejecting folders and resetting saved state…"
+        do {
+            if !resetCommitted {
+                let location = storageManager?.location
+                try await Task.detached(priority: .userInitiated) { try engine.reset(location: location) }.value
+                // Durable success alone authorizes clearing GUI state.
+                resetCommitted = true; statuses = []; selected = nil; draft = nil
+                showCreate = false; creationPath = nil; error = nil
+            }
+            guard let resetRelaunch, let resetTerminate else { throw NestError("RESET completed. Restart RAMNest manually; no relaunch callback is configured.") }
+            try await resetRelaunch()
+            resetTerminationAllowed = true
+            resetTerminate()
+        } catch { resetError = error.localizedDescription }
+        resetting = false; busy = false; progress = ""
+        // Failed reset leaves polling/startup paused. The existing GUI records
+        // stay visible until a durable retry succeeds or explicit recovery runs.
+    }
+
     func quit() async -> Bool {
+        if resetTerminationAllowed { return true }
+        guard !resetCommitted else { return true }
         guard !busy else { error = "Wait for the current transaction to finish before quitting."; return false }
+        if let engine, engine.store.resetPending {
+            busy = true; progress = "Checking interrupted RESET before quitting…"
+            defer { busy = false; progress = "" }
+            do { return try await Task.detached { try engine.canTerminatePendingReset() }.value }
+            catch { self.error = error.localizedDescription; return false }
+        }
         if dirty {
             let alert = NSAlert(); alert.messageText = "Unapplied option changes"; alert.informativeText = "Return to RAMNest to apply or discard them before quitting."; alert.runModal(); return false
         }
@@ -333,5 +418,45 @@ enum MemoryReading {
         guard result == KERN_SUCCESS else { return 0 }
         let pages = UInt64(info.active_count) + UInt64(info.wire_count) + UInt64(info.compressor_page_count)
         return min(1, Double(pages * UInt64(sysconf(_SC_PAGESIZE))) / Double(ProcessInfo.processInfo.physicalMemory))
+    }
+}
+
+// Launch Services takes an argument array (no shell or detached waiter process).
+// The old app exits only after the new instance is accepted by macOS.
+@MainActor enum AppRelaunch {
+    static func arguments(_ arguments: [String]) -> [String] {
+        Array(arguments.dropFirst()).filter { !$0.hasPrefix("-psn_") }
+    }
+    @MainActor private final class Request {
+        var continuation: CheckedContinuation<Void, Error>?
+        var deadline: Task<Void, Never>?
+        func finish(_ error: Error?) {
+            guard let continuation else { return }
+            self.continuation = nil; deadline?.cancel(); deadline = nil
+            if let error { continuation.resume(throwing: error) }
+            else { continuation.resume() }
+        }
+    }
+    static func open() async throws {
+        let bundle = Bundle.main.bundleURL
+        guard bundle.pathExtension == "app", let executable = Bundle.main.executableURL,
+              FileManager.default.isExecutableFile(atPath: executable.path) else {
+            throw NestError("RESET completed, but this executable is not an app bundle. Restart RAMNest manually.")
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        configuration.arguments = arguments(CommandLine.arguments)
+        let request = Request()
+        try await withCheckedThrowingContinuation { continuation in
+            request.continuation = continuation
+            request.deadline = Task { @MainActor in
+                do { try await Task.sleep(for: .seconds(15)) } catch { return }
+                request.finish(NestError("RESET completed, but macOS did not acknowledge relaunch. Restart manually or retry restart."))
+            }
+            NSWorkspace.shared.openApplication(at: bundle, configuration: configuration) { application, error in
+                let failure = error ?? (application == nil ? NestError("RESET completed, but macOS returned no relaunched app. Retry restart or reopen RAMNest manually.") : nil)
+                Task { @MainActor in request.finish(failure) }
+            }
+        }
     }
 }

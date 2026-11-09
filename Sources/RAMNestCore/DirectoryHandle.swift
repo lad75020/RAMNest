@@ -97,7 +97,7 @@ public final class DirectoryHandle: @unchecked Sendable {
     // Preflight the entire candidate before unlinking anything. The expected
     // namespace comes from its committed manifest; unknown entries are retained.
     // All traversal/unlinking is anchored, no-follow, same-device and same-fsid.
-    func removeCommittedRevision(_ name: String) throws {
+    func removeCommittedRevision(_ name: String, validateOnly: Bool = false) throws {
         let candidate = try entryStat(name)
         let revision = try child(name)
         let device = try identity().device
@@ -211,6 +211,7 @@ public final class DirectoryHandle: @unchecked Sendable {
             }
             return current
         }
+        if validateOnly { return }
         for removal in removals {
             let parent = try removal.parentPath.map { try reopenParent($0) } ?? self
             let now = try parent.entryStat(removal.name)

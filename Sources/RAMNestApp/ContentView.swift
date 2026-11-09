@@ -164,7 +164,8 @@ struct AppSettingsView: View {
     @ViewState<Bool> private var login = SMAppService.mainApp.status == .enabled
     @ViewState<String?> private var loginError: String?
     var body: some View {
-        Form {
+        ScrollView {
+          Form {
             Section("Snapshot storage") {
                 Text(model.snapshotStoragePath.isEmpty ? "Storage unavailable" : model.snapshotStoragePath)
                     .font(.callout.monospaced()).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
@@ -186,6 +187,13 @@ struct AppSettingsView: View {
                 }
                 if let error = model.storageError { Text(error).foregroundStyle(.red).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
             }
+            Section("RESET") {
+                Text("Eject all RAM folders, permanently delete their records and every saved snapshot, then restart RAMNest. Sync folders save first; temporary folders discard RAM changes. Original folders are preserved. The selected storage location stays selected.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Button(model.resetButtonTitle, role: .destructive) { model.confirmReset() }.disabled(!model.canReset)
+                if model.resetting { ProgressView(); Text(model.progress).font(.caption) }
+                if let error = model.resetError { Text(error).foregroundStyle(.red).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
+            }
             LabeledContent("Storage engine", value: "Native macOS tmpfs")
             Text("New sessions use an internal root-owned mount slot and a journal-bound link at the original folder path. Each mount/control operation uses macOS administrator authorization. No permanent privileged service or FUSE dependency is installed. Legacy records retain their original backend for recovery.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Picker("File verification for next mount", selection: Binding(get: { model.fileVerification }, set: { model.setFileVerification($0) })) {
@@ -202,6 +210,7 @@ struct AppSettingsView: View {
             Text("Startup mounting pauses whenever an unfinished session needs recovery.").font(.caption).foregroundStyle(.secondary)
             Button("Install Command Line Tool…") { model.installCLI() }.disabled(model.busy)
             Text("RAMNest has no telemetry, license checks, cloud storage, or automatic updater.").font(.caption).foregroundStyle(.secondary)
-        }.padding(24).frame(width: 460)
+          }.padding(24)
+        }.frame(width: 500, height: 720)
     }
 }

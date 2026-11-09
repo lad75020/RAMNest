@@ -4,6 +4,11 @@ import Darwin
 // A narrow session boundary lets owned fixtures exercise coordinator behavior
 // without mounting a filesystem or launching a native helper.
 struct EngineSession {
+    var deferSnapshotCleanup = false
+    var resetStatuses: (() throws -> [FolderStatus])?
+    var resetUnmount: ((String) throws -> Void)?
+    var resetCheckpoint: ((String) throws -> Void)?
+    var resetAssertAbsent: ((Journal) throws -> Void)?
     var linkedMountRoot: URL = LinkedFolders.legacyRoot
     var beforeVolumeLock: ((UUID) throws -> Void)?
     var beforeCleanupUnlink: ((DirectoryHandle, String) throws -> Void)?
@@ -99,23 +104,25 @@ public final class Engine: @unchecked Sendable {
         self.cli = cli ?? (bundle.pathExtension == "app" ? bundle.appendingPathComponent("Contents/Helpers/ramnest") : binary)
     }
     public func statuses() throws -> [FolderStatus] {
-        let folders = try store.locked { try store.load().folders }
-        return try folders.map { folder in
-                var j = try store.journal(folder.id)
-                if let native = j.nativeTmpfs {
-                    let observed = try? NativeTmpfsControl.observe(j)
-                    let live = try? Control.status(j, id: folder.id)
-                    let mounted = Paths.mounts().contains { $0.path == NativeTmpfsPaths.mount(native.session).path }
-                    if !mounted, j.phase != .idle, j.populationVerified {
-                        j.lastError = native.lossDisclosure ?? "Native tmpfs is absent. Unsaved RAM contents are unavailable. Recover/export uses only the latest committed disk checkpoint."
+        return try store.access {
+            let folders = try store.locked { try store.load().folders }
+            return try folders.map { folder in
+                    var j = try store.journal(folder.id)
+                    if let native = j.nativeTmpfs {
+                        let observed = try? NativeTmpfsControl.observe(j)
+                        let live = try? Control.status(j, id: folder.id)
+                        let mounted = Paths.mounts().contains { $0.path == NativeTmpfsPaths.mount(native.session).path }
+                        if !mounted, j.phase != .idle, j.populationVerified {
+                            j.lastError = native.lossDisclosure ?? "Native tmpfs is absent. Unsaved RAM contents are unavailable. Recover/export uses only the latest committed disk checkpoint."
+                        }
+                        return FolderStatus(folder: folder, journal: j, connected: live?.mounted == true && observed != nil,
+                            mounted: mounted, used: observed?.used ?? 0, nativeCapacityBytes: observed?.capacity, nativeReadOnly: observed?.readOnly,
+                            helperActive: observed?.readOnly == false && live?.mounted == true && mountedIdentity(folder, j))
                     }
-                    return FolderStatus(folder: folder, journal: j, connected: live?.mounted == true && observed != nil,
-                        mounted: mounted, used: observed?.used ?? 0, nativeCapacityBytes: observed?.capacity, nativeReadOnly: observed?.readOnly,
-                        helperActive: observed?.readOnly == false && live?.mounted == true && mountedIdentity(folder, j))
-                }
-                // Public native builds do not reconnect/control a historical FUSE helper.
-                let mounted = Paths.mounts().contains { $0.path == (j.managedLink?.mountPath ?? folder.path) }
-                return FolderStatus(folder: folder, journal: j, connected: false, mounted: mounted, used: 0, helperActive: false)
+                    // Public native builds do not reconnect/control a historical FUSE helper.
+                    let mounted = Paths.mounts().contains { $0.path == (j.managedLink?.mountPath ?? folder.path) }
+                    return FolderStatus(folder: folder, journal: j, connected: false, mounted: mounted, used: 0, helperActive: false)
+            }
         }
     }
     public func folder(_ ref: String) throws -> Folder { try store.locked { try store.resolve(ref, config: store.load()) } }
@@ -147,22 +154,24 @@ public final class Engine: @unchecked Sendable {
         }
     }
     public func create(path: URL, name: String?, capacity: UInt64, options: FolderOptions = .init()) throws -> Folder {
-        try SizeParser.validate(capacity)
-        let url = path.standardizedFileURL
-        let initialConfig = try store.locked { try store.load() }
-        let st = try Paths.validate(url, store: store, folders: initialConfig.folders)
-        let label = (name ?? url.lastPathComponent).trimmingCharacters(in: .whitespacesAndNewlines)
-        try validateName(label, excluding: nil, config: initialConfig)
-        let manifest = try Snapshot.manifest(url, maximumLogical: capacity, verification: initialConfig.fileVerification)
-        try manifest.preflight(capacity: capacity)
-        let bookmark = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
-        return try store.locked {
-            var config = try store.load()
-            let current = try Paths.validate(url, store: store, folders: config.folders)
-            guard current.st_dev == st.st_dev, current.st_ino == st.st_ino else { throw NestError("Selected folder changed during admission.", code: 4) }
-            try validateName(label, excluding: nil, config: config)
-            let f = Folder(name: label, path: url.path, capacity: capacity, device: Paths.deviceID(st.st_dev), inode: UInt64(st.st_ino), bookmark: bookmark, options: options)
-            config.folders.append(f); try store.save(config); try store.write(Journal(), for: f.id); return f
+        return try store.access {
+            try SizeParser.validate(capacity)
+            let url = path.standardizedFileURL
+            let initialConfig = try store.locked { try store.load() }
+            let st = try Paths.validate(url, store: store, folders: initialConfig.folders)
+            let label = (name ?? url.lastPathComponent).trimmingCharacters(in: .whitespacesAndNewlines)
+            try validateName(label, excluding: nil, config: initialConfig)
+            let manifest = try Snapshot.manifest(url, maximumLogical: capacity, verification: initialConfig.fileVerification)
+            try manifest.preflight(capacity: capacity)
+            let bookmark = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+            return try store.locked {
+                var config = try store.load()
+                let current = try Paths.validate(url, store: store, folders: config.folders)
+                guard current.st_dev == st.st_dev, current.st_ino == st.st_ino else { throw NestError("Selected folder changed during admission.", code: 4) }
+                try validateName(label, excluding: nil, config: config)
+                let f = Folder(name: label, path: url.path, capacity: capacity, device: Paths.deviceID(st.st_dev), inode: UInt64(st.st_ino), bookmark: bookmark, options: options)
+                config.folders.append(f); try store.save(config); try store.write(Journal(), for: f.id); return f
+            }
         }
     }
     private func validateName(_ name: String, excluding: UUID?, config: Configuration) throws {
@@ -214,6 +223,7 @@ public final class Engine: @unchecked Sendable {
             mounted: true, used: observed.used, capacity: observed.capacity, active: !observed.readOnly && j.populationVerified)
     }
     func cleanSnapshots(_ folder: Folder, _ journal: inout Journal) {
+        guard !session.deferSnapshotCleanup else { return }
         guard journal.phase == .idle || (journal.phase == .mounted && journal.nativeTmpfs != nil), journal.lastError == nil else { return }
         let pinned = journal
         SnapshotRetention.clean(store: store, folder: folder, journal: &journal, validateSource: {
@@ -1109,5 +1119,130 @@ public final class Engine: @unchecked Sendable {
         else { j.phase = .idle; j.mountedDevice = nil; j.lastError = nil }
         SiblingCleanup.rememberCompleted(f, &j); j.originalRename = nil; j.publicationRename = nil
         try store.write(j, for: f.id)
+    }
+}
+
+extension Engine {
+    /// The deletion receipt proves the managed-unmount boundary was crossed.
+    /// Keep it intact for the next launch; never treat resetPending's fail-closed
+    /// inspection fallback or a pre-unmount journal marker as that proof.
+    public func canTerminatePendingReset() throws -> Bool {
+        try store.access(exclusive: true) {
+            try store.resetAuthority()
+            let directory = try DirectoryHandle.open(store.root)
+            guard try directory.exists(RepositoryReset.receiptName) else { return false }
+            let receipt = try StorageRelocation.read(RepositoryReset.Receipt.self, in: directory, name: RepositoryReset.receiptName)
+            _ = try RepositoryReset.validateReceipt(receipt, store: store)
+            let mounts = Paths.mounts()
+            let config = try receipt.configuration.map { try JSONDecoder().decode(Configuration.self, from: $0) }
+            for folder in config?.folders ?? [] {
+                guard !mounts.contains(where: { $0.path == folder.path || $0.path.hasPrefix(folder.path + "/") }) else {
+                    throw NestError("A managed original path is still mounted; Quit stopped.", code: 7)
+                }
+            }
+            // Cleanup may already have removed some journals. Every remaining
+            // journal must still agree with the receipt's no-live-session state.
+            let volumes = try receipt.volumes.open()
+            for name in try volumes.names() {
+                let volume = try volumes.child(name)
+                if try volume.exists("journal.json") {
+                    try RepositoryReset.idle(volume.readJSON(Journal.self, "journal.json", decoder: store.journalDecoder))
+                }
+            }
+            return true
+        }
+    }
+
+    /// Settings RESET never removes a selected/original folder. Its exclusive
+    /// lease also rejects periodic CLI work queued by a retiring native pin.
+    public func reset(location: StoreLocation? = nil) throws {
+        try store.access(exclusive: true) {
+            try store.resetAuthority()
+            let manager = SnapshotStorageManager(location: location ?? StoreLocation(bootstrapRoot: store.root))
+            let transaction = StorageRelocation.Transaction(manager: manager)
+            let stable = try transaction.stableLock()
+            defer { transaction.release([stable]) }
+            guard try StorageRelocation.readReceipt(at: manager.location.bootstrapRoot) == nil else {
+                throw NestError("Finish the pending storage move/cleanup before RESET.", code: 6)
+            }
+            let directory = try DirectoryHandle.open(store.root)
+            if try directory.exists(RepositoryReset.receiptName) {
+                let receipt = try StorageRelocation.read(RepositoryReset.Receipt.self, in: directory, name: RepositoryReset.receiptName)
+                try RepositoryReset.finish(receipt, store: store, transaction: transaction, checkpoint: session.resetCheckpoint)
+                return
+            }
+            try RepositoryReset.validateNamespace(store: store)
+            // Fail immediately on existing locks, including orphan volume locks.
+            // The exclusive access lease prevents new transactions after release.
+            var locks = [try transaction.lock(directory, "repository.lock", nonblocking: true)]
+            do {
+                let volumes = try directory.child("volumes")
+                for name in try volumes.names() {
+                    guard UUID(uuidString: name)?.uuidString == name else { throw NestError("Unknown volume blocks RESET.", code: 6) }
+                    locks.append(try transaction.lock(volumes.child(name), "transaction.lock", nonblocking: true))
+                }
+            } catch { transaction.release(locks); throw error }
+            transaction.release(locks)
+            let current = try session.resetStatuses?() ?? statuses()
+            let active = Set(current.filter { $0.journal.phase != .idle }.map(\.id))
+            var deferred = Set<UUID>()
+            let volumes = try directory.child("volumes")
+            for name in try volumes.names() where !active.contains(UUID(uuidString: name)!) {
+                let journal = try volumes.child(name).readJSON(Journal.self, "journal.json", decoder: store.journalDecoder)
+                if journal.resetUnmountCompleted { deferred.insert(UUID(uuidString: name)!) }
+                try RepositoryReset.idle(journal, completingUnmount: journal.resetUnmountCompleted,
+                                         assertAbsent: session.resetAssertAbsent ?? NativeTmpfsControl.assertAbsent)
+            }
+            for status in current {
+                if status.journal.phase == .idle {
+                    guard !status.mounted, !status.connected else { throw NestError("Unexpected mount blocks RESET.", code: 6) }
+                } else {
+                    guard status.journal.phase == .mounted, status.journal.lastError == nil, status.journal.cleanupWarning == nil,
+                          status.journal.populationVerified, status.journal.nativeTmpfs != nil,
+                          status.mounted, status.connected, status.helperActive == true else {
+                        throw NestError("\(status.folder.name) needs recovery or has uncertain mount identity. RESET stopped.", code: 6)
+                    }
+                }
+            }
+            var unmountSession = session; unmountSession.deferSnapshotCleanup = true
+            let coordinator = Engine(store: store, helper: helper, cli: cli, session: unmountSession)
+            for status in current where status.journal.phase != .idle {
+                var journal = try store.journal(status.id)
+                guard journal.phase == .mounted, let native = journal.nativeTmpfs,
+                      native.session == status.journal.nativeTmpfs?.session else {
+                    throw NestError("Native session changed before RESET eject; data retained.", code: 6)
+                }
+                journal.resetUnmountSession = native.session
+                try store.write(journal, for: status.id)
+                if let unmount = session.resetUnmount { try unmount(status.id.uuidString) }
+                else { try coordinator.unmount(status.id.uuidString) } // Normal busy checks; no Ignore/force.
+            }
+            try session.resetCheckpoint?("unmounted")
+            // No metadata/snapshot deletion above this boundary. Original holding
+            // cleanup below uses the normal completed-restoration receipt policy.
+            try RepositoryReset.validateNamespace(store: store)
+            for name in try volumes.names() {
+                let journal = try volumes.child(name).readJSON(Journal.self, "journal.json", decoder: store.journalDecoder)
+                if journal.resetUnmountCompleted { deferred.insert(UUID(uuidString: name)!) }
+                try RepositoryReset.idle(journal, completingUnmount: journal.resetUnmountCompleted,
+                                         assertAbsent: session.resetAssertAbsent ?? NativeTmpfsControl.assertAbsent)
+            }
+            for folder in try store.load().folders {
+                try Paths.checkedIdentity(folder)
+            }
+            for folder in try store.load().folders where deferred.contains(folder.id) {
+                var journal = try store.journal(folder.id)
+                cleanSnapshots(folder, &journal)
+                try RepositoryReset.idle(journal, assertAbsent: session.resetAssertAbsent ?? NativeTmpfsControl.assertAbsent)
+            }
+            let receipt = try RepositoryReset.prepare(store: store, transaction: transaction,
+                                                       assertAbsent: session.resetAssertAbsent ?? NativeTmpfsControl.assertAbsent)
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let bytes = try encoder.encode(receipt)
+            guard bytes.count <= 64 << 20 else { throw NestError("RESET inventory exceeds its safe durable bound; data retained.", code: 6) }
+            try transaction.atomic(bytes, directory: directory, name: RepositoryReset.receiptName)
+            try session.resetCheckpoint?("prepared")
+            try RepositoryReset.finish(receipt, store: store, transaction: transaction, checkpoint: session.resetCheckpoint)
+        }
     }
 }

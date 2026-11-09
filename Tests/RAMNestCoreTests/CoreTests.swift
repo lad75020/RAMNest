@@ -169,7 +169,7 @@ extension RAMNestTestSuite {
             #expect((try FileManager.default.attributesOfItem(atPath: parent.path)[.posixPermissions] as? NSNumber) == parentMode)
             #expect(!(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("volumes").path)))
             #expect(!(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("configuration.json").path)))
-            #expect(Set(try DirectoryHandle.open(store.root).names()).isSubset(of: ["repository.lock", "storage-location.lock", "storage-location.json", ".ramnest-retired.json"]))
+            #expect(Set(try DirectoryHandle.open(store.root).names()).isSubset(of: ["repository.lock", RepositoryReset.lockName, "storage-location.lock", "storage-location.json", ".ramnest-retired.json"]))
             #expect(throws: (any Error).self) { try store.save(Configuration()) }
             #expect(throws: (any Error).self) { try store.volume(UUID()) }
             #expect(throws: (any Error).self) { try Store(root: store.root) }
@@ -341,6 +341,10 @@ extension RAMNestTestSuite {
             #expect((try String(contentsOf: unknown, encoding: .utf8)) == "preserve unknown")
             #expect(FileManager.default.fileExists(atPath: reopened.root.appendingPathComponent("volumes").path))
         }
+    }
+
+    struct SettingsResetTests {
+        @Test func `Isolated RESET safety and retries`() throws { try SettingsResetScenarios.run() }
     }
 
     struct RAMNestCoreTests {
@@ -725,5 +729,290 @@ struct Scenarios {
         try check(attempts == 0 && waits.isEmpty, "unchanged identity must not invoke the resolver")
         try check(try String(contentsOf: relocated.appendingPathComponent("seed"), encoding: .utf8) == "original sentinel")
         try check(!FileManager.default.fileExists(atPath: original.path), "resolver must not create guessed fallback folders")
+    }
+}
+
+// RESET fixtures never consult AppSupport, start a helper, mount, or relaunch.
+enum SettingsResetScenarios {
+    static func run(cli: URL? = nil) throws {
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().resolvingSymlinksInPath()
+        let root = project.appendingPathComponent("artifacts/settings-reset/fixtures-\(UUID().uuidString)")
+        try Store.privateDirectory(root)
+        func fixture(_ name: String) throws -> (Store, Folder, URL) {
+            let base = root.appendingPathComponent(name); try Store.privateDirectory(base)
+            let original = base.appendingPathComponent("original"); try Store.privateDirectory(original)
+            try Data("original survives".utf8).write(to: original.appendingPathComponent("payload"))
+            let store = try Store(root: base.appendingPathComponent("store"))
+            var options = FolderOptions(); options.mountAtLaunch = false
+            let folder = try Engine(store: store).create(path: original, name: name, capacity: 16 << 20, options: options)
+            _ = try Snapshot.capture(store: store, folder: folder, source: original, previous: nil)
+            _ = try Snapshot.capture(store: store, folder: folder, source: original, previous: nil)
+            return (store, folder, original)
+        }
+        func unchanged(_ store: Store, _ folder: Folder, _ original: URL) throws {
+            try Scenarios.check(try store.load().folders.map(\.id) == [folder.id], "records retained on failure")
+            try Scenarios.check(try String(contentsOf: original.appendingPathComponent("payload"), encoding: .utf8) == "original survives", "original content preserved")
+        }
+        // Persist real native journal/layout shapes. Only kernel observation and
+        // eject are simulated; finalization uses the normal restore coordinator.
+        func mountedFixture(_ store: Store, _ folder: Folder, _ original: URL) throws {
+            let sid = UUID(), parent = try DirectoryHandle.open(original.deletingLastPathComponent())
+            let source = try DirectoryHandle.open(original).identity()
+            let revisions = try DirectoryHandle.open(store.volume(folder.id).appendingPathComponent("revisions")).names().sorted()
+            let holdingName = ".ramnest-\(folder.id.uuidString)-\(sid.uuidString).original"
+            let holding = try parent.createDirectory(holdingName)
+            let expected = try Snapshot.manifest(original)
+            try parent.renameNoReplace(original.lastPathComponent, to: holding, as: "data")
+            try FileManager.default.createSymbolicLink(at: original, withDestinationURL: NativeTmpfsPaths.data(sid))
+            let link = try parent.entryStat(original.lastPathComponent)
+            var layout = LinkedFolderLayout(folderID: folder.id, session: sid, stage: .linked,
+                originalPath: original.path, mountRoot: NativeTmpfsPaths.root.path, mountPath: NativeTmpfsPaths.data(sid).path,
+                holdingPath: original.deletingLastPathComponent().appendingPathComponent(holdingName).path,
+                linkStagePath: original.deletingLastPathComponent().appendingPathComponent(".ramnest-\(folder.id.uuidString)-\(sid.uuidString).link").path,
+                parent: .init(try parent.identity()), root: .init(try parent.identity()),
+                mountpoint: .init(try holding.identity()), source: .init(source))
+            layout.version = 2; layout.holding = .init(try holding.identity())
+            layout.link = .init((Paths.deviceID(link.st_dev), UInt64(link.st_ino)))
+            var j = Journal(); j.phase = .mounted; j.backend = .tmpfs; j.session = sid; j.nativeLink = layout
+            j.nativeTmpfs = NativeTmpfsRecord(session: sid, capacity: folder.capacity)
+            j.nativeTmpfs!.filesystem = NativeFilesystemID(first: 42, second: 2)
+            j.nativeTmpfs!.data = .init((42, 5)); j.mountedDevice = 42; j.populationVerified = true
+            j.initialRevision = revisions.first; j.revision = revisions.last; j.initialSourceManifest = expected
+            j.evacuation = layout.holdingPath; j.evacuationDevice = layout.holding?.device; j.evacuationInode = layout.holding?.inode
+            try store.write(j, for: folder.id)
+        }
+        func fixtureStatuses(_ store: Store) throws -> [FolderStatus] {
+            try store.load().folders.map { folder in
+                let j = try store.journal(folder.id), live = j.phase != .idle
+                return FolderStatus(folder: folder, journal: j, connected: live, mounted: live, used: 0, helperActive: live)
+            }
+        }
+        func finishFixtureUnmount(_ store: Store, _ ref: String) throws {
+            let folder = try store.resolve(ref, config: store.load())
+            var j = try store.journal(folder.id), layout = j.nativeLink!
+            let selected = URL(fileURLWithPath: folder.path), parent = try DirectoryHandle.open(selected.deletingLastPathComponent())
+            try Scenarios.check(unlinkat(parent.fd, selected.lastPathComponent, 0) == 0, "remove fixture managed link")
+            j.restoreRevision = folder.options.sync ? j.revision : j.initialRevision
+            if folder.options.sync {
+                let (source, manifest) = try Snapshot.verified(store: store, id: folder.id, revision: j.restoreRevision!)
+                try Snapshot.copyTree(from: source, to: selected, manifest: manifest, sourceContext: .managedRevision)
+                layout.restoration = .checkpoint
+            } else {
+                try parent.child(URL(fileURLWithPath: layout.holdingPath).lastPathComponent).renameNoReplace("data", to: parent, as: selected.lastPathComponent)
+                layout.restoration = .original
+            }
+            layout.restored = .init(try DirectoryHandle.open(selected).identity()); layout.stage = .restored; layout.mountReleased = true
+            j.nativeLink = layout; j.nativeTmpfs!.managedUnmount = true
+            var boundary = EngineSession(); boundary.deferSnapshotCleanup = true
+            let coordinator = Engine(store: store, session: boundary)
+            try coordinator.finishLinkedRestore(folder, journal: &j)
+            j.socket = nil; try store.write(j, for: folder.id)
+            coordinator.cleanSnapshots(try coordinator.refreshedFolder(folder), &j)
+            try Scenarios.check(j.nativeSessionCompleted && j.restoreRevision != nil && j.siblingCleanup?.isEmpty == false,
+                                "normal finalized journal retains deferred cleanup")
+        }
+        let (success, _, original) = try fixture("success")
+        // Legitimate snapshot symlinks must be unlinked without following them;
+        // hardlinks must not require modifying their linked content.
+        try FileManager.default.createSymbolicLink(at: original.appendingPathComponent("outside-link"), withDestinationURL: root)
+        try Scenarios.check(link(original.appendingPathComponent("payload").path, original.appendingPathComponent("hardlink").path) == 0)
+        let successFolder = try success.load().folders[0]
+        _ = try Snapshot.capture(store: success, folder: successFolder, source: original, previous: nil)
+        var config = try success.load(); config.menuBarMode = true; config.fileVerification = .sizeAndModTime; try success.save(config)
+        // Orphan record/snapshots left by an ordinary Keep Folder removal.
+        let orphanPath = original.deletingLastPathComponent().appendingPathComponent("orphan-original"); try Store.privateDirectory(orphanPath)
+        let orphan = try Engine(store: success).create(path: orphanPath, name: "orphan", capacity: 16 << 20)
+        _ = try Snapshot.capture(store: success, folder: orphan, source: orphanPath, previous: nil)
+        try Engine(store: success).delete(orphan.id.uuidString)
+        let identity = try DirectoryHandle.open(original).identity()
+        try Engine(store: success).reset()
+        try Scenarios.check(try success.load().folders.isEmpty && success.load().menuBarMode && success.load().fileVerification == .sizeAndModTime, "only folder records cleared")
+        try Scenarios.check(try DirectoryHandle.open(success.root.appendingPathComponent("volumes")).names().isEmpty, "all retained and orphan snapshots/records erased")
+        try Scenarios.check(try DirectoryHandle.open(original).identity() == identity, "original root identity preserved")
+        try Scenarios.check(try String(contentsOf: original.appendingPathComponent("payload"), encoding: .utf8) == "original survives", "original payload preserved")
+        try Scenarios.check(FileManager.default.fileExists(atPath: orphanPath.path), "orphan original preserved")
+        try Engine(store: success).reset() // Idempotent empty reset.
+        print("PASS RESET success: retained/orphan snapshots removed, originals and preferences preserved")
+
+        let (failed, failedFolder, failedOriginal) = try fixture("unmount-failure")
+        try mountedFixture(failed, failedFolder, failedOriginal)
+        var session = EngineSession()
+        session.resetStatuses = { try fixtureStatuses(failed) }
+        session.resetUnmount = { _ in throw NestError("injected normal unmount failure", code: 7) }
+        try Scenarios.rejects { try Engine(store: failed, session: session).reset() }
+        try Scenarios.check(try failed.load().folders.map(\.id) == [failedFolder.id], "records retained on failure")
+        let failedHolding = URL(fileURLWithPath: try failed.journal(failedFolder.id).nativeLink!.holdingPath)
+        try Scenarios.check(try String(contentsOf: failedHolding.appendingPathComponent("data/payload"), encoding: .utf8) == "original survives")
+        try Scenarios.check(!failed.resetPending, "unmount failure creates no deletion receipt")
+        try Scenarios.check(try FileManager.default.contentsOfDirectory(atPath: failed.volume(failedFolder.id).appendingPathComponent("revisions").path).count == 2, "unmount failure deletes no snapshots")
+        print("PASS RESET unmount failure: no record or snapshot deletion")
+        let (ordered, firstFolder, firstOriginal) = try fixture("unmount-order")
+        let secondPath = ordered.root.deletingLastPathComponent().appendingPathComponent("temporary")
+        try Store.privateDirectory(secondPath)
+        var temporary = FolderOptions(); temporary.sync = false; temporary.mountAtLaunch = false
+        let secondFolder = try Engine(store: ordered).create(path: secondPath, name: "temporary", capacity: 16 << 20, options: temporary)
+        try Data("temporary original".utf8).write(to: secondPath.appendingPathComponent("payload"))
+        _ = try Snapshot.capture(store: ordered, folder: secondFolder, source: secondPath, previous: nil)
+        let temporaryIdentity = try DirectoryHandle.open(secondPath).identity()
+        try mountedFixture(ordered, firstFolder, firstOriginal)
+        try mountedFixture(ordered, secondFolder, secondPath)
+        var sequence = EngineSession(), ejected: [UUID] = []
+        sequence.resetStatuses = { try fixtureStatuses(ordered) }
+        sequence.resetAssertAbsent = { j in try Scenarios.check(j.nativeSessionCompleted && j.nativeTmpfs?.managedUnmount == true, "fixture completed managed eject") }
+        var failSecond = true
+        sequence.resetUnmount = { ref in
+            ejected.append(UUID(uuidString: ref)!)
+            let c = try ordered.load()
+            try Scenarios.check(c.folders.count == 2, "all GUI records remain until all ejections complete")
+            let revisions = try ordered.volume(firstFolder.id).appendingPathComponent("revisions")
+            try Scenarios.check(try FileManager.default.contentsOfDirectory(atPath: revisions.path).count == 2, "snapshots remain until all ejections complete")
+            if ref == secondFolder.id.uuidString, failSecond { failSecond = false; throw NestError("injected busy/auth cancellation", code: 7) }
+            try finishFixtureUnmount(ordered, ref)
+        }
+        try Scenarios.rejects { try Engine(store: ordered, session: sequence).reset() }
+        try Scenarios.check(ejected == [firstFolder.id, secondFolder.id] && !ordered.resetPending, "partial eject creates no deletion receipt")
+        let completed = try ordered.journal(firstFolder.id)
+        try Scenarios.check(completed.phase == .idle && completed.restoreRevision != nil && completed.siblingCleanup?.count == 1,
+                            "authentic first completed eject persists deferred provenance")
+        try Scenarios.check(completed.resetUnmountCompleted, "RESET ownership survived normal finalization")
+        try Scenarios.check(try !Engine(store: ordered).canTerminatePendingReset(), "partial unmount provenance is not a no-live-session receipt")
+        var foreign = completed; foreign.resetUnmountSession = UUID()
+        try Scenarios.rejects { _ = try JSONDecoder().decode(Journal.self, from: JSONEncoder().encode(foreign)) }
+        var ordinary = completed; ordinary.resetUnmountSession = nil
+        try ordered.write(ordinary, for: firstFolder.id)
+        try Scenarios.rejects { try Engine(store: ordered, session: sequence).reset() }
+        try Scenarios.check(ejected == [firstFolder.id, secondFolder.id], "unowned idle recovery refuses before any further unmount")
+        try ordered.write(completed, for: firstFolder.id)
+        var nextSession = completed
+        try NativeJournalTransition.resetCompletedAuthority(&nextSession)
+        try Scenarios.check(!nextSession.resetUnmountPending, "normal next-session transition retires RESET ownership")
+        let held = URL(fileURLWithPath: completed.siblingCleanup![0].path)
+        try Scenarios.check(FileManager.default.fileExists(atPath: held.appendingPathComponent("data/payload").path), "holding survives second eject failure")
+        try Scenarios.check(try DirectoryHandle.open(ordered.volume(firstFolder.id).appendingPathComponent("revisions")).names().count == 2, "all snapshots survive partial eject")
+        // New Store/Engine, no remount and no in-memory provenance from RESET.
+        let retryStore = try Store(root: ordered.root)
+        var retry = sequence
+        retry.resetStatuses = { try fixtureStatuses(retryStore) }
+        retry.resetCheckpoint = { step in if step == "unmounted" { try Scenarios.check(ejected == [firstFolder.id, secondFolder.id, secondFolder.id], "only remaining mount retried") } }
+        try Engine(store: retryStore, session: retry).reset()
+        try Scenarios.check(try retryStore.load().folders.isEmpty && !retryStore.resetPending, "retry commits durable success")
+        try Scenarios.check(!FileManager.default.fileExists(atPath: held.path), "prior attempt holding cleanup resumes after all unmounts")
+        try Scenarios.check(try DirectoryHandle.open(secondPath).identity() == temporaryIdentity, "temporary original inode preserved")
+        try Scenarios.check(try String(contentsOf: firstOriginal.appendingPathComponent("payload"), encoding: .utf8) == "original survives", "synced content restored")
+        print("PASS RESET partial native unmount/reopen/retry: authentic finalization, no remount, deferred snapshots/holding cleanup, synced/temporary restoration")
+
+
+        let (partial, _, partialOriginal) = try fixture("deletion-failure")
+        var deletes = 0; var fail = EngineSession()
+        fail.resetCheckpoint = { step in
+            if step == "unlink" { deletes += 1; if deletes == 2 { throw NestError("injected unlink failure") } }
+        }
+        try Scenarios.rejects { try Engine(store: partial, session: fail).reset() }
+        try Scenarios.check(partial.resetPending, "partial deletion remains durably fenced")
+        try Scenarios.rejects { _ = try partial.load() }
+        let reopened = try Store(root: partial.root)
+        try Scenarios.rejects { try reopened.save(Configuration()) }
+        try Scenarios.check(try String(contentsOf: partialOriginal.appendingPathComponent("payload"), encoding: .utf8) == "original survives", "original survives partial deletion")
+        try Engine(store: reopened).reset()
+        try Scenarios.check(try reopened.load().folders.isEmpty && !reopened.resetPending, "reopen resumes partial physical inventory")
+        print("PASS RESET partial unlink failure: durable fence blocks writes; reopen/retry completes")
+
+        let (denied, _, deniedOriginal) = try fixture("permission-denied")
+        let deniedVolumes = try DirectoryHandle.open(denied.root.appendingPathComponent("volumes"))
+        let deniedVolume = try deniedVolumes.child(deniedVolumes.names()[0])
+        let deniedRevisions = try deniedVolume.child("revisions")
+        let dataHandles = try deniedRevisions.names().map { try deniedRevisions.child($0).child("data") }
+        var blocked = EngineSession(), blockedOnce = false
+        blocked.resetCheckpoint = { step in
+            if step == "unlink", !blockedOnce {
+                blockedOnce = true
+                for handle in dataHandles { try Scenarios.check(fchmod(handle.fd, 0o500) == 0) }
+            }
+        }
+        try Scenarios.rejects { try Engine(store: denied, session: blocked).reset() }
+        for handle in dataHandles { try Scenarios.check(fchmod(handle.fd, 0o700) == 0) }
+        try Scenarios.check(denied.resetPending, "actual unlink failure retains receipt")
+        try Engine(store: denied).reset()
+        try Scenarios.check(try String(contentsOf: deniedOriginal.appendingPathComponent("payload"), encoding: .utf8) == "original survives")
+        print("PASS RESET actual permission-denied unlink and retry")
+
+        let (changed, _, _) = try fixture("changed-after-interruption")
+        var pause = EngineSession(); pause.resetCheckpoint = { if $0 == "prepared" { throw NestError("pause after durable receipt") } }
+        try Scenarios.rejects { try Engine(store: changed, session: pause).reset() }
+        let unexpected = changed.root.appendingPathComponent("volumes/unrecorded")
+        try Data("unknown".utf8).write(to: unexpected)
+        try Scenarios.rejects { try Engine(store: changed).reset() }
+        try Scenarios.check(try String(contentsOf: unexpected, encoding: .utf8) == "unknown", "retry retains unknown entries")
+        print("PASS RESET retry refuses new unknown data")
+
+        if let cli {
+            let (crossProcess, _, _) = try fixture("cli-contention")
+            var checkCLI = EngineSession()
+            checkCLI.resetCheckpoint = { step in
+                guard step == "unmounted" else { return }
+                try Scenarios.check(!crossProcess.resetPending, "exercise lock contention before a durable fence exists")
+                let child = Process(); child.executableURL = cli
+                child.arguments = ["--store", crossProcess.root.path, "list"]
+                child.standardOutput = FileHandle.nullDevice; child.standardError = FileHandle.nullDevice
+                try child.run(); child.waitUntilExit()
+                try Scenarios.check(child.terminationStatus != 0, "CLI must refuse while RESET holds its exclusive lease")
+            }
+            try Engine(store: crossProcess, session: checkCLI).reset()
+            print("PASS RESET real CLI process refuses concurrent repository access")
+        }
+
+
+        for kind in ["unknown-root", "unknown-volume", "pending-stage", "symlink-revision", "identity", "recovery", "foreign-device", "relocation"] {
+            let (store, folder, original) = try fixture(kind)
+            let volume = try store.volume(folder.id)
+            if kind == "unknown-root" { try Data("unknown".utf8).write(to: store.root.appendingPathComponent("unknown")) }
+            if kind == "unknown-volume" { try Data("unknown".utf8).write(to: volume.appendingPathComponent("unknown")) }
+            if kind == "pending-stage" { try Store.privateDirectory(volume.appendingPathComponent("stage-pending")) }
+            if kind == "symlink-revision" {
+                try FileManager.default.createSymbolicLink(at: volume.appendingPathComponent("revisions/\(UUID().uuidString)"), withDestinationURL: original)
+            }
+            if kind == "identity" {
+                var c = try store.load(); c.folders[0].inode += 1; try store.save(c)
+            }
+            if kind == "recovery" { var j = Journal(); j.phase = .recoveryRequired; try store.write(j, for: folder.id) }
+            if kind == "foreign-device" {
+                let directory = try DirectoryHandle.open(volume.appendingPathComponent("revisions"))
+                let device = try directory.identity().device
+                try Scenarios.rejects { try directory.requireOwnedDirectory(device: device &+ 1) }
+                // Exercise persisted reset authority mismatch without mounting.
+                var receipt = try RepositoryReset.prepare(store: store, transaction: StorageRelocation.Transaction(manager: SnapshotStorageManager(location: StoreLocation(bootstrapRoot: store.root))))
+                receipt.root.device &+= 1
+                try Store.atomicJSON(receipt, store.root.appendingPathComponent(RepositoryReset.receiptName))
+            }
+            if kind == "relocation" { try Data("pending authority".utf8).write(to: store.root.appendingPathComponent(StorageRelocation.receiptName)) }
+            try Scenarios.rejects { try Engine(store: store).reset() }
+            try Scenarios.check(try String(contentsOf: original.appendingPathComponent("payload"), encoding: .utf8) == "original survives", kind + " preserves original")
+            let c = try Store.read(Configuration.self, store.root.appendingPathComponent("configuration.json"))
+            try Scenarios.check(c.folders.map(\.id) == [folder.id], kind + " retains GUI record")
+        }
+        print("PASS RESET refusal: unknown data, pending stages, symlink candidate, identity, recovery, foreign device, relocation")
+
+        let (busyStore, _, _) = try fixture("busy")
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            defer { finished.signal() }
+            try? busyStore.locked { entered.signal(); _ = release.wait(timeout: .now() + 10) }
+        }
+        try Scenarios.check(entered.wait(timeout: .now() + 10) == .success, "shared operation entered")
+        try Scenarios.rejects { try Engine(store: busyStore).reset() }
+        release.signal()
+        try Scenarios.check(finished.wait(timeout: .now() + 10) == .success, "shared operation finished")
+        print("PASS RESET busy lease rejects concurrent operation")
+
+        let managerRoot = root.appendingPathComponent("selection"); try Store.privateDirectory(managerRoot)
+        let bootstrap = managerRoot.appendingPathComponent("bootstrap"), parent = managerRoot.appendingPathComponent("chosen")
+        try Store.privateDirectory(parent)
+        let manager = SnapshotStorageManager(location: StoreLocation(bootstrapRoot: bootstrap))
+        let selectedStore = try manager.open()
+        _ = try manager.move(store: selectedStore, toParent: parent)
+        let selected = try manager.open(), bytes = try Data(contentsOf: manager.location.selectionURL)
+        try Engine(store: selected).reset(location: manager.location)
+        try Scenarios.check(try Data(contentsOf: manager.location.selectionURL) == bytes && manager.open().root == selected.root, "selection authority and selected location preserved")
+        print("PASS RESET selected storage authority preserved byte-for-byte")
     }
 }

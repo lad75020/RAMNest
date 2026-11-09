@@ -93,6 +93,14 @@ public struct Journal: Codable, Equatable, Sendable {
     public var legacyLink: LinkedFolderLayout?
     public var nativeLink: LinkedFolderLayout?
     public var nativeTmpfs: NativeTmpfsRecord?
+    // RESET records admission before eject, so a crash after idle publication
+    // cannot lose ownership of deferred holding/snapshot cleanup.
+    var resetUnmountSession: UUID?
+    public var resetUnmountPending: Bool { resetUnmountSession != nil }
+    var resetUnmountCompleted: Bool {
+        nativeSessionCompleted && resetUnmountSession == nativeTmpfs?.session &&
+            resetUnmountSession != nil && nativeTmpfs?.managedUnmount == true
+    }
     // A completed layout is historical publication evidence, not live mount
     // authority. Idle retention may release its initial/restore revision pins.
     var nativeSessionCompleted: Bool {
@@ -123,7 +131,7 @@ public struct Journal: Codable, Equatable, Sendable {
         case restoreDataDevice, restoreDataInode, publicationReceipt, mountedDevice, populationVerified
         case startupProtocol, startupHelperPID, startupRetired, lastError, updated
         case legacyLink = "fsKitLink"
-        case originalRename, publicationRename, nativeLink, nativeTmpfs
+        case originalRename, publicationRename, nativeLink, nativeTmpfs, resetUnmountSession
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -204,6 +212,12 @@ public struct Journal: Codable, Equatable, Sendable {
         legacyLink = values.contains(.legacyLink) ? try values.decode(LinkedFolderLayout.self, forKey: .legacyLink) : nil
         nativeLink = values.contains(.nativeLink) ? try values.decode(LinkedFolderLayout.self, forKey: .nativeLink) : nil
         nativeTmpfs = values.contains(.nativeTmpfs) ? try values.decode(NativeTmpfsRecord.self, forKey: .nativeTmpfs) : nil
+        resetUnmountSession = values.contains(.resetUnmountSession) ? try values.decode(UUID.self, forKey: .resetUnmountSession) : nil
+        if let resetUnmountSession {
+            guard resetUnmountSession == session, resetUnmountSession == nativeTmpfs?.session else {
+                throw NestError("RESET unmount provenance does not match the native session; all data retained.", code: 6)
+            }
+        }
         guard legacyLink == nil || (nativeLink == nil && nativeTmpfs == nil),
               legacyLink == nil || legacyLink?.version == 1,
               (nativeLink == nil) == (nativeTmpfs == nil),

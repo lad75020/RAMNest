@@ -180,3 +180,13 @@ Further details: [native backend/protocol](docs/NATIVE_TMPFS.md),
 [provenance copy policy](docs/PROVENANCE_COPY_POLICY.md).
 Obsolete engine requirements and reports have been removed. Legacy on-disk
 discriminators remain readable without an executable old storage backend.
+
+Settings → **RESET RAMNest…** ejects every managed RAM folder normally, deletes
+all folder records and saved snapshots (including retained/orphan snapshots),
+then restarts the app. Sync folders save first; temporary folders discard RAM
+changes and restore their originals. Original folders, unrelated drives, app
+preferences and the selected snapshot storage location are preserved. Cancel is
+the default confirmation. Close files and finish recovery or pending storage
+moves first. Errors appear in Settings; retry RESET after fixing the cause. An
+interrupted cleanup pauses other repository operations until RESET completes.
+If only relaunch failed, **Retry Restart…** does not repeat cleanup.

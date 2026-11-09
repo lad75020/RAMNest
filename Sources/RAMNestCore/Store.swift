@@ -27,11 +27,14 @@ public final class Store: @unchecked Sendable {
         try Paths.rejectSymlinks(self.root.path, allowMissingLast: true)
         try Self.rejectRetired(self.root)
         try Self.privateDirectory(self.root)
-        try Self.privateDirectory(self.root.appendingPathComponent("volumes"))
+        if !FileManager.default.fileExists(atPath: self.root.appendingPathComponent(RepositoryReset.receiptName).path) {
+            try Self.privateDirectory(self.root.appendingPathComponent("volumes"))
+        }
         rootIdentity = try DirectoryHandle.open(self.root).identity()
         try locationAuthority?()
     }
     private func validateAuthority() throws {
+        try access {}
         try Self.rejectRetired(root)
         try locationAuthority?()
         let handle = try DirectoryHandle.open(root)
@@ -69,61 +72,75 @@ public final class Store: @unchecked Sendable {
         guard lstat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR, st.st_uid == getuid(), st.st_mode & 0o077 == 0 else { throw NestError("Private storage must be an owned 0700 directory: \(url.path)", code: 6) }
     }
     public func locked<T>(_ operation: () throws -> T) throws -> T {
-        try validateAuthority()
-        let directory = try DirectoryHandle.open(root)
-        let fd = openat(directory.fd, "repository.lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0o600)
-        guard fd >= 0 else { throw NestError("Cannot open repository lock: \(String(cString: strerror(errno)))") }
-        defer { close(fd) }
-        guard flock(fd, LOCK_EX) == 0 else { throw NestError("Cannot lock repository.") }
-        defer { flock(fd, LOCK_UN) }
-        try validateAuthority()
-        return try operation()
+        return try access {
+            try validateAuthority()
+            let directory = try DirectoryHandle.open(root)
+            let fd = openat(directory.fd, "repository.lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0o600)
+            guard fd >= 0 else { throw NestError("Cannot open repository lock: \(String(cString: strerror(errno)))") }
+            defer { close(fd) }
+            guard flock(fd, LOCK_EX) == 0 else { throw NestError("Cannot lock repository.") }
+            defer { flock(fd, LOCK_UN) }
+            try validateAuthority()
+            return try operation()
+        }
     }
     // Lock order: volume transaction -> short repository/configuration lock.
     // Resolve under repository lock, release it, acquire volume, then refresh.
     // Never hold repository.lock while waiting on a volume transaction.
     public func volumeLocked<T>(_ id: UUID, _ operation: () throws -> T) throws -> T {
-        let directory = try managedVolume(id)
-        let fd = openat(directory.fd, "transaction.lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
-        guard fd >= 0 else { throw NestError("Cannot open volume transaction lock.") }
-        defer { close(fd) }
-        guard flock(fd, LOCK_EX) == 0 else { throw NestError("Cannot lock volume transaction.") }
-        defer { flock(fd, LOCK_UN) }
-        try validateAuthority()
-        return try operation()
+        return try access {
+            let directory = try managedVolume(id)
+            let fd = openat(directory.fd, "transaction.lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
+            guard fd >= 0 else { throw NestError("Cannot open volume transaction lock.") }
+            defer { close(fd) }
+            guard flock(fd, LOCK_EX) == 0 else { throw NestError("Cannot lock volume transaction.") }
+            defer { flock(fd, LOCK_UN) }
+            try validateAuthority()
+            return try operation()
+        }
     }
     public func load() throws -> Configuration {
-        try validateAuthority()
-        let url = root.appendingPathComponent("configuration.json")
-        guard FileManager.default.fileExists(atPath: url.path) else { return Configuration() }
-        let config = try Self.read(Configuration.self, url)
-        guard config.version == 1 else { throw NestError("Unsupported configuration version.") }
-        return config
+        return try access {
+            try validateAuthority()
+            let url = root.appendingPathComponent("configuration.json")
+            guard FileManager.default.fileExists(atPath: url.path) else { return Configuration() }
+            let config = try Self.read(Configuration.self, url)
+            guard config.version == 1 else { throw NestError("Unsupported configuration version.") }
+            return config
+        }
     }
     public func save(_ config: Configuration) throws {
-        try validateAuthority()
-        try Self.atomicJSON(config, root.appendingPathComponent("configuration.json"))
+        return try access {
+            try validateAuthority()
+            try Self.atomicJSON(config, root.appendingPathComponent("configuration.json"))
+        }
     }
     public func volume(_ id: UUID) throws -> URL {
-        try validateAuthority()
-        let url = root.appendingPathComponent("volumes/\(id.uuidString)", isDirectory: true)
-        try Self.privateDirectory(url); try Self.privateDirectory(url.appendingPathComponent("revisions")); return url
+        return try access {
+            try validateAuthority()
+            let url = root.appendingPathComponent("volumes/\(id.uuidString)", isDirectory: true)
+            try Self.privateDirectory(url); try Self.privateDirectory(url.appendingPathComponent("revisions")); return url
+        }
     }
     public func journal(_ id: UUID) throws -> Journal {
-        let url = try volume(id).appendingPathComponent("journal.json")
-        return FileManager.default.fileExists(atPath: url.path) ? try Self.read(Journal.self, url, decoder: journalDecoder) : Journal()
+        return try access {
+            let url = try volume(id).appendingPathComponent("journal.json")
+            return FileManager.default.fileExists(atPath: url.path) ? try Self.read(Journal.self, url, decoder: journalDecoder) : Journal()
+        }
     }
     public func write(_ journal: Journal, for id: UUID) throws {
-        try beforeJournalWrite?(journal, id)
-        var j = journal; j.updated = Date()
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let bytes = try encoder.encode(j)
-        if j.backend == .tmpfs || j.nativeTmpfs != nil || j.nativeLink != nil {
-            // Validate the exact bytes before replacement. An invalid transition
-            // must retain the last readable durable journal, not strand recovery.
-            _ = try journalDecoder.decode(Journal.self, from: bytes)
+        return try access {
+            try beforeJournalWrite?(journal, id)
+            var j = journal; j.updated = Date()
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let bytes = try encoder.encode(j)
+            if j.backend == .tmpfs || j.nativeTmpfs != nil || j.nativeLink != nil {
+                // Validate the exact bytes before replacement. An invalid transition
+                // must retain the last readable durable journal, not strand recovery.
+                _ = try journalDecoder.decode(Journal.self, from: bytes)
+            }
+            try Self.atomicData(bytes, volume(id).appendingPathComponent("journal.json"))
         }
-        try Self.atomicData(bytes, volume(id).appendingPathComponent("journal.json"))
     }
     public func resolve(_ ref: String, config: Configuration) throws -> Folder {
         let value = ref.hasPrefix("ram://") ? (String(ref.dropFirst(6)).removingPercentEncoding ?? "") : ref
@@ -346,11 +363,20 @@ public final class SnapshotStorageManager: @unchecked Sendable {
     }
     public func move(store: Store, toParent parent: URL, cancellation: StorageMoveCancellation = .init(),
                      progress: @Sendable (String) -> Void = { _ in }) throws -> SnapshotStorageState {
-        try StorageRelocation.Transaction(manager: self).move(store: store, parent: parent, cancellation: cancellation, progress: progress)
+        try store.access { try StorageRelocation.Transaction(manager: self).move(store: store, parent: parent, cancellation: cancellation, progress: progress) }
         return try state()
     }
     public func retry(progress: @Sendable (String) -> Void = { _ in }) throws -> SnapshotStorageState {
-        try StorageRelocation.Transaction(manager: self).retry(progress: progress)
+        let receipt = try StorageRelocation.readReceipt(at: location.bootstrapRoot)
+        func resume() throws { try StorageRelocation.Transaction(manager: self).retry(progress: progress) }
+        if let receipt {
+            try Store.access(root: URL(fileURLWithPath: receipt.source.path)) {
+                // A reservation may not have created its destination yet.
+                if receipt.stage != .reserving {
+                    try Store.access(root: URL(fileURLWithPath: receipt.destination.path)) { try resume() }
+                } else { try resume() }
+            }
+        } else { try resume() }
         return try state()
     }
 }
@@ -426,7 +452,7 @@ enum StorageRelocation {
     static let receiptName = "storage-migration.json"
     static let fenceName = ".ramnest-retired.json"
     static let incomingName = ".ramnest-incoming.json"
-    static let bootstrapNames: Set<String> = ["storage-location.json", receiptName, "storage-location.lock", "repository.lock"]
+    static let bootstrapNames: Set<String> = ["storage-location.json", receiptName, "storage-location.lock", "repository.lock", RepositoryReset.lockName]
 
     // Canonical decoding rejects unknown/duplicate/partial/null records too.
     static func read<T: Codable>(_ type: T.Type, in directory: DirectoryHandle, name: String) throws -> T {
@@ -572,7 +598,7 @@ extension StorageRelocation {
         }
         func release(_ descriptors: [Int32]) { for fd in descriptors.reversed() { flock(fd, LOCK_UN); close(fd) } }
         func excluded(_ source: Root) -> Set<String> {
-            (source.path == location.bootstrapRoot.path ? StorageRelocation.bootstrapNames : ["repository.lock"]).union([SnapshotCopyObservations.name])
+            (source.path == location.bootstrapRoot.path ? StorageRelocation.bootstrapNames : ["repository.lock", RepositoryReset.lockName]).union([SnapshotCopyObservations.name])
         }
         func move(store: Store, parent: URL, cancellation: StorageMoveCancellation,
                   progress: @Sendable (String) -> Void) throws {
@@ -647,6 +673,7 @@ extension StorageRelocation {
                              directory: sourceHandle, name: StorageRelocation.fenceName)
             try checkpoint("reservation-intent")
             _ = try parentHandle.createDirectory(destinationURL.lastPathComponent); try parentHandle.sync()
+            try Store.access(root: destinationURL) {}
             receipt.destination = try Root(destinationURL); receipt.stage = .copying
             try write(receipt)
             try checkpoint("reserved")
@@ -739,7 +766,7 @@ extension StorageRelocation {
                 try matchSource(receipt)
                 if receipt.destinationInventory == nil { try copy(&receipt, cancellation: cancellation) }
                 try checkpoint("hash")
-                let copied = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name], cancellation: cancellation, matching: receipt.inventory)
+                let copied = try scan(receipt.destination, excluding: [RepositoryReset.lockName, StorageRelocation.incomingName, SnapshotCopyObservations.name], cancellation: cancellation, matching: receipt.inventory)
                 guard destinationMatches(receipt, copied), ownedCopies(receipt, copied), try rootMatches(receipt, root: receipt.destination) else { throw NestError("Opaque storage copy verification failed. Source and partial destination retained; retry or preserve both for recovery.", code: 6) }
                 receipt.destinationInventory = copied
                 let destinationURL = URL(fileURLWithPath: receipt.destination.path)
@@ -755,7 +782,7 @@ extension StorageRelocation {
                 try verifyCopyObservation(receipt)
                 try cancellation.check(); progress("Verifying before committing storage selection…")
                 try matchSource(receipt)
-                let copied = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name], cancellation: cancellation, matching: receipt.inventory)
+                let copied = try scan(receipt.destination, excluding: [RepositoryReset.lockName, StorageRelocation.incomingName, SnapshotCopyObservations.name], cancellation: cancellation, matching: receipt.inventory)
                 guard destinationMatches(receipt, copied), ownedCopies(receipt, copied), try rootMatches(receipt, root: receipt.destination) else { throw NestError("Verified destination changed. Both stores retained.", code: 6) }
                 let source = try receipt.source.open()
                 let fence = StorageRelocation.Fence(transaction: receipt.transaction, bootstrap: receipt.bootstrap.path, destination: receipt.destination.path)
@@ -771,7 +798,7 @@ extension StorageRelocation {
                 let fence = StorageRelocation.Fence(transaction: receipt.transaction, bootstrap: receipt.bootstrap.path, destination: receipt.destination.path)
                 try durableFence(fence, directory: source, name: StorageRelocation.fenceName)
                 try durableFence(fence, directory: receipt.destination.open(), name: StorageRelocation.incomingName)
-                let copied = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name], matching: receipt.inventory)
+                let copied = try scan(receipt.destination, excluding: [RepositoryReset.lockName, StorageRelocation.incomingName, SnapshotCopyObservations.name], matching: receipt.inventory)
                 guard try StorageRelocation.read(StorageRelocation.Fence.self, in: source, name: StorageRelocation.fenceName) == StorageRelocation.Fence(transaction: receipt.transaction, bootstrap: receipt.bootstrap.path, destination: receipt.destination.path),
                       destinationMatches(receipt, copied), ownedCopies(receipt, copied), try rootMatches(receipt, root: receipt.destination) else { throw NestError("Fenced move cannot be proven. Preserve both stores and retry after restoring access.", code: 6) }
                 try checkpoint("publication")
@@ -893,7 +920,7 @@ extension StorageRelocation.Transaction {
         }
         return (result, last)
     }
-    func scan(_ root: Root, excluding: Set<String>, cancellation: StorageMoveCancellation = .init(), matching: [Item]? = nil) throws -> [Item] {
+    func scan(_ root: Root, excluding: Set<String>, cancellation: StorageMoveCancellation = .init(), matching: [Item]? = nil, resetInventory: Bool = false) throws -> [Item] {
         let handle = try root.open(); try writableLocal(handle)
         var fs = statfs(); guard fstatfs(handle.fd, &fs) == 0 else { throw NestError("Cannot inspect storage filesystem.", code: 6) }
         var pending = try handle.names().filter { !excluding.contains($0) }
@@ -906,7 +933,7 @@ extension StorageRelocation.Transaction {
             let (directory, name) = try parent(handle, path: path)
             var policy = recorded[path]?.fileVerification ?? .sha256
             let components = path.split(separator: "/").map(String.init)
-            if matching == nil, components.count >= 6, components[0] == "volumes", UUID(uuidString: components[1]) != nil,
+            if !resetInventory, matching == nil, components.count >= 6, components[0] == "volumes", UUID(uuidString: components[1]) != nil,
                components[2] == "revisions", UUID(uuidString: components[3]) != nil, components[4] == "data" {
                 let key = components.prefix(4).joined(separator: "/")
                 if policies[key] == nil {
@@ -916,7 +943,7 @@ extension StorageRelocation.Transaction {
                 }
                 policy = policies[key]!
             }
-            let item = try inspect(directory, name: name, relative: path, device: root.device, cancellation: cancellation, verification: policy)
+            let item = try inspect(directory, name: name, relative: path, device: root.device, cancellation: cancellation, verification: policy, allowSnapshotHardlinks: resetInventory)
             result.append(item)
             if item.kind == UInt16(S_IFDIR) {
                 let child = try directory.child(name)
@@ -933,12 +960,12 @@ extension StorageRelocation.Transaction {
         return result.sorted { $0.path < $1.path }
     }
     func inspect(_ parent: DirectoryHandle, name: String, relative: String, device: UInt64,
-                 cancellation: StorageMoveCancellation = .init(), verification: FileVerification = .sha256) throws -> Item {
+                 cancellation: StorageMoveCancellation = .init(), verification: FileVerification = .sha256, allowSnapshotHardlinks: Bool = false) throws -> Item {
         let st = try parent.entryStat(name), kind = st.st_mode & S_IFMT
         guard verification == .sha256 || kind != S_IFREG || Item.revisionPayload(relative) else { throw NestError("Control storage files require SHA verification; retained.", code: 6) }
         guard Paths.deviceID(st.st_dev) == device, st.st_uid == getuid(),
               [S_IFDIR, S_IFREG, S_IFLNK].contains(kind),
-              kind == S_IFDIR || st.st_nlink == 1,
+              kind == S_IFDIR || st.st_nlink == 1 || (allowSnapshotHardlinks && kind == S_IFREG && Item.revisionPayload(relative)),
               st.st_flags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else {
             throw NestError("Unsupported owner, hard link, compression/flags or special entry in opaque store: \(relative). No source attributes were changed.", code: 6)
         }
@@ -1036,7 +1063,7 @@ extension StorageRelocation.Transaction {
             }
             receipt.partialFile = nil; try write(receipt)
         }
-        let existing = try scan(receipt.destination, excluding: [StorageRelocation.incomingName, SnapshotCopyObservations.name], matching: receipt.inventory)
+        let existing = try scan(receipt.destination, excluding: [RepositoryReset.lockName, StorageRelocation.incomingName, SnapshotCopyObservations.name], matching: receipt.inventory)
         for item in existing {
             guard let original = expected[item.path], ownedCopies(receipt, [item]),
                   item.kind == UInt16(S_IFDIR) || (receipt.allocations[item.path]?.attributes == nil ? original.sameContent(item, directoryTimes: false) : original.sameCopyContent(item, directoryTimes: false)) else { throw NestError("Partial destination contains an unproven entry: \(item.path). Preserve it and source; automatic overwrite is refused.", code: 6) }
@@ -1204,7 +1231,7 @@ extension StorageRelocation.Transaction {
         }
         let expected = Dictionary(uniqueKeysWithValues: receipt.inventory.map { ($0.path, $0) })
         let remaining = try scan(receipt.source, excluding: excluded(receipt.source).union([StorageRelocation.fenceName]), matching: receipt.inventory)
-        let copied = Dictionary(uniqueKeysWithValues: try scan(receipt.destination, excluding: ["repository.lock", StorageRelocation.incomingName, SnapshotCopyObservations.name], matching: receipt.inventory).map { ($0.path, $0) })
+        let copied = Dictionary(uniqueKeysWithValues: try scan(receipt.destination, excluding: ["repository.lock", RepositoryReset.lockName, StorageRelocation.incomingName, SnapshotCopyObservations.name], matching: receipt.inventory).map { ($0.path, $0) })
         if let recorded = receipt.sourceObservation {
             if try source.exists(SnapshotCopyObservations.name) {
                 guard try inspect(source, name: SnapshotCopyObservations.name, relative: SnapshotCopyObservations.name, device: receipt.source.device) == recorded else { throw NestError("Obsolete copy observation changed; retained.", code: 6) }
@@ -1249,5 +1276,217 @@ extension StorageRelocation.Transaction {
             guard unlinkat(destination.fd, StorageRelocation.incomingName, 0) == 0 else { throw NestError("Destination cleanup fence removal needs Retry.", code: 6) }
             try destination.sync()
         }
+    }
+}
+
+// Shared leases cover full volume transactions as well as short configuration
+// operations. Reset takes an exclusive nonblocking lease, including across CLI
+// processes. Per-thread nesting preserves the existing volume -> repo lock order.
+extension Store {
+    private final class AccessLease: NSObject {
+        let exclusive: Bool
+        init(_ exclusive: Bool) { self.exclusive = exclusive }
+    }
+    func access<T>(exclusive: Bool = false, _ body: () throws -> T) throws -> T {
+        try Self.access(root: root, exclusive: exclusive, body)
+    }
+    static func access<T>(root: URL, exclusive: Bool = false, _ body: () throws -> T) throws -> T {
+        let directory = try DirectoryHandle.open(root), identity = try directory.identity()
+        try directory.requireOwnedDirectory(device: identity.device, privateMode: true)
+        let key = "sh.ramnest.access.\(identity.device).\(identity.inode)"
+        if let lease = Thread.current.threadDictionary[key] as? AccessLease {
+            guard !exclusive || lease.exclusive else { throw NestError("Cannot reset during a repository operation.", code: 7) }
+            return try body()
+        }
+        let fd = openat(directory.fd, RepositoryReset.lockName, O_CREAT | O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw NestError("Cannot open reset coordination lock.", code: 6) }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(),
+              info.st_mode & 0o077 == 0, info.st_nlink == 1, info.st_size == 0,
+              Paths.deviceID(info.st_dev) == identity.device,
+              flock(fd, (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB) == 0 else {
+            throw NestError("RAMNest storage is busy or resetting. Wait for the operation, then retry in Settings.", code: 7)
+        }
+        defer { flock(fd, LOCK_UN) }
+        let named = try directory.entryStat(RepositoryReset.lockName)
+        guard named.st_dev == info.st_dev, named.st_ino == info.st_ino,
+              try DirectoryHandle.open(root).identity() == identity else { throw NestError("Reset lock or repository identity changed.", code: 6) }
+        if !exclusive, try directory.exists(RepositoryReset.receiptName) {
+            throw NestError("An interrupted RESET needs Retry RESET in Settings. All other repository operations are paused.", code: 7)
+        }
+        Thread.current.threadDictionary[key] = AccessLease(exclusive)
+        defer { Thread.current.threadDictionary.removeObject(forKey: key) }
+        return try body()
+    }
+    func resetAuthority() throws { try validateAuthority() }
+    public var resetPending: Bool {
+        // Failure to inspect is also pending; never substitute an empty store.
+        (try? DirectoryHandle.open(root).exists(RepositoryReset.receiptName)) ?? true
+    }
+}
+
+// A durable, bounded physical inventory permits retry after an unlink/fsync or
+// app crash. Missing entries are allowed only after this receipt is durable;
+// changed identities/content and unrecorded entries always stop cleanup.
+enum RepositoryReset {
+    static let lockName = "reset.lock" // Stable inode: never deleted or relocated.
+    static let receiptName = ".ramnest-reset.json"
+    struct Receipt: Codable {
+        var version = 1
+        var root: StorageRelocation.Root
+        var volumes: StorageRelocation.Root
+        var inventory: [StorageRelocation.Item]
+        var configuration: Data?
+        var result: Data
+    }
+    static let preserved: Set<String> = [lockName, "repository.lock", "storage-location.lock", "storage-location.json", "volumes", "configuration.json", receiptName]
+
+    static func idle(_ journal: Journal, completingUnmount: Bool = false,
+                     assertAbsent: (Journal) throws -> Void = NativeTmpfsControl.assertAbsent) throws {
+        guard journal.phase == .idle, journal.lastError == nil, completingUnmount || journal.cleanupWarning == nil,
+              journal.evacuation == nil, journal.restoreStage == nil,
+              completingUnmount || (journal.restoreRevision == nil && journal.siblingCleanup?.isEmpty != false && journal.retiringRevisions?.isEmpty != false),
+              journal.publicationReceipt == nil || journal.publicationReceipt?.phase == "published",
+              journal.startupProtocol == nil || journal.startupRetired == true || journal.populationVerified,
+              journal.managedLink == nil || (journal.managedLink?.stage == .restored && journal.managedLink?.mountReleased == true) else {
+            throw NestError("Unfinished recovery, holding/staging data or cleanup blocks RESET. Finish recovery first.", code: 6)
+        }
+        if let native = journal.nativeTmpfs {
+            guard native.periodicAuthorization == nil else { throw NestError("Periodic work remains authorized; RESET stopped.", code: 7) }
+            try assertAbsent(journal)
+            guard !Paths.mounts().contains(where: { $0.path == NativeTmpfsPaths.mount(native.session).path }) else { throw NestError("Native mount still exists; RESET stopped.", code: 7) }
+        }
+        if let layout = journal.managedLink {
+            guard let restored = layout.restored else { throw NestError("Restored original identity is missing; RESET stopped.", code: 6) }
+            try restored.verify(DirectoryHandle.open(URL(fileURLWithPath: layout.originalPath)))
+            for path in completingUnmount ? [] : [layout.holdingPath, layout.linkStagePath] {
+                let url = URL(fileURLWithPath: path), parent = try DirectoryHandle.open(url.deletingLastPathComponent())
+                guard try !parent.exists(url.lastPathComponent) else { throw NestError("Retained original or stage needs recovery before RESET: \(path)", code: 6) }
+            }
+            guard !Paths.mounts().contains(where: { $0.path == layout.mountPath || $0.path.hasPrefix(layout.mountPath + "/") }) else { throw NestError("Managed mount remains; RESET stopped.", code: 7) }
+        }
+        if let socket = journal.socket {
+            let url = URL(fileURLWithPath: socket), parent = try DirectoryHandle.open(url.deletingLastPathComponent())
+            guard try !parent.exists(url.lastPathComponent) else { throw NestError("A background helper socket remains; RESET stopped.", code: 7) }
+        }
+        for pid in [journal.startupHelperPID, journal.quiescedHelperPID].compactMap({ $0 }) where pid > 0 {
+            guard kill(pid, 0) != 0, errno == ESRCH else { throw NestError("A recorded helper may still be active; RESET stopped.", code: 7) }
+        }
+    }
+
+    static func validateNamespace(store: Store) throws {
+        let directory = try DirectoryHandle.open(store.root)
+        guard Set(try directory.names()).isSubset(of: preserved.union([SnapshotCopyObservations.name])) else { throw NestError("Unknown repository entries block RESET.", code: 6) }
+        let volumes = try directory.child("volumes")
+        let device = try directory.identity().device, fsid = try directory.cleanupFilesystem()
+        try volumes.requireOwnedDirectory(device: device, privateMode: true)
+        guard try volumes.cleanupFilesystem() == fsid else { throw NestError("Foreign volumes filesystem blocks RESET.", code: 6) }
+        for name in try volumes.names() {
+            guard UUID(uuidString: name)?.uuidString == name else { throw NestError("Unknown volume blocks RESET.", code: 6) }
+            let volume = try volumes.child(name)
+            try volume.requireOwnedDirectory(device: device, privateMode: true)
+            guard try volume.cleanupFilesystem() == fsid else { throw NestError("Foreign volume filesystem blocks RESET.", code: 6) }
+            guard Set(try volume.names()).isSubset(of: ["journal.json", "transaction.lock", "revisions"]),
+                  try volume.exists("journal.json"), try volume.exists("revisions") else { throw NestError("Unknown or pending volume data blocks RESET.", code: 6) }
+            let revisions = try volume.child("revisions")
+            try revisions.requireOwnedDirectory(device: device, privateMode: true)
+            guard try revisions.cleanupFilesystem() == fsid else { throw NestError("Foreign snapshot filesystem blocks RESET.", code: 6) }
+            for name in try revisions.names() {
+                guard UUID(uuidString: name)?.uuidString == name else { throw NestError("Unknown or pending snapshot blocks RESET.", code: 6) }
+                try revisions.removeCommittedRevision(name, validateOnly: true)
+            }
+        }
+    }
+
+    static func prepare(store: Store, transaction: StorageRelocation.Transaction,
+                        assertAbsent: (Journal) throws -> Void = NativeTmpfsControl.assertAbsent) throws -> Receipt {
+        let root = try StorageRelocation.Root(store.root), directory = try root.open()
+        let names = Set(try directory.names())
+        guard names.isSubset(of: preserved.union([SnapshotCopyObservations.name])) else { throw NestError("Unknown repository entries block RESET; no data was erased.", code: 6) }
+        // A committed selection is preserved byte-for-byte; a relocation receipt
+        // or either retirement fence is deliberately outside the allowlist.
+        if names.contains("storage-location.json") { _ = try StoreLocation(bootstrapRoot: store.root).resolve() }
+        if names.contains(SnapshotCopyObservations.name) { _ = try SnapshotCopyObservations.read(store.root) }
+        let volumes = try directory.child("volumes")
+        try volumes.requireOwnedDirectory(device: root.device, privateMode: true)
+        let config = try store.load()
+        guard Set(config.folders.map(\.id)).count == config.folders.count else { throw NestError("Duplicate folder records block RESET.", code: 6) }
+        for folder in config.folders {
+            guard !Paths.overlaps(folder.path, store.root.path),
+                  !Paths.mounts().contains(where: { $0.path == folder.path || $0.path.hasPrefix(folder.path + "/") }) else { throw NestError("Original path overlaps storage or remains mounted; RESET stopped.", code: 6) }
+            try Paths.checkedIdentity(folder)
+            guard try volumes.exists(folder.id.uuidString) else { throw NestError("Missing volume record blocks RESET.", code: 6) }
+        }
+        for name in try volumes.names() {
+            try idle(volumes.child(name).readJSON(Journal.self, "journal.json", decoder: store.journalDecoder), assertAbsent: assertAbsent)
+        }
+        // One root-relative, strong-hash inventory also pins every ancestor.
+        // Manifest-validated payload hardlinks are only unlinked, never modified.
+        let items = try transaction.scan(root, excluding: preserved.subtracting(["volumes"]), resetInventory: true)
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        var result = config; result.folders = []
+        let configuration: Data? = try directory.exists("configuration.json") ? readConfiguration(directory) : nil
+        return Receipt(root: root, volumes: try StorageRelocation.Root(store.root.appendingPathComponent("volumes")), inventory: items, configuration: configuration, result: try encoder.encode(result))
+    }
+    static func readConfiguration(_ root: DirectoryHandle) throws -> Data {
+        // Reads an owned, regular, bounded control file via an anchored fd.
+        let st = try root.entryStat("configuration.json")
+        guard st.st_mode & S_IFMT == S_IFREG, st.st_uid == getuid(), st.st_nlink == 1, st.st_size <= 64 << 20 else { throw NestError("Unsafe RESET configuration.", code: 6) }
+        let fd = openat(root.fd, "configuration.json", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { throw NestError("Cannot read RESET configuration.", code: 6) }
+        defer { close(fd) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0, opened.st_ino == st.st_ino, opened.st_dev == st.st_dev else { throw NestError("RESET configuration changed.", code: 6) }
+        return try FileHandle(fileDescriptor: fd, closeOnDealloc: false).readToEnd() ?? Data()
+    }
+    // This receipt is published only after every managed unmount and idle
+    // check succeeds. Its anchored authority also permits Quit during cleanup.
+    static func validateReceipt(_ receipt: Receipt, store: Store) throws -> DirectoryHandle {
+        guard receipt.version == 1, receipt.root.path == store.root.path, receipt.inventory.count <= 100_000,
+              Set(receipt.inventory.map(\.path)).count == receipt.inventory.count,
+              try JSONDecoder().decode(Configuration.self, from: receipt.result).folders.isEmpty else { throw NestError("Invalid RESET receipt; preserve it for recovery.", code: 6) }
+        try store.resetAuthority()
+        let directory = try receipt.root.open()
+        guard receipt.volumes.path == store.root.appendingPathComponent("volumes").path else { throw NestError("Invalid RESET volume anchor.", code: 6) }
+        _ = try receipt.volumes.open()
+        let currentConfig = try directory.exists("configuration.json") ? readConfiguration(directory) : nil
+        guard currentConfig == receipt.configuration || currentConfig == receipt.result else { throw NestError("Configuration changed during RESET; cleanup stopped.", code: 6) }
+        return directory
+    }
+    static func finish(_ receipt: Receipt, store: Store, transaction: StorageRelocation.Transaction,
+                       checkpoint: ((String) throws -> Void)?) throws {
+        let directory = try validateReceipt(receipt, store: store)
+        let expected = Dictionary(uniqueKeysWithValues: receipt.inventory.map { ($0.path, $0) })
+        for item in receipt.inventory {
+            let parts = item.path.split(separator: "/", omittingEmptySubsequences: false)
+            guard parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("\0") }),
+                  (item.path == "volumes" || item.path.hasPrefix("volumes/") || item.path == SnapshotCopyObservations.name), item.device == receipt.root.device else { throw NestError("Invalid RESET inventory path.", code: 6) }
+        }
+        guard Set(try directory.names()).isSubset(of: preserved.union([SnapshotCopyObservations.name])) else { throw NestError("Unknown data appeared during RESET; cleanup stopped.", code: 6) }
+        // Scan all remaining entries before the next unlink. The existing opaque
+        // scanner checks owner, no-follow opens, device, fsid, mounts and content.
+        let actual = try transaction.scan(receipt.root, excluding: preserved.subtracting(["volumes"]), matching: receipt.inventory, resetInventory: true)
+            .filter { $0.path != "volumes" }
+        for item in actual {
+            guard let original = expected[item.path], original.device == item.device, original.inode == item.inode,
+                  original.sameContent(item, directoryTimes: false) else { throw NestError("RESET inventory changed at \(item.path); remaining data retained.", code: 6) }
+        }
+        for item in actual.sorted(by: { $0.path.split(separator: "/").count > $1.path.split(separator: "/").count }) {
+            try store.resetAuthority()
+            _ = try receipt.root.open()
+            let (parent, name) = try transaction.parent(directory, path: item.path, inventory: expected)
+            let current = try transaction.inspect(parent, name: name, relative: item.path, device: receipt.root.device, allowSnapshotHardlinks: true)
+            guard item.inode == current.inode, item.device == current.device, item.sameContent(current, directoryTimes: false) else { throw NestError("RESET entry changed; cleanup stopped.", code: 6) }
+            try checkpoint?("unlink")
+            guard unlinkat(parent.fd, name, item.kind == UInt16(S_IFDIR) ? AT_REMOVEDIR : 0) == 0 else { throw NestError("RESET cleanup failed: \(String(cString: strerror(errno))). Retry RESET in Settings.", code: 6) }
+            try parent.sync()
+        }
+        try store.resetAuthority()
+        try checkpoint?("configuration")
+        try transaction.atomic(receipt.result, directory: directory, name: "configuration.json")
+        try checkpoint?("commit")
+        guard unlinkat(directory.fd, receiptName, 0) == 0 else { throw NestError("RESET cleanup receipt could not be retired; retry in Settings.", code: 6) }
+        try directory.sync()
     }
 }

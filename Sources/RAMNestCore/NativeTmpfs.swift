@@ -283,7 +283,7 @@ enum NativeJournalTransition {
             throw NestError("Only completed idle authority can be reset.", code: 6)
         }
         SnapshotRetention.remember(&journal)
-        journal.managedLink = nil; journal.nativeTmpfs = nil
+        journal.managedLink = nil; journal.nativeTmpfs = nil; journal.resetUnmountSession = nil
         journal.populationVerified = false; journal.mountedDevice = nil; journal.session = nil; journal.socket = nil
         journal.initialRevision = nil; journal.restoreRevision = nil
         journal.initialSourceManifest = nil; journal.restoreManifest = nil
