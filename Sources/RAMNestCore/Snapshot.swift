@@ -4,7 +4,7 @@ import Darwin
 
 // Authority for one coordinator-owned rename window, never a general manifest
 // comparison mode. Intent is durable before mutation; an incomplete receipt is
-// retained for review, not promoted by observing an inode after a crash.
+// retained for review unless a v2 swap intent durably recorded both raw sides.
 struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
     enum Operation: String, Codable, Sendable { case evacuation, rollback, publication }
     struct Node: Codable, Equatable, Sendable {
@@ -48,6 +48,7 @@ struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
     var destinationGroup: UInt32
     var before: Observation
     var after: Observation?
+    var publicationSwap: PublicationSwap?
 
     static func observe(_ url: URL, matching: Manifest? = nil, verification: FileVerification? = nil) throws -> Observation {
         let root = try DirectoryHandle.open(url), cursor = DirectoryCursor(root)
@@ -98,7 +99,7 @@ struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
             path.isEmpty || (!path.hasPrefix("/") && !path.contains("\0") && path.utf8.count <= 4096 &&
                 path.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." })
         }
-        guard version == 1, destinationInode > 0, before.nodes.count <= StorageModes.maximumRecords,
+        guard [1, 2].contains(version), (version == 2) == (publicationSwap != nil), destinationInode > 0, before.nodes.count <= StorageModes.maximumRecords,
               before.nodes.first?.path == "", Set(before.nodes.map(\.path)).count == before.nodes.count,
               before.manifest.publicRoot?.path == "", before.manifest.publicRoot?.kind == "directory",
               before.manifest.entries.count + before.opaque.count + 1 == before.nodes.count,
@@ -111,6 +112,7 @@ struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
             throw Self.failure(".", "invalid rename receipt")
         }
         _ = try before.manifest.copyFidelityView()
+        try validatePublicationSwap()
         if let after {
             guard after.manifest.publicRoot?.path == "", after.manifest.publicRoot?.kind == "directory" else { throw Self.failure(".", "missing raw completed root") }
             _ = try after.manifest.copyFidelityView()
@@ -121,6 +123,7 @@ struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
         try validate()
         guard self.folder == folder.id, session == journal.session, self.operation == operation,
               before.manifest.fileVerification == journal.fileVerification else { throw Self.failure(".", "receipt binding changed") }
+        try boundPublicationSwap(to: folder, journal: journal)
     }
     // The exception applies only to the actual renamed inodes, including a
     // hardlink alias of one of them. All other raw fields remain exact.
@@ -159,7 +162,9 @@ struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
         }
         if wholeRoot {
             guard let a = observed.manifest.publicRoot, let b = before.manifest.publicRoot else { throw Self.failure(".", "missing public root") }
-            try check(a, b)
+            if let swap = publicationSwap {
+                try check(swap.directoryAfter.removing(from: a), swap.directoryBefore.removing(from: b))
+            } else { try check(a, b) }
         }
     }
     private static func renameEntryView(_ entry: Entry) throws -> Entry {
@@ -168,12 +173,14 @@ struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
     }
     mutating func complete(at url: URL) throws {
         guard after == nil else { throw Self.failure(".", "rename receipt already completed") }
+        guard publicationSwap == nil else { throw Self.failure(".", "swap requires both raw after observations") }
         let observed = try Self.observe(url, matching: before.manifest)
         try compare(observed); after = observed
     }
     func verify(at url: URL) throws -> Manifest {
         try validate()
         guard let after else { throw Self.failure(".", "unacknowledged rename requires review") }
+        guard publicationSwap == nil || publicationSwap?.destinationPath == url.path else { throw Self.failure(".", "swap readback path changed") }
         let actual = try Self.observe(url, matching: after.manifest)
         guard actual == after else { throw Self.failure(".", "raw post-rename observation changed") }
         return after.manifest
@@ -184,24 +191,507 @@ struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
     // unrenamed descendants retain exact ctimes. This creates no after receipt.
     func verifyStrictIncomplete(at url: URL) throws -> Manifest {
         try validate()
-        guard after == nil else { throw Self.failure(".", "expected incomplete rename intent") }
+        guard after == nil, publicationSwap == nil else { throw Self.failure(".", "expected strict non-swap incomplete rename intent") }
         let actual = try Self.observe(url, matching: before.manifest)
         try compare(actual, allowProvenanceChanges: false)
         return actual.manifest
     }
+    // Reviewed legacy recovery is an acknowledgement of missing history, never
+    // a completed rename receipt. Normalize only these locally supplied raw
+    // root observations; the stored receipt and both observations stay intact.
+    func validateReviewedPublication(_ actual: Observation, macl: MACL, displaced: SwapLink) throws {
+        try validate()
+        guard version == 1, operation == .publication, wholeRoot, after == nil,
+              publicationSwap == nil, macl.digest == nil,
+              let priorRoot = before.manifest.publicRoot, let actualRoot = actual.manifest.publicRoot,
+              priorRoot.attributes[MACL.name] == displaced.macl.digest else {
+            throw Self.failure(".", "not the narrowly supported legacy publication review")
+        }
+        var comparison = self, observed = actual
+        comparison.before.manifest.publicRoot = try displaced.macl.removing(from: priorRoot)
+        observed.manifest.publicRoot = try macl.removing(from: actualRoot)
+        try comparison.compare(observed)
+    }
     // Explicit null is not an absent completion, and an unknown version cannot
     // select legacy journal recovery. Encoding omits the pending after field.
-    private enum CodingKeys: String, CodingKey { case version, operation, folder, session, wholeRoot, names, destinationDevice, destinationInode, destinationOwner, destinationGroup, before, after }
+    private enum CodingKeys: String, CodingKey, CaseIterable { case version, operation, folder, session, wholeRoot, names, destinationDevice, destinationInode, destinationOwner, destinationGroup, before, after, publicationSwap }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         version = try c.decode(Int.self, forKey: .version); operation = try c.decode(Operation.self, forKey: .operation)
+        if version == 2 { try Self.requireFields(decoder, required: [], allowed: Set(CodingKeys.allCases.map(\.rawValue))) }
         folder = try c.decode(UUID.self, forKey: .folder); session = try c.decode(UUID.self, forKey: .session)
         wholeRoot = try c.decode(Bool.self, forKey: .wholeRoot); names = try c.decode([String].self, forKey: .names)
         destinationDevice = try c.decode(UInt64.self, forKey: .destinationDevice); destinationInode = try c.decode(UInt64.self, forKey: .destinationInode)
         destinationOwner = try c.decode(UInt32.self, forKey: .destinationOwner); destinationGroup = try c.decode(UInt32.self, forKey: .destinationGroup)
         before = try c.decode(Observation.self, forKey: .before)
         after = c.contains(.after) ? try c.decode(Observation.self, forKey: .after) : nil
+        publicationSwap = c.contains(.publicationSwap) ? try c.decode(PublicationSwap.self, forKey: .publicationSwap) : nil
         try validate()
+    }
+}
+
+extension VerifiedRenameReceipt {
+    private struct WireKey: CodingKey {
+        var stringValue: String
+        var intValue: Int? { nil }
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+    }
+    private static func requireFields(_ decoder: Decoder, required: Set<String>, allowed: Set<String>) throws {
+        let container = try decoder.container(keyedBy: WireKey.self)
+        let keys = Set(container.allKeys.map(\.stringValue))
+        guard required.isSubset(of: keys), keys.isSubset(of: allowed) else { throw failure(".", "unknown or missing swap evidence fields") }
+    }
+    // No grant bytes are stored or reapplied. This is measured no-follow evidence
+    // for one pathname-preserving MACL exchange, not an xattr comparison policy.
+    struct MACL: Codable, Equatable, Sendable {
+        static let name = "com.apple.macl"
+        var digest: String?
+        var bytes: UInt64
+        private enum CodingKeys: String, CodingKey { case digest, bytes }
+        init(digest: String?, bytes: UInt64) { self.digest = digest; self.bytes = bytes }
+        init(from decoder: Decoder) throws {
+            try VerifiedRenameReceipt.requireFields(decoder, required: ["bytes"], allowed: ["digest", "bytes"])
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            digest = c.contains(.digest) ? try c.decode(String.self, forKey: .digest) : nil
+            bytes = try c.decode(UInt64.self, forKey: .bytes)
+            try validate()
+        }
+        func validate() throws {
+            guard bytes <= 1 << 20, digest.map({ $0.count == 64 && $0.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }) ?? (bytes == 0) else {
+                throw VerifiedRenameReceipt.failure(".", "invalid measured MACL")
+            }
+        }
+        static func observe(_ url: URL) throws -> MACL {
+            let count = getxattr(url.path, name, nil, 0, 0, XATTR_NOFOLLOW)
+            if count < 0 {
+                guard errno == ENOATTR else { throw VerifiedRenameReceipt.failure(".", "cannot observe MACL") }
+                return MACL(digest: nil, bytes: 0)
+            }
+            guard count <= 1 << 20 else { throw VerifiedRenameReceipt.failure(".", "MACL bound exceeded") }
+            var data = Data(count: count)
+            guard data.withUnsafeMutableBytes({ getxattr(url.path, name, $0.baseAddress, count, 0, XATTR_NOFOLLOW) }) == count else {
+                throw VerifiedRenameReceipt.failure(".", "MACL changed during observation")
+            }
+            return MACL(digest: Snapshot.digest(data), bytes: UInt64(count))
+        }
+        func removing(from entry: Entry) throws -> Entry {
+            try validate()
+            let cost = digest == nil ? 0 : bytes + UInt64(Self.name.utf8.count)
+            guard entry.attributes[Self.name] == digest, cost <= entry.attributeBytes else {
+                throw VerifiedRenameReceipt.failure(".", "MACL observation/accounting disagrees")
+            }
+            var result = entry; result.attributes.removeValue(forKey: Self.name); result.attributeBytes -= cost
+            return result
+        }
+    }
+    struct SwapLink: Codable, Equatable, Sendable {
+        var node: Node
+        var entry: Entry
+        var macl: MACL
+        private enum CodingKeys: String, CodingKey { case node, entry, macl }
+        init(node: Node, entry: Entry, macl: MACL) { self.node = node; self.entry = entry; self.macl = macl }
+        init(from decoder: Decoder) throws {
+            try VerifiedRenameReceipt.requireFields(decoder, required: ["node", "entry", "macl"], allowed: ["node", "entry", "macl"])
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            node = try c.decode(Node.self, forKey: .node); entry = try c.decode(Entry.self, forKey: .entry); macl = try c.decode(MACL.self, forKey: .macl)
+        }
+        static func observe(_ url: URL) throws -> SwapLink {
+            let parent = try DirectoryHandle.open(url.deletingLastPathComponent()), name = url.lastPathComponent
+            let prior = Node("", try parent.entryStat(name))
+            guard prior.mode & UInt16(S_IFMT) == UInt16(S_IFLNK), prior.links == 1,
+                  prior.owner == getuid(), prior.group == getgid() else { throw VerifiedRenameReceipt.failure(".", "unsafe swap link") }
+            try Snapshot.supportedSecurity(url, parent.entryStat(name))
+            var target = [CChar](repeating: 0, count: Int(MAXPATHLEN) + 1)
+            let count = readlinkat(parent.fd, name, &target, target.count - 1)
+            guard count > 0, count < target.count - 1 else { throw VerifiedRenameReceipt.failure(".", "cannot read swap link") }
+            let destination = String(decoding: target.prefix(count).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            var entry = Entry(path: "", kind: "symlink", size: prior.size, mode: prior.mode & 0o7777,
+                mtimeSeconds: prior.mtimeSeconds, mtimeNanos: prior.mtimeNanos, checksum: destination,
+                attributes: try Snapshot.attributes(url), flags: prior.flags, attributeBytes: 0)
+            try Snapshot.accountAttributes(url, entry: &entry)
+            let macl = try MACL.observe(url)
+            _ = try macl.removing(from: entry)
+            guard prior == Node("", try parent.entryStat(name)), try Snapshot.attributes(url) == entry.attributes,
+                  try MACL.observe(url) == macl,
+                  try DirectoryHandle.open(url.deletingLastPathComponent()).identity() == parent.identity() else {
+                throw VerifiedRenameReceipt.failure(".", "swap link changed during observation")
+            }
+            return SwapLink(node: prior, entry: entry, macl: macl)
+        }
+    }
+    struct PublicationSwap: Codable, Equatable, Sendable {
+        var sourcePath: String
+        var destinationPath: String
+        var sourceParent: LinkedFolderLayout.Identity
+        var directoryBefore: MACL
+        // Expected pathname grant, independently measured again after the swap.
+        var directoryAfter: MACL
+        var linkBefore: SwapLink
+        var linkAfter: SwapLink?
+        private enum CodingKeys: String, CodingKey { case sourcePath, destinationPath, sourceParent, directoryBefore, directoryAfter, linkBefore, linkAfter }
+        init(sourcePath: String, destinationPath: String, sourceParent: LinkedFolderLayout.Identity, directoryBefore: MACL, directoryAfter: MACL, linkBefore: SwapLink) {
+            self.sourcePath = sourcePath; self.destinationPath = destinationPath; self.sourceParent = sourceParent
+            self.directoryBefore = directoryBefore; self.directoryAfter = directoryAfter; self.linkBefore = linkBefore
+        }
+        init(from decoder: Decoder) throws {
+            let required: Set<String> = ["sourcePath", "destinationPath", "sourceParent", "directoryBefore", "directoryAfter", "linkBefore"]
+            try VerifiedRenameReceipt.requireFields(decoder, required: required, allowed: required.union(["linkAfter"]))
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            sourcePath = try c.decode(String.self, forKey: .sourcePath); destinationPath = try c.decode(String.self, forKey: .destinationPath)
+            sourceParent = try c.decode(LinkedFolderLayout.Identity.self, forKey: .sourceParent)
+            directoryBefore = try c.decode(MACL.self, forKey: .directoryBefore); directoryAfter = try c.decode(MACL.self, forKey: .directoryAfter)
+            linkBefore = try c.decode(SwapLink.self, forKey: .linkBefore)
+            linkAfter = c.contains(.linkAfter) ? try c.decode(SwapLink.self, forKey: .linkAfter) : nil
+        }
+    }
+    static func publicationSource(_ journal: Journal) throws -> URL {
+        guard let layout = journal.managedLink else { throw failure(".", "missing swap layout") }
+        if layout.restoration == .original { return layout.originalDataURL }
+        guard layout.restoration == .checkpoint, let stage = journal.restoreStage else { throw failure(".", "missing swap source") }
+        return URL(fileURLWithPath: stage).appendingPathExtension("data")
+    }
+    func boundPublicationSwap(to folder: Folder, journal: Journal) throws {
+        guard let swap = publicationSwap else { return }
+        guard let layout = journal.managedLink, layout.folderID == folder.id, layout.session == session,
+              [.publishing, .restored].contains(layout.stage), layout.originalPath == folder.path,
+              journal.originalRename?.after != nil, journal.restoreManifest == (after?.manifest ?? before.manifest),
+              operation == (layout.restoration == .original ? .rollback : .publication),
+              swap.destinationPath == folder.path, swap.sourcePath == (try Self.publicationSource(journal)).path,
+              layout.parent.device == destinationDevice, layout.parent.inode == destinationInode,
+              layout.link?.device == swap.linkBefore.node.device, layout.link?.inode == swap.linkBefore.node.inode,
+              layout.mountPath == swap.linkBefore.entry.checksum,
+              layout.restored?.device == before.nodes.first?.device, layout.restored?.inode == before.nodes.first?.inode,
+              swap.sourceParent == (layout.restoration == .original ? layout.holding : layout.parent) else {
+            throw Self.failure(".", "swap journal/path/identity binding changed")
+        }
+    }
+    mutating func preparePublicationSwap(source: URL, destination: URL, folder: Folder, journal: Journal) throws {
+        guard version == 1, publicationSwap == nil, after == nil else { throw Self.failure(".", "swap intent already recorded") }
+        let link = try SwapLink.observe(destination)
+        let macl = try MACL.observe(source)
+        guard let root = before.manifest.publicRoot else { throw Self.failure(".", "missing swap root") }
+        _ = try macl.removing(from: root)
+        publicationSwap = PublicationSwap(sourcePath: source.path, destinationPath: destination.path,
+            sourceParent: try .init(DirectoryHandle.open(source.deletingLastPathComponent()).identity()),
+            directoryBefore: macl, directoryAfter: link.macl, linkBefore: link)
+        version = 2
+        try bound(to: folder, journal: journal, operation: operation)
+        try verifyPublicationSwapPreflight(folder: folder, journal: journal)
+    }
+    func verifyPublicationSwapPreflight(folder: Folder, journal: Journal) throws {
+        try bound(to: folder, journal: journal, operation: operation)
+        guard let swap = publicationSwap, after == nil,
+              try Self.observe(URL(fileURLWithPath: swap.sourcePath), matching: before.manifest) == before,
+              try MACL.observe(URL(fileURLWithPath: swap.sourcePath)) == swap.directoryBefore,
+              try SwapLink.observe(URL(fileURLWithPath: swap.destinationPath)) == swap.linkBefore else {
+            throw Self.failure(".", "raw swap preflight changed")
+        }
+        try swap.sourceParent.verify(DirectoryHandle.open(URL(fileURLWithPath: swap.sourcePath).deletingLastPathComponent()))
+        let parent = try DirectoryHandle.open(URL(fileURLWithPath: swap.destinationPath).deletingLastPathComponent())
+        var st = stat()
+        guard try parent.identity() == (destinationDevice, destinationInode), fstat(parent.fd, &st) == 0,
+              st.st_uid == destinationOwner, st.st_gid == destinationGroup else { throw Self.failure(".", "swap parent changed") }
+    }
+    func validatePublicationSwap() throws {
+        guard let swap = publicationSwap else { return }
+        guard wholeRoot, operation != .evacuation, swap.sourcePath != swap.destinationPath,
+              [swap.sourcePath, swap.destinationPath].allSatisfy({ $0.hasPrefix("/") && URL(fileURLWithPath: $0).standardizedFileURL.path == $0 && !$0.contains("\0") }),
+              swap.sourceParent.inode > 0, swap.sourceParent.device == destinationDevice,
+              before.nodes.first?.device == destinationDevice,
+              swap.linkBefore.node.device == destinationDevice,
+              swap.linkBefore.node.inode != before.nodes.first?.inode,
+              swap.linkBefore.node.mode & UInt16(S_IFMT) == UInt16(S_IFLNK), swap.linkBefore.node.links == 1,
+              swap.linkBefore.node.owner == getuid(), swap.linkBefore.node.group == getgid(),
+              swap.directoryAfter == swap.linkBefore.macl, (after == nil) == (swap.linkAfter == nil),
+              let root = before.manifest.publicRoot else { throw Self.failure(".", "invalid publication swap") }
+        _ = try swap.directoryBefore.removing(from: root)
+        _ = try swap.linkBefore.macl.removing(from: swap.linkBefore.entry)
+        if let link = swap.linkAfter, let after {
+            guard link.macl == swap.directoryBefore, let root = after.manifest.publicRoot else { throw Self.failure(".", "MACL did not remain at both pathnames") }
+            _ = try swap.directoryAfter.removing(from: root)
+            var node = link.node
+            node.ctimeSeconds = swap.linkBefore.node.ctimeSeconds; node.ctimeNanos = swap.linkBefore.node.ctimeNanos
+            guard node == swap.linkBefore.node,
+                  try Self.renameEntryView(link.macl.removing(from: link.entry)) == Self.renameEntryView(swap.linkBefore.macl.removing(from: swap.linkBefore.entry)) else {
+                throw Self.failure(".", "displaced swap link identity/raw metadata changed")
+            }
+        }
+    }
+    mutating func completePublicationSwap(folder: Folder, journal: Journal) throws {
+        try bound(to: folder, journal: journal, operation: operation)
+        guard let swap = publicationSwap, after == nil else { throw Self.failure(".", "missing pending swap authority") }
+        try swap.sourceParent.verify(DirectoryHandle.open(URL(fileURLWithPath: swap.sourcePath).deletingLastPathComponent()))
+        let parent = try DirectoryHandle.open(URL(fileURLWithPath: swap.destinationPath).deletingLastPathComponent())
+        var st = stat()
+        guard try parent.identity() == (destinationDevice, destinationInode), fstat(parent.fd, &st) == 0,
+              st.st_uid == destinationOwner, st.st_gid == destinationGroup else { throw Self.failure(".", "swap destination parent changed") }
+        var completed = self
+        completed.after = try Self.observe(URL(fileURLWithPath: swap.destinationPath), matching: before.manifest)
+        guard try MACL.observe(URL(fileURLWithPath: swap.destinationPath)) == swap.directoryAfter else { throw Self.failure(".", "published MACL relationship changed") }
+        completed.publicationSwap?.linkAfter = try SwapLink.observe(URL(fileURLWithPath: swap.sourcePath))
+        try completed.validate()
+        self = completed
+    }
+    // Crash recovery may complete only a v2 intent that recorded BOTH sides
+    // before mutation. A legacy v1 incomplete intent is never adopted here.
+    func verifyDisplacedSwapLink(at url: URL) throws {
+        guard let swap = publicationSwap else { return }
+        try validate()
+        try swap.sourceParent.verify(DirectoryHandle.open(url.deletingLastPathComponent()))
+        guard url.path == swap.sourcePath, let expected = swap.linkAfter,
+              try SwapLink.observe(url) == expected else { throw Self.failure(".", "raw post-swap link changed") }
+    }
+    func matchesPublicationCopy(_ published: Manifest, of source: Manifest) throws -> Bool {
+        try validate()
+        guard let after, after.manifest == published else { return false }
+        // validate proves the exact swap relationship. Bind the unmodified raw
+        // copy source to the revision; final readback still uses raw after.
+        return try (publicationSwap == nil ? published : before.manifest).matchesCopy(of: source)
+    }
+}
+
+/// An in-memory, single-use review. Only Engine can issue it; no CLI command
+/// constructs or automatically accepts one. Its binding is immutable.
+public struct LegacyPublicationReview: Sendable {
+    struct ControlRecord: Equatable, Sendable {
+        let bytes: Data
+        let node: VerifiedRenameReceipt.Node
+    }
+    public let token: UUID
+    public var folderPath: String { evidence.folder.path }
+    public var revision: String { evidence.latest.id }
+    public var initialRevision: String { evidence.initial.id }
+    public var retainedOriginalPath: String { evidence.layout.originalDataURL.path }
+    public var retainedLinkPath: String { evidence.stagePath + ".data" }
+    public let snapshotPath: String
+    let evidence: ReviewedPublicationEvidence
+    let journalControl: ControlRecord
+    let configurationControl: ControlRecord
+    var journalBytes: Data { journalControl.bytes }
+}
+
+// Durable acknowledgement, deliberately distinct from VerifiedRenameReceipt.
+// The raw incomplete receipt is also preserved in originalJournal byte-for-byte.
+struct ReviewedPublicationEvidence: Codable, Equatable, Sendable {
+    struct Revision: Codable, Equatable, Sendable {
+        let id: String
+        let logical: Manifest
+        let materialized: Manifest
+        let raw: VerifiedRenameReceipt.Observation
+        fileprivate enum CodingKeys: String, CodingKey, CaseIterable { case id, logical, materialized, raw }
+
+        func validate() throws {
+            try logical.validateVerification(); try materialized.validateVerification(); try raw.manifest.validateVerification()
+            guard UUID(uuidString: id) != nil, logical.fileVerification == .sha256,
+                  materialized.fileVerification == .sha256, materialized.matchesExpected(logical),
+                  raw.manifest.fileVerification == .sha256, raw.opaque.isEmpty,
+                  let root = raw.manifest.publicRoot, root.path.isEmpty, root.mode == 0o700,
+                  raw.nodes.count == raw.manifest.entries.count + 1,
+                  raw.nodes.map(\.path) == [""] + raw.manifest.entries.map(\.path),
+                  Set(raw.nodes.map(\.path)).count == raw.nodes.count else { throw Self.invalid() }
+            _ = try StorageModes(materialized)
+            _ = try StorageModes(raw.manifest)
+            _ = try raw.manifest.copyFidelityView()
+            let rootNode = raw.nodes[0]
+            for (node, entry) in zip(raw.nodes, [root] + raw.manifest.entries) {
+                let kind = entry.kind == "directory" ? S_IFDIR : entry.kind == "file" ? S_IFREG : S_IFLNK
+                guard node.inode > 0, node.links > 0, node.size >= 0,
+                      node.device == rootNode.device, node.owner == rootNode.owner, node.group == rootNode.group,
+                      node.mode & UInt16(S_IFMT) == UInt16(kind), node.mode & 0o7777 == entry.mode,
+                      node.flags & ~UInt32(entry.kind == "file" ? UF_COMPRESSED : 0) == entry.flags,
+                      (0..<1_000_000_000).contains(node.mtimeNanos), (0..<1_000_000_000).contains(node.ctimeNanos),
+                      entry.kind == "directory" || node.size == entry.size,
+                      entry.kind != "file" || (node.mtimeSeconds == entry.mtimeSeconds && node.mtimeNanos == entry.mtimeNanos) else { throw Self.invalid() }
+            }
+            let controls = raw.manifest.entries.filter { $0.path != "data" && !$0.path.hasPrefix("data/") }
+            let names = Set(controls.map(\.path))
+            guard names == ["manifest.json"] || names == ["manifest.json", "modes.bin"],
+                  controls.allSatisfy({ $0.kind == "file" && $0.mode == 0o600 && $0.hardlink == nil && $0.size > 0 && $0.size <= 64 << 20 }),
+                  let dataRoot = raw.manifest.entries.first(where: { $0.path == "data" }), dataRoot.kind == "directory" else { throw Self.invalid() }
+            // The wrapper/control-file hashes are diagnostic raw readback, not
+            // authentication of original manifest.json bytes (which are not
+            // embedded here and may predate relocation/legacy compatibility).
+            // Only the data subtree, projected through the existing physical
+            // mode policy, binds raw payload/metadata to the logical evidence.
+            func relative(_ entry: Entry) throws -> Entry {
+                var result = entry
+                result.path = entry.path == "data" ? "" : String(entry.path.dropFirst(5))
+                if let anchor = entry.hardlink {
+                    guard anchor.hasPrefix("data/") else { throw Self.invalid() }
+                    result.hardlink = String(anchor.dropFirst(5))
+                }
+                return result
+            }
+            let physical = try Manifest(entries: raw.manifest.entries.filter { $0.path.hasPrefix("data/") }.map(relative), publicRoot: relative(dataRoot))
+            let observed = try names.contains("modes.bin") ? StorageModes(materialized).projecting(physical) : physical
+            guard observed.matchesExpected(materialized) else { throw Self.invalid() }
+        }
+        private static func invalid() -> NestError { NestError("Reviewed snapshot raw/logical/materialized evidence is inconsistent; retained.", code: 6) }
+    }
+    let folder: Folder
+    let originalJournal: Data
+    let layout: LinkedFolderLayout
+    let stagePath: String
+    let parent: VerifiedRenameReceipt.Node
+    let stage: VerifiedRenameReceipt.Node
+    let holding: VerifiedRenameReceipt.Node
+    let published: VerifiedRenameReceipt.Observation
+    let publishedMACL: VerifiedRenameReceipt.MACL
+    let displaced: VerifiedRenameReceipt.SwapLink
+    let original: VerifiedRenameReceipt.Observation
+    let initial: Revision
+    let latest: Revision
+    fileprivate enum CodingKeys: String, CodingKey, CaseIterable { case folder, originalJournal, layout, stagePath, parent, stage, holding, published, publishedMACL, displaced, original, initial, latest }
+
+    func originalState(fixtureRoot: URL?) throws -> Journal {
+        guard originalJournal.count <= 64 << 20,
+              let object = try JSONSerialization.jsonObject(with: originalJournal) as? [String: Any],
+              object["reviewedRecovery"] == nil else { throw NestError("Invalid original reviewed-recovery record; retained.", code: 6) }
+        let decoder = JSONDecoder()
+        if let fixtureRoot { decoder.userInfo[LinkedFolderLayout.decoderRootKey] = fixtureRoot }
+        return try decoder.decode(Journal.self, from: originalJournal)
+    }
+    func validate(fixtureRoot: URL?) throws {
+        try initial.validate(); try latest.validate()
+        let base = try originalState(fixtureRoot: fixtureRoot)
+        guard base.managedLink == layout, layout.stage == .publishing, layout.restoration == .checkpoint,
+              layout.folderID == folder.id, layout.originalPath == folder.path,
+              base.phase != .idle, base.populationVerified, base.fileVerification == .sha256,
+              base.nativeTmpfs?.managedUnmount == true || (fixtureRoot != nil && layout.version == 1),
+              folder.options.sync, base.restoreRevision == latest.id, base.revision == latest.id,
+              base.initialRevision == initial.id, base.restoreStage == stagePath,
+              base.restoreStageDevice == stage.device, base.restoreStageInode == stage.inode,
+              base.restoreDataDevice == layout.restored?.device, base.restoreDataInode == layout.restored?.inode,
+              base.restoreManifest == base.publicationRename?.before.manifest,
+              let receipt = base.publicationRename, let evacuation = base.originalRename,
+              evacuation.after == original, evacuation.folder == folder.id, evacuation.session == layout.session,
+              layout.source.device == original.nodes.first?.device, layout.source.inode == original.nodes.first?.inode,
+              layout.restored?.device == published.nodes.first?.device, layout.restored?.inode == published.nodes.first?.inode,
+              layout.parent.device == parent.device, layout.parent.inode == parent.inode,
+              layout.holding?.device == holding.device, layout.holding?.inode == holding.inode,
+              layout.link?.device == displaced.node.device, layout.link?.inode == displaced.node.inode,
+              displaced.entry.checksum == layout.mountPath,
+              receipt.destinationDevice == parent.device, receipt.destinationInode == parent.inode,
+              receipt.destinationOwner == parent.owner, receipt.destinationGroup == parent.group,
+              try receipt.before.manifest.matchesCopy(of: latest.materialized),
+              try evacuation.before.manifest.matchesCopy(of: initial.materialized),
+              initial.id != latest.id || initial == latest else {
+            throw NestError("Reviewed recovery evidence does not bind the original transaction and committed snapshots; retained.", code: 6)
+        }
+        try receipt.bound(to: folder, journal: base, operation: .publication)
+        try receipt.validateReviewedPublication(published, macl: publishedMACL, displaced: displaced)
+    }
+}
+
+struct ReviewedRecoveryAcknowledgement: Codable, Equatable, Sendable {
+    struct Acceptance: Codable, Equatable, Sendable {
+        let token: UUID
+        let date: Date
+        let acceptsMissingHistoricRecord: Bool
+        fileprivate enum CodingKeys: String, CodingKey, CaseIterable { case token, date, acceptsMissingHistoricRecord }
+    }
+    var version = 1
+    // Keep large immutable evidence off every Journal's inline representation,
+    // including nil acknowledgements in ordinary transaction debug frames.
+    // Acceptance history and completion remain independent value/COW state.
+    private final class EvidenceBox: Encodable, Sendable {
+        let value: ReviewedPublicationEvidence
+        init(_ value: ReviewedPublicationEvidence) { self.value = value }
+        func encode(to encoder: Encoder) throws { try value.encode(to: encoder) }
+    }
+    private let evidenceBox: EvidenceBox
+    var evidence: ReviewedPublicationEvidence { evidenceBox.value }
+    var acceptances: [Acceptance]
+    var completedAt: Date?
+    private enum CodingKeys: String, CodingKey, CaseIterable { case version, evidence, acceptances, completedAt }
+    init(evidence: ReviewedPublicationEvidence, acceptance: Acceptance) { evidenceBox = EvidenceBox(evidence); acceptances = [acceptance] }
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.version == rhs.version && lhs.evidence == rhs.evidence && lhs.acceptances == rhs.acceptances && lhs.completedAt == rhs.completedAt
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(version, forKey: .version); try c.encode(evidenceBox, forKey: .evidence)
+        try c.encode(acceptances, forKey: .acceptances); try c.encodeIfPresent(completedAt, forKey: .completedAt)
+    }
+    init(from decoder: Decoder) throws {
+        try ReviewedEvidenceFields.require(decoder, required: ["version", "evidence", "acceptances"], allowed: Set(CodingKeys.allCases.map(\.rawValue)))
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decode(Int.self, forKey: .version)
+        evidenceBox = try EvidenceBox(c.decode(ReviewedPublicationEvidence.self, forKey: .evidence))
+        acceptances = try c.decode([Acceptance].self, forKey: .acceptances)
+        completedAt = c.contains(.completedAt) ? try c.decode(Date.self, forKey: .completedAt) : nil
+        guard version == 1, !acceptances.isEmpty, acceptances.count <= 128,
+              acceptances.allSatisfy({ $0.acceptsMissingHistoricRecord && $0.date.timeIntervalSince1970.isFinite }),
+              Set(acceptances.map(\.token)).count == acceptances.count else {
+            throw NestError("Invalid explicit reviewed recovery acceptance; retained.", code: 6)
+        }
+        guard completedAt.map({ $0.timeIntervalSince1970.isFinite && $0 >= acceptances.last!.date }) ?? true else {
+            throw NestError("Invalid reviewed recovery completion date; retained.", code: 6)
+        }
+        try evidence.validate(fixtureRoot: decoder.userInfo[LinkedFolderLayout.decoderRootKey] as? URL)
+    }
+    func validate(journal: Journal, fixtureRoot: URL?) throws {
+        var base = try evidence.originalState(fixtureRoot: fixtureRoot), actual = journal
+        base.updated = actual.updated
+        actual.reviewedRecovery = nil
+        if completedAt != nil {
+            base.managedLink?.stage = .restored; base.managedLink?.mountReleased = true
+            base.phase = .idle; base.mountedDevice = nil; base.socket = nil; base.lastError = nil
+            base.nativeTmpfs?.quiescence = nil; base.nativeTmpfs?.periodicAuthorization = nil
+            base.quiescedRevision = nil; base.quiescedSession = nil
+            base.cleanupWarning = retentionNotice
+        }
+        guard actual == base else { throw NestError("Reviewed recovery journal diverged from its acknowledged transaction; retained.", code: 6) }
+    }
+    var retentionNotice: String {
+        "Reviewed recovery completed; historical pre-swap link metadata remains unavailable. Backups and evidence retained. Original: \(evidence.layout.originalDataURL.path). Displaced link: \(evidence.stagePath).data. Snapshots: initial \(evidence.initial.id), latest \(evidence.latest.id). Automatic cleanup and remount are paused; explicit RESET can delete managed snapshots/records but preserves these external recovery folders."
+    }
+}
+
+// Strictness is deliberately confined to these new acknowledgement-owned
+// types. Historical Journal/Manifest/Entry decoders keep their existing policy.
+private enum ReviewedEvidenceFields {
+    private struct Key: CodingKey {
+        let stringValue: String; var intValue: Int? { nil }
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+    }
+    static func require(_ decoder: Decoder, required: Set<String>, allowed: Set<String>) throws {
+        let c = try decoder.container(keyedBy: Key.self), keys = Set(c.allKeys.map(\.stringValue))
+        guard required.isSubset(of: keys), keys.isSubset(of: allowed) else { throw NestError("Unknown or missing reviewed recovery evidence fields; retained.", code: 6) }
+    }
+}
+extension ReviewedPublicationEvidence {
+    init(from decoder: Decoder) throws {
+        let fields = Set(CodingKeys.allCases.map(\.rawValue))
+        try ReviewedEvidenceFields.require(decoder, required: fields, allowed: fields)
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        folder = try c.decode(Folder.self, forKey: .folder); originalJournal = try c.decode(Data.self, forKey: .originalJournal)
+        layout = try c.decode(LinkedFolderLayout.self, forKey: .layout); stagePath = try c.decode(String.self, forKey: .stagePath)
+        parent = try c.decode(VerifiedRenameReceipt.Node.self, forKey: .parent); stage = try c.decode(VerifiedRenameReceipt.Node.self, forKey: .stage)
+        holding = try c.decode(VerifiedRenameReceipt.Node.self, forKey: .holding); published = try c.decode(VerifiedRenameReceipt.Observation.self, forKey: .published)
+        publishedMACL = try c.decode(VerifiedRenameReceipt.MACL.self, forKey: .publishedMACL); displaced = try c.decode(VerifiedRenameReceipt.SwapLink.self, forKey: .displaced)
+        original = try c.decode(VerifiedRenameReceipt.Observation.self, forKey: .original)
+        initial = try c.decode(Revision.self, forKey: .initial); latest = try c.decode(Revision.self, forKey: .latest)
+    }
+}
+extension ReviewedPublicationEvidence.Revision {
+    init(from decoder: Decoder) throws {
+        let fields = Set(CodingKeys.allCases.map(\.rawValue))
+        try ReviewedEvidenceFields.require(decoder, required: fields, allowed: fields)
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id); logical = try c.decode(Manifest.self, forKey: .logical)
+        materialized = try c.decode(Manifest.self, forKey: .materialized); raw = try c.decode(VerifiedRenameReceipt.Observation.self, forKey: .raw)
+    }
+}
+extension ReviewedRecoveryAcknowledgement.Acceptance {
+    init(from decoder: Decoder) throws {
+        let fields = Set(CodingKeys.allCases.map(\.rawValue))
+        try ReviewedEvidenceFields.require(decoder, required: fields, allowed: fields)
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        token = try c.decode(UUID.self, forKey: .token); date = try c.decode(Date.self, forKey: .date)
+        acceptsMissingHistoricRecord = try c.decode(Bool.self, forKey: .acceptsMissingHistoricRecord)
     }
 }
 
@@ -580,7 +1070,7 @@ public enum Snapshot {
         }
         return Manifest(entries: entries.sorted { $0.path < $1.path }, publicRoot: rootEntry, fileVerification: policy)
     }
-    private static func accountAttributes(_ url: URL, entry: inout Entry) throws {
+    static func accountAttributes(_ url: URL, entry: inout Entry) throws {
         var st = stat()
         guard lstat(url.path, &st) == 0 else { throw readFailure("Cannot inspect attribute accounting", errno, url) }
         let fd = open(url.path, O_RDONLY | O_CLOEXEC | (st.st_mode & S_IFMT == S_IFLNK ? O_SYMLINK : O_NOFOLLOW))
@@ -971,6 +1461,7 @@ enum SnapshotRetention {
     // durable journal are verified. Failures are reported without failing saves.
     static func clean(store: Store, folder: Folder, journal: inout Journal, validateSource: () throws -> Void,
                       beforeSiblingUnlink: ((DirectoryHandle, String) throws -> Void)? = nil) {
+        guard journal.reviewedRecovery == nil else { return }
         guard journal.phase == .idle || journal.phase == .mounted,
               journal.lastError == nil, let latest = journal.revision else { return }
         do {

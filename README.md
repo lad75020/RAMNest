@@ -190,3 +190,11 @@ the default confirmation. Close files and finish recovery or pending storage
 moves first. Errors appear in Settings; retry RESET after fixing the cause. An
 interrupted cleanup pauses other repository operations until RESET completes.
 If only relaunch failed, **Retry Restart…** does not repeat cleanup.
+
+## MCP automation
+
+The macOS `ramnest-mcp` SwiftPM product exposes RAMNest folder activities and
+settings over stdio. See [the MCP guide and complete app-control parity matrix](docs/MCP.md)
+for build, package authority, client configuration, confirmations, and owned
+fixture acceptance commands. [Current verification evidence](docs/MCP_VALIDATION.md)
+distinguishes offline domain tests from SDK, package, and native lifecycle gates.

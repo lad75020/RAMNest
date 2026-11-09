@@ -93,6 +93,16 @@ struct FolderDetail: View {
                 if let loss = status.journal.nativeTmpfs?.lossDisclosure { Label(loss, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled) }
                 if let error = status.journal.lastError { Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled) }
                 if let warning = status.journal.cleanupWarning { Label(warning, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled) }
+                if let notice = status.journal.reviewedRecoveryNotice, status.journal.cleanupWarning != notice {
+                    Label(notice, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
+                }
+                if status.journal.reviewedRecoveryNotice != nil {
+                    Text("Retained snapshots and journal evidence: \(model.snapshotStoragePath)").font(.caption).textSelection(.enabled)
+                }
+                if status.canReviewLegacyPublication {
+                    Text("This legacy publication is missing the old symlink's pre-swap metadata. Review the verified evidence and explicitly accept that missing history before completing recovery.").font(.callout).foregroundStyle(.orange)
+                    Button("Review Legacy Recovery…", systemImage: "doc.text.magnifyingglass") { model.reviewLegacyRecovery() }.disabled(model.busy)
+                }
                 HStack {
                     if status.journal.nativeTmpfs != nil && status.mounted && !status.connected && status.journal.phase == .mounted {
                         Button("Reconnect", systemImage: "arrow.triangle.2.circlepath") { model.reconnect(status) }.disabled(model.busy)

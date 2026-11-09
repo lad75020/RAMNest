@@ -81,6 +81,11 @@ public struct Journal: Codable, Equatable, Sendable {
     var initialSourceManifest: Manifest?
     var originalRename: VerifiedRenameReceipt?
     var publicationRename: VerifiedRenameReceipt?
+    var reviewedRecovery: ReviewedRecoveryAcknowledgement?
+    public var reviewedRecoveryNotice: String? {
+        guard let reviewedRecovery else { return nil }
+        return reviewedRecovery.completedAt == nil ? "Reviewed recovery was interrupted. Backups and acknowledgement are retained; Review Legacy Recovery again to inspect and explicitly confirm a retry." : reviewedRecovery.retentionNotice
+    }
     var restoreManifest: Manifest?
     public var restoreStage: String?
     public var restoreStageDevice: UInt64?
@@ -131,7 +136,7 @@ public struct Journal: Codable, Equatable, Sendable {
         case restoreDataDevice, restoreDataInode, publicationReceipt, mountedDevice, populationVerified
         case startupProtocol, startupHelperPID, startupRetired, lastError, updated
         case legacyLink = "fsKitLink"
-        case originalRename, publicationRename, nativeLink, nativeTmpfs, resetUnmountSession
+        case originalRename, publicationRename, nativeLink, nativeTmpfs, resetUnmountSession, reviewedRecovery
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -178,6 +183,7 @@ public struct Journal: Codable, Equatable, Sendable {
         initialSourceManifest = values.contains(.initialSourceManifest) ? try values.decode(Manifest.self, forKey: .initialSourceManifest) : nil
         originalRename = values.contains(.originalRename) ? try values.decode(VerifiedRenameReceipt.self, forKey: .originalRename) : nil
         publicationRename = values.contains(.publicationRename) ? try values.decode(VerifiedRenameReceipt.self, forKey: .publicationRename) : nil
+        reviewedRecovery = values.contains(.reviewedRecovery) ? try values.decode(ReviewedRecoveryAcknowledgement.self, forKey: .reviewedRecovery) : nil
         for receipt in [originalRename, publicationRename].compactMap({ $0 }) {
             guard receipt.session == session else { throw NestError("Rename receipt session mismatch; retained.", code: 6) }
         }
@@ -293,6 +299,7 @@ public struct Journal: Codable, Equatable, Sendable {
                     debugDescription: "Incoherent legacy linked-folder transaction stage; all data retained.")
             }
         }
+        try reviewedRecovery?.validate(journal: self, fixtureRoot: decoder.userInfo[LinkedFolderLayout.decoderRootKey] as? URL)
     }
 }
 public struct Configuration: Codable, Sendable {
@@ -336,7 +343,7 @@ public struct FolderStatus: Codable, Identifiable, Sendable {
             return nativeReadOnly == true ? "Needs attention · Read-only (guarded)" : "Needs attention · Native mount retained"
         }
         return isReady ? "Mounted in RAM" : mounted ? "Needs attention · Read-only (guarded)" : journal.phase == .idle ? "Files are on disk" : "Needs attention" }
-    public var canMount: Bool { !mounted && !connected && journal.phase == .idle }
+    public var canMount: Bool { !mounted && !connected && journal.phase == .idle && journal.reviewedRecovery == nil }
     public var canEject: Bool {
         let nativePending = journal.nativeTmpfs != nil && (journal.phase == .ejecting ||
             (!journal.populationVerified && [.preparing, .mounting, .evacuated].contains(journal.phase)))
@@ -345,8 +352,13 @@ public struct FolderStatus: Codable, Identifiable, Sendable {
     }
     public var canSave: Bool { isReady && folder.options.sync && (journal.nativeTmpfs == nil || NativeSnapshotSafety.supported) }
     public var snapshotBlocker: String? { journal.nativeTmpfs != nil && !NativeSnapshotSafety.supported ? NativeSnapshotSafety.blockedMessage : nil }
-    public var canResize: Bool { !mounted && !connected && journal.phase == .idle }
+    public var canResize: Bool { !mounted && !connected && journal.phase == .idle && journal.reviewedRecovery == nil }
     public var canRecover: Bool { !mounted && journal.phase != .idle }
+    public var canReviewLegacyPublication: Bool {
+        canRecover && journal.populationVerified && journal.managedLink?.restoration == .checkpoint &&
+            journal.managedLink?.stage == .publishing && journal.publicationRename?.version == 1 &&
+            journal.publicationRename?.after == nil && journal.publicationRename?.operation == .publication
+    }
     public var primaryActionTitle: String { mounted ? (isReady && folder.options.sync ? "Save and Eject" : "Eject") : "Mount" }
     public var id: UUID { folder.id }
 }

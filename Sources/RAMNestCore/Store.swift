@@ -99,6 +99,31 @@ public final class Store: @unchecked Sendable {
             return try operation()
         }
     }
+    // Review never creates lock/control files. Reacquire the same cross-process
+    // volume -> repository order at confirmation; reject busy work immediately.
+    func reviewedPublicationLocked<T>(_ id: UUID, _ operation: () throws -> T) throws -> T {
+        let rootHandle = try DirectoryHandle.open(root)
+        guard try rootHandle.exists(RepositoryReset.lockName) else { throw NestError("Missing recovery coordination lock; review stopped.", code: 6) }
+        return try access {
+            try validateAuthority()
+            let volume = try managedVolume(id)
+            var locks: [Int32] = []
+            defer { for fd in locks.reversed() { flock(fd, LOCK_UN); close(fd) } }
+            for (directory, name) in [(volume, "transaction.lock"), (rootHandle, "repository.lock")] {
+                let fd = openat(directory.fd, name, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+                guard fd >= 0 else { throw NestError("Missing recovery lock; review stopped.", code: 6) }
+                locks.append(fd)
+                var st = stat()
+                guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_uid == getuid(),
+                      st.st_nlink == 1, st.st_mode & 0o077 == 0, st.st_size == 0,
+                      flock(fd, LOCK_EX | LOCK_NB) == 0 else { throw NestError("Recovery is busy; wait and start a fresh review.", code: 7) }
+                let named = try directory.entryStat(name)
+                guard named.st_dev == st.st_dev, named.st_ino == st.st_ino else { throw NestError("Recovery lock changed; review stopped.", code: 6) }
+            }
+            try validateAuthority()
+            return try operation()
+        }
+    }
     public func load() throws -> Configuration {
         return try access {
             try validateAuthority()
@@ -134,7 +159,8 @@ public final class Store: @unchecked Sendable {
             var j = journal; j.updated = Date()
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let bytes = try encoder.encode(j)
-            if j.backend == .tmpfs || j.nativeTmpfs != nil || j.nativeLink != nil {
+            guard j.reviewedRecovery == nil || bytes.count <= 64 << 20 else { throw NestError("Reviewed recovery acknowledgement exceeds its 64 MiB durable bound; previous state and all backups retained.", code: 6) }
+            if j.backend == .tmpfs || j.nativeTmpfs != nil || j.nativeLink != nil || j.reviewedRecovery != nil {
                 // Validate the exact bytes before replacement. An invalid transition
                 // must retain the last readable durable journal, not strand recovery.
                 _ = try journalDecoder.decode(Journal.self, from: bytes)
@@ -366,9 +392,9 @@ public final class SnapshotStorageManager: @unchecked Sendable {
         try store.access { try StorageRelocation.Transaction(manager: self).move(store: store, parent: parent, cancellation: cancellation, progress: progress) }
         return try state()
     }
-    public func retry(progress: @Sendable (String) -> Void = { _ in }) throws -> SnapshotStorageState {
+    public func retry(cancellation: StorageMoveCancellation = .init(), progress: @Sendable (String) -> Void = { _ in }) throws -> SnapshotStorageState {
         let receipt = try StorageRelocation.readReceipt(at: location.bootstrapRoot)
-        func resume() throws { try StorageRelocation.Transaction(manager: self).retry(progress: progress) }
+        func resume() throws { try StorageRelocation.Transaction(manager: self).retry(cancellation: cancellation, progress: progress) }
         if let receipt {
             try Store.access(root: URL(fileURLWithPath: receipt.source.path)) {
                 // A reservation may not have created its destination yet.
@@ -701,7 +727,8 @@ extension StorageRelocation {
                 throw NestError("Eject \(folder.name) before moving snapshots.", code: 7)
             }
         }
-        func retry(progress: @Sendable (String) -> Void) throws {
+        func retry(cancellation: StorageMoveCancellation, progress: @Sendable (String) -> Void) throws {
+            try cancellation.check()
             let stable = try stableLock(); defer { release([stable]) }
             guard var receipt = try StorageRelocation.readReceipt(at: location.bootstrapRoot) else { return }
             if receipt.stage == .reserving {
@@ -732,7 +759,7 @@ extension StorageRelocation {
                     try idle(journal, folder: folder)
                 }
             }
-            try advance(&receipt, cancellation: .init(), progress: progress)
+            try advance(&receipt, cancellation: cancellation, progress: progress)
         }
         func validate(_ receipt: Receipt, destinationRequired: Bool = true) throws {
             _ = try receipt.bootstrap.open(); _ = try receipt.sourceParent.open(privateMode: false)
@@ -1341,9 +1368,65 @@ enum RepositoryReset {
         var result: Data
     }
     static let preserved: Set<String> = [lockName, "repository.lock", "storage-location.lock", "storage-location.json", "volumes", "configuration.json", receiptName]
+    // Finder owns the bytes and may update them between RESET attempts. Never
+    // inventory or unlink this metadata. Admission is deliberately restricted
+    // to an owned, single-link regular file on this same filesystem.
+    static let finderMetadataName = ".DS_Store"
+    static var inventoryExclusions: Set<String> { preserved.subtracting(["volumes"]).union([finderMetadataName]) }
+
+    static func validateFinderMetadata(_ st: stat, device: UInt64) throws {
+        guard st.st_mode & S_IFMT == S_IFREG, st.st_uid == getuid(), st.st_nlink == 1,
+              st.st_mode & 0o022 == 0, st.st_size >= 0, st.st_size <= 16 << 20,
+              Paths.deviceID(st.st_dev) == device else {
+            throw NestError("Unsafe Finder metadata .DS_Store blocks RESET; entry retained.", code: 6)
+        }
+    }
+    static func validateRootNamespace(_ directory: DirectoryHandle) throws {
+        let names = Set(try directory.names())
+        let unknown = names.subtracting(preserved.union([SnapshotCopyObservations.name, finderMetadataName])).sorted()
+        guard unknown.isEmpty else {
+            throw NestError("Unknown repository entries block RESET: " + unknown.prefix(8).map(Snapshot.diagnosticLabel).joined(separator: ", ") + ". Entries retained.", code: 6)
+        }
+        if names.contains(finderMetadataName) {
+            let device = try directory.identity().device
+            let prior = try directory.entryStat(finderMetadataName)
+            try validateFinderMetadata(prior, device: device)
+            let fd = openat(directory.fd, finderMetadataName, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            guard fd >= 0 else { throw NestError("Cannot pin Finder metadata .DS_Store; RESET stopped.", code: 6) }
+            defer { close(fd) }
+            var opened = stat(), rootFS = statfs(), fileFS = statfs()
+            guard fstat(fd, &opened) == 0, fstatfs(directory.fd, &rootFS) == 0, fstatfs(fd, &fileFS) == 0,
+                  rootFS.f_fsid.val.0 == fileFS.f_fsid.val.0, rootFS.f_fsid.val.1 == fileFS.f_fsid.val.1,
+                  opened.st_dev == prior.st_dev, opened.st_ino == prior.st_ino else {
+                throw NestError("Finder metadata .DS_Store changed identity/filesystem; RESET stopped.", code: 6)
+            }
+            try validateFinderMetadata(opened, device: device)
+            let current = try directory.entryStat(finderMetadataName)
+            try validateFinderMetadata(current, device: device)
+            guard current.st_dev == opened.st_dev, current.st_ino == opened.st_ino else {
+                throw NestError("Finder metadata .DS_Store changed during admission; RESET stopped.", code: 6)
+            }
+        }
+    }
 
     static func idle(_ journal: Journal, completingUnmount: Bool = false,
                      assertAbsent: (Journal) throws -> Void = NativeTmpfsControl.assertAbsent) throws {
+        if let acknowledgement = journal.reviewedRecovery {
+            guard acknowledgement.completedAt != nil, journal.phase == .idle, journal.lastError == nil,
+                  let layout = journal.managedLink, layout.stage == .restored, layout.mountReleased,
+                  journal.socket == nil, journal.nativeTmpfs?.periodicAuthorization == nil,
+                  let restored = layout.restored else {
+                throw NestError("An unfinished reviewed recovery blocks RESET. Review and explicitly confirm it first; all evidence retained.", code: 6)
+            }
+            if journal.nativeTmpfs != nil { try assertAbsent(journal) }
+            try restored.verify(DirectoryHandle.open(URL(fileURLWithPath: layout.originalPath)))
+            let paths = [layout.originalPath, layout.mountPath, layout.holdingPath, acknowledgement.evidence.stagePath, acknowledgement.evidence.stagePath + ".data"] +
+                (journal.nativeTmpfs.map { [NativeTmpfsPaths.mount($0.session).path] } ?? [])
+            guard !Paths.mounts().contains(where: { mount in paths.contains { mount.path == $0 || mount.path.hasPrefix($0 + "/") } }) else { throw NestError("A reviewed recovery path is mounted; RESET stopped.", code: 7) }
+            // Explicit RESET deletes only its repository inventory. Retained
+            // external holdings, wrappers and displaced links are never queued.
+            return
+        }
         guard journal.phase == .idle, journal.lastError == nil, completingUnmount || journal.cleanupWarning == nil,
               journal.evacuation == nil, journal.restoreStage == nil,
               completingUnmount || (journal.restoreRevision == nil && journal.siblingCleanup?.isEmpty != false && journal.retiringRevisions?.isEmpty != false),
@@ -1377,7 +1460,7 @@ enum RepositoryReset {
 
     static func validateNamespace(store: Store) throws {
         let directory = try DirectoryHandle.open(store.root)
-        guard Set(try directory.names()).isSubset(of: preserved.union([SnapshotCopyObservations.name])) else { throw NestError("Unknown repository entries block RESET.", code: 6) }
+        try validateRootNamespace(directory)
         let volumes = try directory.child("volumes")
         let device = try directory.identity().device, fsid = try directory.cleanupFilesystem()
         try volumes.requireOwnedDirectory(device: device, privateMode: true)
@@ -1403,7 +1486,7 @@ enum RepositoryReset {
                         assertAbsent: (Journal) throws -> Void = NativeTmpfsControl.assertAbsent) throws -> Receipt {
         let root = try StorageRelocation.Root(store.root), directory = try root.open()
         let names = Set(try directory.names())
-        guard names.isSubset(of: preserved.union([SnapshotCopyObservations.name])) else { throw NestError("Unknown repository entries block RESET; no data was erased.", code: 6) }
+        try validateRootNamespace(directory)
         // A committed selection is preserved byte-for-byte; a relocation receipt
         // or either retirement fence is deliberately outside the allowlist.
         if names.contains("storage-location.json") { _ = try StoreLocation(bootstrapRoot: store.root).resolve() }
@@ -1423,7 +1506,8 @@ enum RepositoryReset {
         }
         // One root-relative, strong-hash inventory also pins every ancestor.
         // Manifest-validated payload hardlinks are only unlinked, never modified.
-        let items = try transaction.scan(root, excluding: preserved.subtracting(["volumes"]), resetInventory: true)
+        let items = try transaction.scan(root, excluding: inventoryExclusions, resetInventory: true)
+        try validateRootNamespace(directory)
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         var result = config; result.folders = []
         let configuration: Data? = try directory.exists("configuration.json") ? readConfiguration(directory) : nil
@@ -1463,10 +1547,10 @@ enum RepositoryReset {
             guard parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("\0") }),
                   (item.path == "volumes" || item.path.hasPrefix("volumes/") || item.path == SnapshotCopyObservations.name), item.device == receipt.root.device else { throw NestError("Invalid RESET inventory path.", code: 6) }
         }
-        guard Set(try directory.names()).isSubset(of: preserved.union([SnapshotCopyObservations.name])) else { throw NestError("Unknown data appeared during RESET; cleanup stopped.", code: 6) }
+        try validateRootNamespace(directory)
         // Scan all remaining entries before the next unlink. The existing opaque
         // scanner checks owner, no-follow opens, device, fsid, mounts and content.
-        let actual = try transaction.scan(receipt.root, excluding: preserved.subtracting(["volumes"]), matching: receipt.inventory, resetInventory: true)
+        let actual = try transaction.scan(receipt.root, excluding: inventoryExclusions, matching: receipt.inventory, resetInventory: true)
             .filter { $0.path != "volumes" }
         for item in actual {
             guard let original = expected[item.path], original.device == item.device, original.inode == item.inode,
@@ -1479,13 +1563,16 @@ enum RepositoryReset {
             let current = try transaction.inspect(parent, name: name, relative: item.path, device: receipt.root.device, allowSnapshotHardlinks: true)
             guard item.inode == current.inode, item.device == current.device, item.sameContent(current, directoryTimes: false) else { throw NestError("RESET entry changed; cleanup stopped.", code: 6) }
             try checkpoint?("unlink")
+            try validateRootNamespace(directory)
             guard unlinkat(parent.fd, name, item.kind == UInt16(S_IFDIR) ? AT_REMOVEDIR : 0) == 0 else { throw NestError("RESET cleanup failed: \(String(cString: strerror(errno))). Retry RESET in Settings.", code: 6) }
             try parent.sync()
         }
         try store.resetAuthority()
         try checkpoint?("configuration")
+        try validateRootNamespace(directory)
         try transaction.atomic(receipt.result, directory: directory, name: "configuration.json")
         try checkpoint?("commit")
+        try validateRootNamespace(directory)
         guard unlinkat(directory.fd, receiptName, 0) == 0 else { throw NestError("RESET cleanup receipt could not be retired; retry in Settings.", code: 6) }
         try directory.sync()
     }

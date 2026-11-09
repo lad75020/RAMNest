@@ -25,6 +25,7 @@ import RAMNestCore
       export REF DESTINATION [--revision UUID] [--live]
       busy REF
       file-verification [sha256|sizeAndModTime]
+      reset --confirm-reset [--reset-bootstrap BOOTSTRAP]
       install-cli DIRECTORY
     REF is a name, original path, UUID, or ram://percent-encoded-name.
     create uses an existing directory; defaults: sync/nobrowse/startup on,
@@ -61,8 +62,8 @@ import RAMNestCore
             }
             let command = args.removeFirst()
             var values: [String: String] = [:]; var flags: Set<String> = []; var positional: [String] = []
-            let valued: Set<String> = ["--size", "-s", "--name", "-n", "--periodic", "--file-comparison-method", "--revision"]
-            let allowed: Set<String> = [ "--json", "--all", "-a", "--no-mount", "--keep", "--destroy", "--confirm-delete", "--ignore-busy", "--live", "--sync-folder", "--no-sync-folder", "--nobrowse", "--no-nobrowse", "--mount-at-launch", "--no-mount-at-launch", "--no-periodic"]
+            let valued: Set<String> = ["--size", "-s", "--name", "-n", "--periodic", "--file-comparison-method", "--revision", "--reset-bootstrap"]
+            let allowed: Set<String> = [ "--json", "--all", "-a", "--no-mount", "--keep", "--destroy", "--confirm-delete", "--confirm-reset", "--ignore-busy", "--live", "--sync-folder", "--no-sync-folder", "--nobrowse", "--no-nobrowse", "--mount-at-launch", "--no-mount-at-launch", "--no-periodic"]
             var i = 0
             while i < args.count {
                 let value = args[i]
@@ -72,6 +73,9 @@ import RAMNestCore
                 else { positional.append(value); i += 1 }
             }
             func require(_ count: Int) throws { guard positional.count == count else { throw NestError("\(command) requires \(count) positional arguments. See --help.", code: 64) } }
+            guard command == "reset" || (!flags.contains("--confirm-reset") && values["--reset-bootstrap"] == nil) else {
+                throw NestError("RESET options are accepted only by reset.", code: 64)
+            }
             func size() throws -> UInt64 { guard let s = values["--size"] ?? values["-s"] else { throw NestError("--size is required.", code: 64) }; return try SizeParser.parse(s) }
             func options(_ initial: FolderOptions) throws -> FolderOptions {
                 var o = initial
@@ -86,6 +90,11 @@ import RAMNestCore
             }
             let engine = Engine(store: try StoreLocation().open(explicitRoot: root))
             switch command {
+            case "reset":
+                try require(0)
+                guard flags.contains("--confirm-reset") else { throw NestError("RESET requires --confirm-reset. Originals and selected storage are preserved.", code: 64) }
+                let bootstrap = values["--reset-bootstrap"].map { URL(fileURLWithPath: $0) } ?? root ?? Store.defaultRoot
+                try engine.reset(location: StoreLocation(bootstrapRoot: bootstrap)); try success(json)
             case "file-verification":
                 guard positional.count <= 1 else { throw NestError("file-verification accepts one policy.", code: 64) }
                 if let raw = positional.first {

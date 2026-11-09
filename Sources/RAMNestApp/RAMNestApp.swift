@@ -43,7 +43,7 @@ import Combine
     }
 }
 
-@main struct RAMNestApp: App {
+struct RAMNestApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     var body: some Scene {
         WindowGroup("RAMNest") {

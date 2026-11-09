@@ -97,7 +97,7 @@ import RAMNestCore
                 let unclean = statuses.contains { !$0.connected && $0.journal.phase != .idle }
                 if unclean { error = "A previous session did not finish cleanly. Automatic mounting is paused. Recover or export each affected folder first." }
                 else {
-                    for status in statuses where !status.mounted && status.journal.phase == .idle && status.folder.options.mountAtLaunch {
+                    for status in statuses where status.canMount && status.folder.options.mountAtLaunch {
                         guard engineGeneration == 0, !Task.isCancelled, !resetting, !movingStorage, storagePending == nil, self.engine === engine else { break }
                         await perform("Mounting \(status.folder.name)…") { try engine.mount(status.id.uuidString) }
                     }
@@ -253,6 +253,37 @@ import RAMNestCore
         guarded { guard let s = self.selectedStatus, s.canSave, let engine = self.engine else { return }; Task { await self.perform("Saving a coherent local snapshot…") { try engine.save(s.id.uuidString) } } }
     }
     func recover(_ status: FolderStatus? = nil) { guarded { guard let s = status ?? self.selectedStatus, s.canRecover, let engine = self.engine else { return }; Task { await self.perform("Recovering the committed snapshot…") { try engine.recover(s.id.uuidString) } } } }
+    func reviewLegacyRecovery() {
+        guarded {
+            guard let status = self.selectedStatus, status.canReviewLegacyPublication, let engine = self.engine else { return }
+            // Synchronous admission prevents two queued clicks, polling or RESET
+            // from opening another review before this Task reaches its first await.
+            self.busy = true; self.progress = "Reviewing legacy recovery evidence (read only)…"
+            let generation = self.engineGeneration
+            Task {
+                do {
+                    let review = try await Task.detached(priority: .userInitiated) { try engine.reviewLegacyPublication(status.id.uuidString) }.value
+                    defer { engine.cancelLegacyPublicationReview(review) }
+                    if generation == self.engineGeneration {
+                        let alert = NSAlert(); alert.alertStyle = .warning
+                        alert.messageText = "Review incomplete legacy publication"
+                        alert.informativeText = "The restored folder is already on disk. Its current contents and metadata were checked against the committed checkpoint and legacy receipt. The old destination symlink's pre-swap metadata and MACL were never recorded. That missing history cannot be proved or recreated. Only the explained root MACL pathname difference and the existing narrowly bound rename provenance rule are admitted.\n\nFolder: \(review.folderPath)\nLatest checkpoint: \(review.revision)\nInitial checkpoint: \(review.initialRevision)\n\nRetained original: \(review.retainedOriginalPath)\nRetained displaced link: \(review.retainedLinkPath)\nSnapshots: \(review.snapshotPath)\n\nAccepting records a durable acknowledgement of the missing historic record, then rechecks all reviewed evidence before changing metadata. Recovery copies and snapshots are kept; remount and automatic cleanup remain paused until a separately confirmed RESET removes the managed records. RESET preserves external recovery folders."
+                        alert.addButton(withTitle: "Cancel")
+                        alert.addButton(withTitle: "Accept Missing Record and Complete Recovery")
+                        alert.buttons[0].keyEquivalent = "\r"; alert.buttons[1].keyEquivalent = ""
+                        self.progress = "Waiting for explicit recovery confirmation…"
+                        if alert.runModal() == .alertSecondButtonReturn {
+                            self.progress = "Rechecking evidence and completing reviewed recovery…"
+                            try await Task.detached(priority: .userInitiated) {
+                                try engine.confirmLegacyPublicationReview(review, token: review.token, acceptsMissingHistoricRecord: true)
+                            }.value
+                        }
+                    }
+                } catch { self.error = error.localizedDescription }
+                self.busy = false; self.progress = ""; await self.refresh()
+            }
+        }
+    }
     func resize() {
         guard selectedStatus?.canResize == true else { return }
         guarded {
@@ -338,7 +369,7 @@ import RAMNestCore
         else {
             let alert = NSAlert(); alert.alertStyle = .critical
             alert.messageText = resetCommitted ? "Restart RAMNest?" : "RESET RAMNest and delete all snapshots?"
-            alert.informativeText = "All managed RAM folders will be ejected normally. Sync folders save their contents; temporary folders discard RAM changes and restore their originals. All RAM-folder records and saved snapshots, including retained snapshots, will be permanently deleted. Original folders and unrelated drives are preserved. RAMNest then restarts using the selected storage location. Close files first. Any recovery or cleanup error stops reset."
+            alert.informativeText = "All managed RAM folders will be ejected normally. Sync folders save their contents; temporary folders discard RAM changes and restore their originals. All RAM-folder records, reviewed-recovery acknowledgements and saved snapshots, including retained snapshots, will be permanently deleted. Original folders, external recovery folders and unrelated drives are preserved. Save the displayed recovery locations and evidence before RESET. RAMNest then restarts using the selected storage location. Close files first. Any unfinished recovery or cleanup error stops reset."
             alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: resetCommitted ? "Restart" : "RESET and Restart")
             alert.buttons[0].keyEquivalent = "\r"; alert.buttons[1].keyEquivalent = ""
             alert.buttons[1].hasDestructiveAction = !resetCommitted

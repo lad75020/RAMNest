@@ -1,6 +1,8 @@
 import Foundation
 import Darwin
+#if !RAMNEST_METADATA_STANDALONE
 import Testing
+#endif
 @testable import RAMNestCore
 
 /// Disk-only construction of the persisted version-1 linked layout. The same
@@ -67,6 +69,7 @@ final class LinkedTransactionDataFixture {
     }
 }
 
+#if !RAMNEST_METADATA_STANDALONE
 extension RAMNestTestSuite {
     struct LinkedTransactionTests {
         private func parent() throws -> URL {
@@ -131,3 +134,5 @@ extension RAMNestTestSuite {
         }
     }
 }
+
+#endif

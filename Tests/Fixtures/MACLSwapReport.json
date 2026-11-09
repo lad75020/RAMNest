@@ -1,0 +1,47 @@
+{
+  "beforeSource": {
+    "path": "/private/var/folders/gq/fj68kcfn2t1fb21qqrt6b44h0000gn/T/ramnest-macl-swap-68CFF502-F82A-4232-88A4-D266CCC97C15",
+    "inode": 249707256,
+    "device": 16777231,
+    "mode": "0o40700",
+    "macl": {
+      "exists": true,
+      "bytes": 72,
+      "sha256": "7fcac7fe1fe5f6d77213793b8a5f5a0a6c1ad3fc438e3ec5c85bc08fbe727687"
+    }
+  },
+  "beforeDestination": {
+    "path": "/private/var/folders/gq/fj68kcfn2t1fb21qqrt6b44h0000gn/T/ramnest-macl-swap-68CFF502-F82A-4232-88A4-D266CCC97C15.managed-link",
+    "inode": 249707863,
+    "device": 16777231,
+    "mode": "0o120755",
+    "macl": {
+      "exists": false,
+      "bytes": -1
+    }
+  },
+  "swapResult": 0,
+  "errno": 0,
+  "afterSource": {
+    "path": "/private/var/folders/gq/fj68kcfn2t1fb21qqrt6b44h0000gn/T/ramnest-macl-swap-68CFF502-F82A-4232-88A4-D266CCC97C15",
+    "inode": 249707863,
+    "device": 16777231,
+    "mode": "0o120755",
+    "macl": {
+      "exists": true,
+      "bytes": 72,
+      "sha256": "7fcac7fe1fe5f6d77213793b8a5f5a0a6c1ad3fc438e3ec5c85bc08fbe727687"
+    }
+  },
+  "afterDestination": {
+    "path": "/private/var/folders/gq/fj68kcfn2t1fb21qqrt6b44h0000gn/T/ramnest-macl-swap-68CFF502-F82A-4232-88A4-D266CCC97C15.managed-link",
+    "inode": 249707256,
+    "device": 16777231,
+    "mode": "0o40700",
+    "macl": {
+      "exists": false,
+      "bytes": -1
+    }
+  },
+  "payloadPreserved": true
+}

@@ -73,6 +73,7 @@ enum SiblingCleanup {
     // Called only after verified restore/rollback has committed idle, and before
     // any next session can overwrite the original transaction references.
     static func rememberCompleted(_ folder: Folder, _ journal: inout Journal) {
+        guard journal.reviewedRecovery == nil else { return }
         guard journal.phase == .idle, journal.lastError == nil else { return }
         let parentURL = URL(fileURLWithPath: folder.path).deletingLastPathComponent()
         let parent = try? DirectoryHandle.open(parentURL)
@@ -124,6 +125,7 @@ enum SiblingCleanup {
                       sourceRevision: String?,
                       validateSource: () throws -> Void,
                       beforeUnlink: ((DirectoryHandle, String) throws -> Void)? = nil) -> [String] {
+        guard journal.reviewedRecovery == nil else { return [] }
         guard journal.phase == .idle, journal.lastError == nil else { return [] }
         var warnings: [String] = []
         for recorded in journal.siblingCleanup ?? [] {

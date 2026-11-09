@@ -32,6 +32,7 @@ cp "$build/direct"/ramnest "$app/Contents/Helpers/ramnest"
 python3 scripts/native-build-authority.py embed "$authority" "$generated" "$app"
 cp "$build/direct"/libRAMNestCore.dylib "$app/Contents/Frameworks/"
 cp resources/Info.plist "$app/Contents/Info.plist"
+cp resources/mcp-bridge.json "$app/Contents/Resources/mcp-bridge.json"
 xcrun actool resources/Assets.xcassets \
   --compile "$app/Contents/Resources" \
   --platform macosx \

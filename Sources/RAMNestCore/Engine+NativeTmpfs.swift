@@ -72,6 +72,7 @@ extension Engine {
         defer { authorization.finish() }
         try volumeTransaction(ref) { current in
             var f = current, j = try store.journal(current.id)
+            guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery retains the original, evidence and snapshots. Use explicit RESET before creating a new session.", code: 6) }
             if j.nativeTmpfs != nil, (try? NativeTmpfsControl.observe(j)) != nil {
                 guard j.populationVerified, j.phase == .mounted, mountedIdentity(f, j) else {
                     throw NestError("Native mount remains guarded or has an incomplete transaction. Retain it for explicit recovery.", code: 6)
@@ -285,6 +286,7 @@ extension Engine {
         try volumeTransaction(ref) { f in
             var j = try store.journal(f.id)
             guard j.nativeTmpfs != nil else { throw NestError("Not a native session.", code: 6) }
+            guard j.reviewedRecovery == nil else { throw NestError("Use a fresh legacy recovery review; ordinary Recover cannot consume an acknowledgement.", code: 6) }
             try NativeTmpfsControl.assertAbsent(j)
             if j.phase == .idle { try finishLinkedRestore(f, journal: &j, authorization: authorization); cleanSnapshots(try refreshedFolder(f), &j); return }
             let continuingRestore = j.phase == .restoring || j.phase == .pendingRestore
