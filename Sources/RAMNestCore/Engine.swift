@@ -906,7 +906,8 @@ public final class Engine: @unchecked Sendable {
 
     /// The public destination identity is durable before rename/swap and before
     /// configuration. Either side of either write can be resumed by identity.
-    func restoreLinkedOriginal(_ f: Folder, journal j: inout Journal, temporary: Bool) throws {
+    func restoreLinkedOriginal(_ f: Folder, journal j: inout Journal, temporary: Bool,
+                               authorization: NativeTmpfsAuthorization? = nil) throws {
         guard var layout = j.managedLink else { throw NestError("Missing linked-folder authority.", code: 6) }
         let parent = try LinkedFolders.parent(layout, folder: f, root: session.linkedMountRoot)
         _ = try LinkedFolders.root(layout)
@@ -914,7 +915,7 @@ public final class Engine: @unchecked Sendable {
         if j.nativeTmpfs != nil { try NativeTmpfsControl.assertAbsent(j) }
         let selected = URL(fileURLWithPath: f.path)
         let selectedExists = try parent.exists(selected.lastPathComponent)
-        if layout.stage == .restored { try finishLinkedRestore(f, journal: &j); return }
+        if layout.stage == .restored { try finishLinkedRestore(f, journal: &j, authorization: authorization); return }
         if [.reserved, .evacuating].contains(layout.stage), selectedExists,
            layout.source.matches(try parent.entryStat(selected.lastPathComponent)) {
             // Evacuation never happened. Never select this branch after RAM
@@ -928,7 +929,7 @@ public final class Engine: @unchecked Sendable {
             }
             layout.restoration = .original; layout.restored = layout.source; layout.stage = .restored; j.managedLink = layout
             j.restoreRevision = j.initialRevision; try store.write(j, for: f.id)
-            try finishLinkedRestore(f, journal: &j); return
+            try finishLinkedRestore(f, journal: &j, authorization: authorization); return
         }
         let alreadyPublished: Bool
         if selectedExists, let restored = layout.restored { alreadyPublished = restored.matches(try parent.entryStat(selected.lastPathComponent)) }
@@ -1043,10 +1044,10 @@ public final class Engine: @unchecked Sendable {
             guard bound, try Snapshot.manifest(selected, matching: publicationExpected).matchesExpected(publicationExpected) else { throw NestError("Published restore readback failed; backup and RAM retained.", code: 6) }
         }
         layout.stage = .restored; j.managedLink = layout; try store.write(j, for: f.id)
-        try finishLinkedRestore(f, journal: &j)
+        try finishLinkedRestore(f, journal: &j, authorization: authorization)
     }
 
-    func finishLinkedRestore(_ f: Folder, journal j: inout Journal) throws {
+    func finishLinkedRestore(_ f: Folder, journal j: inout Journal, authorization supplied: NativeTmpfsAuthorization? = nil) throws {
         guard var layout = j.managedLink, layout.stage == .restored, let restored = layout.restored else { throw NestError("linked-folder restoration is not committed.", code: 6) }
         let parent = try LinkedFolders.parent(layout, folder: f, root: session.linkedMountRoot)
         let selected = URL(fileURLWithPath: f.path)
@@ -1109,7 +1110,9 @@ public final class Engine: @unchecked Sendable {
         }
         if !layout.mountReleased {
             if let record = j.nativeTmpfs {
-                let reply = try nativeOperation("release", layout: layout, record: record)
+                let authorization = supplied ?? NativeTmpfsAuthorization(helper: helper)
+                defer { if supplied == nil { authorization.finish() } }
+                let reply = try nativeOperation("release", layout: layout, record: record, authorization: authorization)
                 guard reply.isEmpty else { throw NestError("Invalid native release receipt.", code: 6) }
             } else { try LinkedFolders.releaseMountpoint(layout) }
             layout.mountReleased = true

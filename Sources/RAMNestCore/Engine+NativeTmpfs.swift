@@ -3,10 +3,10 @@ import Darwin
 
 extension Engine {
     func nativeOperation(_ operation: String, layout: LinkedFolderLayout, record: NativeTmpfsRecord,
-                         nobrowse: Bool = true) throws -> [String] {
+                         nobrowse: Bool = true, authorization: NativeTmpfsAuthorization) throws -> [String] {
         var arguments = try NativeTmpfsControl.arguments(operation, layout: layout, record: record)
         if operation == "mount" { arguments[arguments.count - 1] = String(nobrowse) }
-        return try NativeTmpfsControl.authorize(helper: helper, arguments: arguments)
+        return try authorization.authorize(arguments: arguments)
     }
     private func nativeSlot(_ folder: Folder, session: UUID, reply: [String]) throws -> LinkedFolderLayout {
         guard reply.count == 4, let rd = UInt64(reply[0]), let ri = UInt64(reply[1]),
@@ -68,6 +68,8 @@ extension Engine {
         }
     }
     func mountNative(_ ref: String) throws {
+        let authorization = NativeTmpfsAuthorization(helper: helper)
+        defer { authorization.finish() }
         try volumeTransaction(ref) { current in
             var f = current, j = try store.journal(current.id)
             if j.nativeTmpfs != nil, (try? NativeTmpfsControl.observe(j)) != nil {
@@ -78,7 +80,7 @@ extension Engine {
                 if try NativeTmpfsControl.observe(j).readOnly {
                     j.quiescedRevision = nil; j.quiescedSession = nil; j.nativeTmpfs?.quiescence = nil
                     j.nativeTmpfs?.managedUnmount = false; try store.write(j, for: f.id)
-                    let reply = try nativeOperation("thaw", layout: j.nativeLink!, record: j.nativeTmpfs!)
+                    let reply = try nativeOperation("thaw", layout: j.nativeLink!, record: j.nativeTmpfs!, authorization: authorization)
                     guard reply.isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
                     _ = try NativeTmpfsControl.observe(j, readonly: false)
                 }
@@ -128,12 +130,12 @@ extension Engine {
                 try store.write(j, for: f.id)
                 let (source, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
                 let sid = j.session!
-                let reservation = try NativeTmpfsControl.authorize(helper: helper, arguments: ["--native-v1", "reserve", String(getuid()), sid.uuidString])
+                let reservation = try authorization.authorize(arguments: ["--native-v1", "reserve", String(getuid()), sid.uuidString])
                 j.nativeLink = try nativeSlot(f, session: sid, reply: reservation)
                 j.nativeTmpfs = NativeTmpfsRecord(session: sid, capacity: f.capacity)
                 try store.write(j, for: f.id)
                 // Keep originals in place during mount/population; failure is cheap.
-                let mounted = try nativeOperation("mount", layout: j.nativeLink!, record: j.nativeTmpfs!, nobrowse: f.options.nobrowse)
+                let mounted = try nativeOperation("mount", layout: j.nativeLink!, record: j.nativeTmpfs!, nobrowse: f.options.nobrowse, authorization: authorization)
                 guard mounted.count == 3, let a = UInt32(mounted[0]), let b = UInt32(mounted[1]), UInt64(mounted[2]) != nil else {
                     throw NestError("Invalid native mount receipt. An uncertain mount is retained; no source moved.", code: 6)
                 }
@@ -149,12 +151,12 @@ extension Engine {
                 try store.write(j, for: f.id)
                 // This unpublished tree has no client mappings created by RAMNest.
                 // Read-only guards activation verification; it is not a save receipt.
-                guard try nativeOperation("readonly", layout: j.nativeLink!, record: j.nativeTmpfs!).isEmpty else { throw NestError("Invalid native read-only receipt.", code: 6) }
+                guard try nativeOperation("readonly", layout: j.nativeLink!, record: j.nativeTmpfs!, authorization: authorization).isEmpty else { throw NestError("Invalid native read-only receipt.", code: 6) }
                 _ = try NativeTmpfsControl.observe(j, readonly: true)
                 let (originalHandle, original) = try evacuateOriginal(f, journal: &j, expected: before.manifest, sourceBefore: before)
                 try verifyAndPublishPopulation(f, journal: &j, expected: copied, source: originalHandle, original: original)
                 try ensureNativePin(f, journal: &j)
-                guard try nativeOperation("thaw", layout: j.nativeLink!, record: j.nativeTmpfs!).isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
+                guard try nativeOperation("thaw", layout: j.nativeLink!, record: j.nativeTmpfs!, authorization: authorization).isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
                 _ = try NativeTmpfsControl.observe(j, readonly: false)
                 try nativePeriod(f, journal: &j)
                 cleanSnapshots(f, &j)
@@ -172,7 +174,10 @@ extension Engine {
         }
     }
     @discardableResult func captureNative(_ f: Folder, journal j: inout Journal, quiesce: Bool,
-                                         periodic: NativePeriodicSaveRequest? = nil) throws -> String {
+                                         periodic: NativePeriodicSaveRequest? = nil,
+                                         authorization supplied: NativeTmpfsAuthorization? = nil) throws -> String {
+        let authorization = supplied ?? NativeTmpfsAuthorization(helper: helper)
+        defer { if supplied == nil { authorization.finish() } }
         try periodic?.validate(folder: f, journal: j)
         guard j.populationVerified, mountedIdentity(f, j), let layout = j.nativeLink, let record = j.nativeTmpfs else {
             throw NestError("Live native RAM is unavailable; a disk checkpoint cannot be saved as current RAM.", code: 6)
@@ -186,7 +191,7 @@ extension Engine {
         var receipt: [String] = []
         return try NativeCheckpointTransaction.run(keepFrozen: quiesce, readonly: {
             try validatePeriodic() // Before any administrator prompt.
-            receipt = try nativeOperation("freeze", layout: layout, record: record)
+            receipt = try nativeOperation("freeze", layout: layout, record: record, authorization: authorization)
         }, verify: { _ = try NativeTmpfsControl.observe(next, readonly: true) }, validateMappings: {
             guard let fs = record.filesystem else { throw NestError("Missing native fsid.", code: 6) }
             try NativeSnapshotSafety.validateReceipt(receipt, filesystem: fs)
@@ -205,12 +210,14 @@ extension Engine {
             if thawFailed || (try? NativeTmpfsControl.observe(next)) == nil { next.phase = .recoveryRequired }
             try store.write(next, for: f.id)
         }, stillBoundReadonly: { (try? NativeTmpfsControl.observe(next, readonly: true)) != nil }, thaw: {
-            guard try nativeOperation("thaw", layout: layout, record: record).isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
+            guard try nativeOperation("thaw", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
             _ = try NativeTmpfsControl.observe(next, readonly: false)
         })
     }
 
     func unmountNative(_ ref: String, ignoreBusy: Bool) throws {
+        let authorization = NativeTmpfsAuthorization(helper: helper)
+        defer { authorization.finish() }
         if !ignoreBusy {
             let busy = try busyProcesses(ref)
             guard busy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw NestError("Processes use this native volume. Close them or explicitly Ignore for a normal eject. Ignore cannot bypass the mandatory mapping/coherence guard.\n" + busy, code: 7) }
@@ -235,10 +242,10 @@ extension Engine {
             try ensureNativePin(f, journal: &j)
             if f.options.sync && j.populationVerified {
                 // Mandatory, even when the caller selected Ignore Busy.
-                _ = try captureNative(f, journal: &j, quiesce: true); j.restoreRevision = j.revision
+                _ = try captureNative(f, journal: &j, quiesce: true, authorization: authorization); j.restoreRevision = j.revision
             } else {
                 // Explicit temporary discard needs no current-RAM checkpoint.
-                guard try nativeOperation("readonly", layout: layout, record: record).isEmpty else { throw NestError("Invalid native read-only receipt.", code: 6) }
+                guard try nativeOperation("readonly", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native read-only receipt.", code: 6) }
                 _ = try NativeTmpfsControl.observe(j, requireData: j.populationVerified, readonly: true)
                 j.restoreRevision = j.initialRevision
             }
@@ -247,7 +254,7 @@ extension Engine {
             // other process is killed; ordinary umount still rejects other pins.
             if let socket = j.socket { guard try Control.request(socket, "retire").isEmpty else { throw NestError("Native pin did not acknowledge retirement.", code: 6) } }
             do {
-                guard try nativeOperation("unmount", layout: layout, record: record).isEmpty else { throw NestError("Invalid native unmount receipt.", code: 6) }
+                guard try nativeOperation("unmount", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native unmount receipt.", code: 6) }
                 try NativeTmpfsControl.assertAbsent(j)
                 j.nativeTmpfs!.managedUnmount = true; try store.write(j, for: f.id)
             } catch {
@@ -261,7 +268,7 @@ extension Engine {
                     try store.write(j, for: f.id)
                     try ensureNativePin(f, journal: &j)
                     if j.populationVerified && observed.readOnly {
-                        guard try nativeOperation("thaw", layout: layout, record: record).isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
+                        guard try nativeOperation("thaw", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
                         _ = try NativeTmpfsControl.observe(j, readonly: false)
                     }
                 } else {
@@ -270,14 +277,16 @@ extension Engine {
                 throw failure
             }
         }
-        try finalizeNative(ref, explicitRecovery: false)
+        try finalizeNative(ref, explicitRecovery: false, authorization: authorization)
     }
-    func finalizeNative(_ ref: String, explicitRecovery: Bool) throws {
+    func finalizeNative(_ ref: String, explicitRecovery: Bool, authorization supplied: NativeTmpfsAuthorization? = nil) throws {
+        let authorization = supplied ?? NativeTmpfsAuthorization(helper: helper)
+        defer { if supplied == nil { authorization.finish() } }
         try volumeTransaction(ref) { f in
             var j = try store.journal(f.id)
             guard j.nativeTmpfs != nil else { throw NestError("Not a native session.", code: 6) }
             try NativeTmpfsControl.assertAbsent(j)
-            if j.phase == .idle { try finishLinkedRestore(f, journal: &j); cleanSnapshots(try refreshedFolder(f), &j); return }
+            if j.phase == .idle { try finishLinkedRestore(f, journal: &j, authorization: authorization); cleanSnapshots(try refreshedFolder(f), &j); return }
             let continuingRestore = j.phase == .restoring || j.phase == .pendingRestore
             if NativeRecoveryPolicy.needsLossDisclosure(j, sync: f.options.sync) {
                 j.nativeTmpfs!.lossDisclosure = "The native tmpfs mount disappeared outside a completed managed eject. Any unsaved contents are lost. Explicit recovery restores only the latest committed disk checkpoint; it cannot export the vanished RAM tree."
@@ -289,12 +298,12 @@ extension Engine {
             // No helper export after unmount. Only a verified committed revision
             // or the retained original inode can authorize disk publication.
             if !j.populationVerified || !f.options.sync {
-                try restoreLinkedOriginal(f, journal: &j, temporary: true)
+                try restoreLinkedOriginal(f, journal: &j, temporary: true, authorization: authorization)
             } else {
                 if !continuingRestore {
                     j.restoreRevision = j.revision; j.phase = .pendingRestore; try store.write(j, for: f.id)
                 }
-                try restoreLinkedOriginal(f, journal: &j, temporary: false)
+                try restoreLinkedOriginal(f, journal: &j, temporary: false, authorization: authorization)
             }
             j.socket = nil; try store.write(j, for: f.id)
             cleanSnapshots(try refreshedFolder(f), &j)

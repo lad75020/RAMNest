@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import Testing
+import Security
 @testable import RAMNestCore
 
 extension RAMNestTestSuite {
@@ -157,16 +158,19 @@ extension RAMNestTestSuite {
             var bound = r; bound.filesystem = NativeFilesystemID(first: UInt32.max, second: 2)
             #expect(try NativeTmpfsControl.arguments("freeze", layout: l, record: bound).suffix(3) == [String(UInt32.max), "2", "67108864"])
         }
-        @Test func `Administrator invocation quotes shell and AppleScript metacharacters`() throws {
+        @Test func `Administrator command quotes metacharacters and passes shell text as handler data`() throws {
             #expect(NativeTmpfsControl.shellQuote("a'b") == "'a'\\''b'")
             let url = URL(fileURLWithPath: "/private/tmp/A ' $()`\\\"/ramnest-helper")
             let image = NativeHelperImage(source: url, bytes: 128, digest: String(repeating: "a", count: 64))
-            let script = try NativeHelperBootstrap.administratorScript(image: image, arguments: ["--native-v1", "reserve", String(getuid()), sid.uuidString])
-            #expect(script.hasPrefix("do shell script \"") && script.hasSuffix("\" with administrator privileges"))
+            let command = try NativeHelperBootstrap.command(image: image, arguments: ["--native-v1", "reserve", String(getuid()), sid.uuidString])
+            let script = NativeAppleScriptContext.source(operation: sid)
+            #expect(script.contains("do shell script commandText with administrator privileges without altering line endings"))
+            #expect(!script.contains(url.path))
             #expect(try NativeHelperBootstrap.script(image: image, arguments: ["--native-v1", "reserve", String(getuid()), sid.uuidString]).contains("'--native-v1' 'reserve'"))
-            #expect(script.contains("'/usr/bin/env' '-i' 'PATH=/usr/bin:/bin:/usr/sbin:/sbin' 'LC_ALL=C'"))
+            #expect(command.hasPrefix("'/usr/bin/env' '-i' 'PATH=/usr/bin:/bin:/usr/sbin:/sbin' 'LC_ALL=C'"))
+            #expect(try NativeHelperBootstrap.script(image: image, arguments: ["--native-v1", "reserve", String(getuid()), sid.uuidString]).contains(NativeTmpfsControl.shellQuote(url.path)))
             #expect(!script.contains("sudo") && !script.contains("password"))
-            #expect(throws: (any Error).self) { try NativeHelperBootstrap.administratorScript(image: image, arguments: ["--exec", "id"]) }
+            #expect(throws: (any Error).self) { try NativeHelperBootstrap.command(image: image, arguments: ["--exec", "id"]) }
         }
         @Test func `Kernel identity and read-only flag are mandatory and statfs supplies allocation`() throws {
             let fs = NativeFilesystemID(first: 42, second: 2), path = NativeTmpfsPaths.mount(sid).path
@@ -270,6 +274,279 @@ extension RAMNestTestSuite {
 }
 
 extension RAMNestTestSuite.NativeTmpfsTests {
+    /// Prompts here are deterministic simulations of the documented per-script
+    /// grace period. No test using this probe creates NSAppleScript or runs root.
+    private final class AuthorizationProbe {
+        var sources: [String] = [], operations: [String] = [], commands: [String] = []
+        var captures = 0, prompts = 0, finishes = 0
+        var captureFailureAt: Int?
+        var failure: (operation: String, number: Int)?
+        var malformedAt: String?
+        func operation() -> NativeTmpfsAuthorization {
+            let helper = URL(fileURLWithPath: "/private/tmp/owned ' € $()`\\\"/ramnest-helper")
+            return NativeTmpfsAuthorization(helper: helper, capture: { url in
+                self.captures += 1
+                if self.captures == self.captureFailureAt { throw NestError("Captured image authority changed", code: 4) }
+                return NativeHelperImage(source: url, bytes: 128, digest: String(repeating: "a", count: 64))
+            }, makeScript: { source in
+                self.sources.append(source)
+                return Script(self)
+            })
+        }
+        private final class Script: NativeAdministratorExecuting {
+            let probe: AuthorizationProbe
+            var prompted = false, finished = false
+            init(_ probe: AuthorizationProbe) { self.probe = probe }
+            func execute(command: String) throws -> String {
+                #expect(!finished)
+                if !prompted { probe.prompts += 1; prompted = true }
+                let op = ["reserve", "mount", "readonly", "freeze", "thaw", "unmount", "release"].first {
+                    command.contains(String(NativeTmpfsControl.shellQuote("'--native-v1' '\($0)'").dropFirst().dropLast()))
+                } ?? "unknown"
+                probe.operations.append(op); probe.commands.append(command)
+                if let failure = probe.failure, failure.operation == op {
+                    probe.failure = nil
+                    throw NativeAppleScriptFailure(number: failure.number, message: "injected native failure")
+                }
+                if probe.malformedAt == op { return "NOT-OK\t42\t2" }
+                switch op {
+                case "reserve": return "OK\t1\t20\t1\t21\n"
+                case "mount": return "OK\t42\t2\t67108864\n"
+                case "freeze": return "OK\t\(NativeSnapshotSafety.receiptVersion)\t42\t2\n"
+                default: return "OK\n"
+                }
+            }
+            func finish() { if !finished { probe.finishes += 1; finished = true } }
+        }
+    }
+    private func authorizationCoordinator() throws -> Engine {
+        Engine(store: try Store(root: fixture().appendingPathComponent("authorization-store")))
+    }
+    private func authorizationRecord() -> NativeTmpfsRecord {
+        var record = NativeTmpfsRecord(session: sid, capacity: 64 << 20)
+        record.filesystem = .init(first: 42, second: 2)
+        return record
+    }
+    private func authorizationCheckpoint(_ engine: Engine, authorization: NativeTmpfsAuthorization,
+                                         keepFrozen: Bool = false, failCopy: Bool = false,
+                                         events: inout [String]) throws -> String {
+        var receipt: [String] = []
+        return try NativeCheckpointTransaction.run(keepFrozen: keepFrozen, readonly: {
+            events.append("freeze")
+            receipt = try engine.nativeOperation("freeze", layout: layout(), record: authorizationRecord(), authorization: authorization)
+        }, verify: { events.append("verify") }, validateMappings: {
+            events.append("validate-mappings")
+            try NativeSnapshotSafety.validateReceipt(receipt, filesystem: authorizationRecord().filesystem!)
+        }, copy: {
+            events.append("copy")
+            if failCopy { throw NestError("injected copy failure", code: 6) }
+            return "new-checkpoint"
+        }, commit: { _ in events.append("commit") }, invalidate: { _, failedThaw in
+            events.append(failedThaw ? "invalidate-guarded" : "invalidate")
+        }, stillBoundReadonly: { true }, thaw: {
+            events.append("thaw")
+            let response = try engine.nativeOperation("thaw", layout: layout(), record: authorizationRecord(), authorization: authorization)
+            #expect(response.isEmpty)
+        })
+    }
+
+    @Test func nativeMountUsesOneAuthorizationContext() throws {
+        let engine = try authorizationCoordinator(), probe = AuthorizationProbe(), authorization = probe.operation()
+        defer { authorization.finish() }
+        #expect(probe.sources.isEmpty && probe.prompts == 0) // Lazy, after source checkpoint.
+        #expect(try authorization.authorize(arguments: ["--native-v1", "reserve", String(getuid()), sid.uuidString]) == ["1", "20", "1", "21"])
+        #expect(try engine.nativeOperation("mount", layout: layout(), record: authorizationRecord(), nobrowse: false, authorization: authorization) == ["42", "2", "67108864"])
+        for op in ["readonly", "thaw"] {
+            #expect(try engine.nativeOperation(op, layout: layout(), record: authorizationRecord(), authorization: authorization).isEmpty)
+        }
+        #expect(probe.operations == ["reserve", "mount", "readonly", "thaw"])
+        #expect(probe.sources.count == 1 && probe.prompts == 1 && probe.captures == 4)
+        #expect(probe.commands[1].contains(String(NativeTmpfsControl.shellQuote("'67108864' 'false'").dropFirst().dropLast())))
+        for command in probe.commands {
+            #expect(command.contains("/usr/bin/codesign --verify --strict --all-architectures"))
+            #expect(command.contains("Native staged image digest mismatch"))
+            #expect(command.contains("trap cleanup EXIT"))
+        }
+        authorization.finish(); authorization.finish()
+        #expect(probe.finishes == 1)
+    }
+
+    @Test func nativeEjectSharesAuthorizationThroughRelease() throws {
+        let engine = try authorizationCoordinator(), probe = AuthorizationProbe(), authorization = probe.operation()
+        defer { authorization.finish() }
+        var events: [String] = []
+        #expect(try authorizationCheckpoint(engine, authorization: authorization, keepFrozen: true, events: &events) == "new-checkpoint")
+        #expect(events == ["freeze", "verify", "validate-mappings", "verify", "copy", "verify", "commit"])
+        #expect(try engine.nativeOperation("unmount", layout: layout(), record: authorizationRecord(), authorization: authorization).isEmpty)
+        // Release follows ordinary-user restoration/publication, with this same
+        // context. It is deliberately not batched ahead of those durable steps.
+        #expect(try engine.nativeOperation("release", layout: layout(), record: authorizationRecord(), authorization: authorization).isEmpty)
+        #expect(probe.operations == ["freeze", "unmount", "release"])
+        #expect(probe.sources.count == 1 && probe.prompts == 1 && probe.captures == 3)
+    }
+
+    @Test func nativeSaveAndLiveExportUseSeparateAuthorizationContexts() throws {
+        let engine = try authorizationCoordinator(), probe = AuthorizationProbe()
+        for _ in 0..<2 {
+            let authorization = probe.operation()
+            defer { authorization.finish() }
+            var events: [String] = []
+            #expect(try authorizationCheckpoint(engine, authorization: authorization, events: &events) == "new-checkpoint")
+            #expect(events.last == "thaw" && events.firstIndex(of: "commit")! < events.firstIndex(of: "thaw")!)
+        }
+        #expect(probe.operations == ["freeze", "thaw", "freeze", "thaw"])
+        #expect(probe.sources.count == 2 && Set(probe.sources).count == 2 && probe.prompts == 2 && probe.finishes == 2)
+    }
+
+    @Test func nativeRecoveryAndTemporaryEjectUseBoundedContexts() throws {
+        let engine = try authorizationCoordinator(), probe = AuthorizationProbe()
+        for steps in [["readonly", "unmount", "release"], ["release"]] {
+            let authorization = probe.operation()
+            defer { authorization.finish() }
+            for op in steps {
+                #expect(try engine.nativeOperation(op, layout: layout(), record: authorizationRecord(), authorization: authorization).isEmpty)
+            }
+        }
+        #expect(probe.sources.count == 2 && probe.prompts == 2 && probe.finishes == 2)
+        #expect(probe.operations == ["readonly", "unmount", "release", "release"])
+    }
+
+    @Test(arguments: [-128, Int(errAuthorizationCanceled), Int(errAuthorizationDenied)])
+    func nativeCancellationNeverRepromptsDuringRollback(_ number: Int) throws {
+        let engine = try authorizationCoordinator(), probe = AuthorizationProbe(), authorization = probe.operation()
+        defer { authorization.finish() }
+        probe.failure = ("freeze", number)
+        var events: [String] = []
+        #expect(throws: (any Error).self) { try authorizationCheckpoint(engine, authorization: authorization, events: &events) }
+        #expect(events == ["freeze", "invalidate", "thaw", "invalidate-guarded"])
+        #expect(probe.operations == ["freeze"] && probe.captures == 1)
+        #expect(probe.sources.count == 1 && probe.prompts == 1 && probe.finishes == 1)
+        #expect(throws: (any Error).self) {
+            try engine.nativeOperation("unmount", layout: layout(), record: authorizationRecord(), authorization: authorization)
+        }
+        #expect(probe.prompts == 1 && probe.captures == 1)
+    }
+
+    @Test func nativeMappingFailureThawsUsingOriginalAuthorization() throws {
+        let engine = try authorizationCoordinator(), probe = AuthorizationProbe(), authorization = probe.operation()
+        defer { authorization.finish() }
+        probe.failure = ("freeze", 78)
+        var events: [String] = []
+        #expect(throws: (any Error).self) { try authorizationCheckpoint(engine, authorization: authorization, events: &events) }
+        #expect(events == ["freeze", "invalidate", "thaw"])
+        #expect(probe.operations == ["freeze", "thaw"] && probe.captures == 2)
+        #expect(probe.sources.count == 1 && probe.prompts == 1)
+    }
+
+    @Test func nativeCopyFailureThawsWithoutCommittingOrNewAuthorization() throws {
+        let engine = try authorizationCoordinator(), probe = AuthorizationProbe(), authorization = probe.operation()
+        defer { authorization.finish() }
+        var events: [String] = []
+        #expect(throws: (any Error).self) {
+            try authorizationCheckpoint(engine, authorization: authorization, failCopy: true, events: &events)
+        }
+        #expect(!events.contains("commit") && events.suffix(2) == ["invalidate", "thaw"])
+        #expect(probe.operations == ["freeze", "thaw"] && probe.prompts == 1 && probe.sources.count == 1)
+    }
+
+    @Test func nativeFailedUnmountReusesAuthorizationForThaw() throws {
+        let engine = try authorizationCoordinator(), probe = AuthorizationProbe(), authorization = probe.operation()
+        defer { authorization.finish() }
+        probe.failure = ("unmount", 16)
+        #expect(throws: (any Error).self) {
+            try engine.nativeOperation("unmount", layout: layout(), record: authorizationRecord(), authorization: authorization)
+        }
+        #expect(try engine.nativeOperation("thaw", layout: layout(), record: authorizationRecord(), authorization: authorization).isEmpty)
+        #expect(probe.operations == ["unmount", "thaw"] && probe.prompts == 1 && probe.sources.count == 1)
+    }
+
+    @Test func nativeAuthorityFailureCannotStartOrReusePrivilegedExecution() throws {
+        let probe = AuthorizationProbe(), authorization = probe.operation()
+        defer { authorization.finish() }
+        let reserve = ["--native-v1", "reserve", String(getuid()), sid.uuidString]
+        probe.captureFailureAt = 1
+        #expect(throws: (any Error).self) { try authorization.authorize(arguments: reserve) }
+        #expect(probe.sources.isEmpty && probe.prompts == 0)
+        _ = try authorization.authorize(arguments: reserve)
+        probe.captureFailureAt = 3
+        #expect(throws: (any Error).self) { try authorization.authorize(arguments: reserve) }
+        #expect(probe.captures == 3 && probe.operations == ["reserve"] && probe.prompts == 1)
+    }
+
+    @Test func nativeScriptCreationFailureCannotStartAnotherContext() throws {
+        let helper = URL(fileURLWithPath: "/private/tmp/owned-helper")
+        var captures = 0, contexts = 0
+        let authorization = NativeTmpfsAuthorization(helper: helper, capture: { source in
+            captures += 1
+            return NativeHelperImage(source: source, bytes: 128, digest: String(repeating: "a", count: 64))
+        }, makeScript: { _ in
+            contexts += 1
+            throw NativeAppleScriptFailure(number: -2741, message: "injected compile failure")
+        })
+        defer { authorization.finish() }
+        let reserve = ["--native-v1", "reserve", String(getuid()), sid.uuidString]
+        for _ in 0..<2 {
+            #expect(throws: (any Error).self) { try authorization.authorize(arguments: reserve) }
+        }
+        #expect(captures == 1 && contexts == 1)
+    }
+
+    @Test func nativeAppleScriptErrorDictionaryPreservesCancellation() {
+        let info: NSDictionary = [NSAppleScript.errorNumber: NSNumber(value: -128), NSAppleScript.errorMessage: "User canceled."]
+        let failure = NativeAppleScriptFailure(info)
+        #expect(failure.number == -128 && failure.authorizationStopped)
+        #expect(failure.localizedDescription.contains("User canceled."))
+        #expect(!NativeAppleScriptFailure(nil).authorizationStopped)
+    }
+
+    @Test func nativeClosedOrCrossSessionContextCannotAuthorize() throws {
+        let probe = AuthorizationProbe()
+        var authorization: NativeTmpfsAuthorization? = probe.operation()
+        let reserve = ["--native-v1", "reserve", String(getuid()), sid.uuidString]
+        _ = try authorization!.authorize(arguments: reserve)
+        var other = reserve; other[3] = UUID().uuidString
+        #expect(throws: (any Error).self) { try authorization!.authorize(arguments: other) }
+        authorization!.finish()
+        #expect(throws: (any Error).self) { try authorization!.authorize(arguments: reserve) }
+        #expect(probe.sources.count == 1 && probe.prompts == 1 && probe.operations == ["reserve"] && probe.finishes == 1)
+        authorization = nil
+        #expect(probe.finishes == 1)
+        var next: NativeTmpfsAuthorization? = probe.operation()
+        _ = try next!.authorize(arguments: reserve)
+        next = nil // Exceptional scope exit also releases the retained context.
+        #expect(probe.sources.count == 2 && probe.prompts == 2 && probe.finishes == 2)
+    }
+
+    @Test func nativeMalformedReceiptCannotAuthorizeCheckpoint() throws {
+        let engine = try authorizationCoordinator(), probe = AuthorizationProbe(), authorization = probe.operation()
+        defer { authorization.finish() }
+        probe.malformedAt = "freeze"
+        var events: [String] = []
+        #expect(throws: (any Error).self) { try authorizationCheckpoint(engine, authorization: authorization, events: &events) }
+        #expect(!events.contains("copy") && !events.contains("commit"))
+        #expect(probe.operations == ["freeze", "thaw"] && probe.prompts == 1 && probe.sources.count == 1)
+    }
+
+    @Test func nativeAppleScriptHandlerRetainsContextAndPreservesArgumentBytes() throws {
+        // Real NSAppleScript handler transport, deliberately WITHOUT any shell
+        // execution/administrator command. No auth dialog or external app events.
+        let source = """
+        property calls : 0
+        on ramnest_authorize(commandText)
+            set calls to calls + 1
+            return (calls as text) & ":" & commandText
+        end ramnest_authorize
+        """
+        let script = try NativeAppleScriptContext(source: source)
+        defer { script.finish() }
+        let values = ["OK\t42\t2\n", "é € ' \\\" $()`\r\n", ""]
+        for (index, value) in values.enumerated() {
+            #expect(try script.execute(command: value) == "\(index + 1):" + value)
+        }
+        script.finish()
+        #expect(throws: (any Error).self) { try script.execute(command: "closed") }
+    }
+
     @Test func `Native completed idle retention and authority reset decode every durable boundary`() throws {
         let root = try fixture(), selected = root.appendingPathComponent("selected")
         try Store.privateDirectory(selected)
