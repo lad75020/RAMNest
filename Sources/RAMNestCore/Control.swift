@@ -1,13 +1,24 @@
 import Foundation
 import Darwin
 
-public struct HelperStatus: Sendable {
+public struct NativePinStatus: Sendable {
     public let id: UUID
     public let pid: Int32
     public let mounted: Bool
     public let used: UInt64
     public let capacity: UInt64
     public let active: Bool
+    static func decode(_ fields: [String], id: UUID) throws -> NativePinStatus {
+        guard fields.count == 6, let actual = UUID(uuidString: fields[0]), actual == id,
+              let pid = Int32(fields[1]), pid > 1, let used = UInt64(fields[3]),
+              let capacity = UInt64(fields[4]), capacity >= 16 << 20, used <= capacity,
+              ["mounted", "lost"].contains(fields[2]), ["active", "guarded"].contains(fields[5]),
+              fields[2] == "mounted" || (fields[5] == "guarded" && used == 0) else {
+            throw NestError("Native pin status identity/state/accounting mismatch.", code: 2)
+        }
+        return NativePinStatus(id: actual, pid: pid, mounted: fields[2] == "mounted", used: used,
+                               capacity: capacity, active: fields[5] == "active")
+    }
 }
 public enum Control {
     public static func request(_ socketPath: String, _ command: String, timeout: Int = 180) throws -> [String] {
@@ -31,20 +42,18 @@ public enum Control {
         let frameLimit = 8192
         guard timeout > 0, !command.contains("\n"), !command.contains("\0"), command.utf8.count <= frameLimit else { throw NestError("Invalid helper request.", code: 2) }
         let operation = String(command.prefix { $0 != "\t" })
-        let allowsProgress = ["populate", "populate2", "export", "quiesce", "export2", "quiesce2", "export3", "quiesce3"].contains(operation)
         func failure(_ detail: String) -> NestError {
             NestError("Helper \(operation) \(detail). Recovery data was retained.", code: 2)
         }
         func timedOut() -> NestError {
-            failure(allowsProgress ? "timed out waiting for progress; the helper may still be working" : "timed out waiting for a reply")
+            failure("timed out waiting for a reply")
         }
         var noSignal: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout.size(ofValue: noSignal)))
         var uid: uid_t = 0; var gid: gid_t = 0
         guard getpeereid(fd, &uid, &gid) == 0, uid == getuid() else { throw NestError("Helper peer is not owned by this user.", code: 2) }
         guard fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) == 0 else { throw failure("connection setup failed") }
-        // Monotonic deadlines survive EINTR, partial frames and trickling bytes.
-        // Only a complete, strictly advancing work frame renews the receive wait.
+        // Fixed monotonic deadlines survive EINTR, partial frames and trickling bytes.
         func ready(_ event: Int16, until deadline: TimeInterval) throws {
             while true {
                 let remaining = deadline - ProcessInfo.processInfo.systemUptime
@@ -71,8 +80,7 @@ public enum Control {
             }
         }
         var output = Data(); var byte: UInt8 = 0
-        var deadline = ProcessInfo.processInfo.systemUptime + Double(timeout)
-        var progress: UInt64 = 0
+        let deadline = ProcessInfo.processInfo.systemUptime + Double(timeout)
         while true {
             try ready(Int16(POLLIN), until: deadline)
             let count = Darwin.read(fd, &byte, 1)
@@ -85,17 +93,6 @@ public enum Control {
             }
             guard let frame = String(data: output, encoding: .utf8) else { throw failure("returned an invalid reply frame") }
             let fields = frame.components(separatedBy: "\t")
-            if fields.first == "PROGRESS" {
-                guard allowsProgress, fields.count == 2, !fields[1].isEmpty,
-                      fields[1].utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
-                      let next = UInt64(fields[1]), next > 0, next >= progress else { throw failure("returned an invalid progress frame") }
-                if next > progress {
-                    progress = next
-                    deadline = ProcessInfo.processInfo.systemUptime + Double(timeout)
-                }
-                output.removeAll(keepingCapacity: true)
-                continue
-            }
             if fields.first == "OK" { return Array(fields.dropFirst()) }
             if fields.first == "ERR", fields.count == 2, let code = Int32(fields[1]), code > 0 {
                 throw NestError("Helper \(operation) rejected operation: \(String(cString: strerror(code))).", code: 6)
@@ -103,21 +100,22 @@ public enum Control {
             throw failure("returned an invalid reply frame")
         }
     }
-    public static func status(_ journal: Journal, id: UUID) throws -> HelperStatus {
+    public static func status(_ journal: Journal, id: UUID) throws -> NativePinStatus {
         guard let path = journal.socket else { throw NestError("No helper session.", code: 2) }
         let fields = try request(path, "status", timeout: 2)
-        guard fields.count == 6, let actual = UUID(uuidString: fields[0]), actual == id, let pid = Int32(fields[1]), let used = UInt64(fields[3]), let capacity = UInt64(fields[4]) else { throw NestError("Helper identity mismatch.", code: 2) }
-        return HelperStatus(id: actual, pid: pid, mounted: fields[2] == "mounted", used: used, capacity: capacity, active: fields[5] == "active")
+        return try NativePinStatus.decode(fields, id: id)
     }
     public static func launch(helper: URL, arguments: [String]) throws {
+        guard arguments.first == "--pin-v1" else { throw NestError("Only the native user pin can detach.", code: 64) }
         let process = Process(); process.executableURL = helper; process.arguments = ["--daemonize"] + arguments
         let null = FileHandle(forUpdatingAtPath: "/dev/null")!
         process.standardInput = null; process.standardOutput = null; process.standardError = null
         try process.run(); process.waitUntilExit()
-        guard process.terminationStatus == 0 else { throw NestError("Could not start FUSE-T helper.", code: 2) }
+        guard process.terminationStatus == 0 else { throw NestError("Could not start the packaged native tmpfs pin helper.", code: 2) }
     }
-    @discardableResult public static func run(_ executable: String, _ arguments: [String]) throws -> String {
+    @discardableResult public static func run(_ executable: String, _ arguments: [String], currentDirectory: URL? = nil) throws -> String {
         let process = Process(); process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments
+        if let currentDirectory { process.currentDirectoryURL = currentDirectory }
         let pipe = Pipe(); process.standardOutput = pipe; process.standardError = pipe
         try process.run(); let data = pipe.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
         let output = String(decoding: data, as: UTF8.self)

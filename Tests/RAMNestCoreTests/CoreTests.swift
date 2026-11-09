@@ -189,7 +189,7 @@ extension RAMNestTestSuite {
             let (root, manager, store, folder, revision) = try moveFixture()
             let parent = root.appendingPathComponent("chosen"); try Store.privateDirectory(parent)
             var journal = Journal(); journal.revision = revision; journal.session = UUID()
-            journal.backend = .nfs; journal.startupProtocol = GuardedPopulationStartup.version
+            journal.backend = .nfs; journal.startupProtocol = LegacyJournalFormat.startupVersion
             try store.write(journal, for: folder.id)
             #expect(throws: (any Error).self) { try manager.move(store: store, toParent: parent) }
             // A normally activated and cleanly restored session retains startup
@@ -399,7 +399,7 @@ struct Scenarios {
         try Snapshot.copyTree(from: data, to: exported, manifest: manifest,sourceContext:.managedRevision)
         try check(try Snapshot.manifest(exported) == manifest)
         pass("verified real file/symlink/hardlink/Unicode/xattr/flags snapshot roundtrip")
-        try compressionMetadataScenarios(root: root)
+        try systemCompressionMetadataScenarios(root: root)
         pass("logical compression metadata: reserved xattr and UF_COMPRESSED, source unchanged, strict content and user metadata verification")
         let before = try Snapshot.manifest(selected)
         try rejects { try Snapshot.copyTree(from: selected, to: exported, manifest: before) }
@@ -485,7 +485,7 @@ struct Scenarios {
         pass("bounded bookmark retry accepts only the original identity; unsafe paths and unrelated errors stop immediately")
         print("PASS: \(tests) Swift integration scenarios; disposable fixtures at \(root.path)")
     }
-    static func compressionMetadataScenarios(root: URL) throws {
+    static func systemCompressionMetadataScenarios(root: URL) throws {
         let source = root.appendingPathComponent("source&accent-é")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
         let store = try Store(root: root.appendingPathComponent("compression-store"))
@@ -584,7 +584,7 @@ struct Scenarios {
         try payload.write(to: quarantined)
         let quarantine = Data("0081;65000000;RAMNest;".utf8)
         try put(quarantined, "com.apple.quarantine", quarantine)
-        let quarantineRevision = try Snapshot.adoptExport(store: store, folder: folder, stage: quarantineStage)
+        let quarantineRevision = try Snapshot.capture(store: store, folder: folder, source: quarantineStage, previous: nil)
         let (quarantineData, quarantineManifest) = try Snapshot.verified(store: store, id: folder.id, revision: quarantineRevision)
         try check(quarantineManifest.entries[0].attributes["com.apple.quarantine"] == Snapshot.digest(quarantine))
         let quarantineCopy = quarantineData.appendingPathComponent("quarantined.bin")
@@ -633,7 +633,7 @@ struct Scenarios {
         } catch let error as NestError {
             try check(error.code == 6 && error.message.contains("exceeds logical capacity") && !error.message.contains("exceeds metadata budget"))
             try check(error.message.contains("requires 2949120000 bytes") && error.message.contains("allowed 2147483648 bytes"))
-            try check(error.message.contains("55000 entries, 45000 regular files") && error.message.contains("compression does not reduce") && error.message.contains("Increase capacity"))
+            try check(error.message.contains("55000 entries, 45000 regular files") && error.message.contains("snapshot admission") && error.message.contains("Increase capacity"))
         }
         let small = Manifest(entries: (0..<2_500).map { entry($0, kind: "directory") })
         try check(small.allocatedEstimate == 0)

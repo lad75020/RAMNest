@@ -1,47 +1,117 @@
-# Local recovery
+# Native and legacy checkpoint recovery
 
-Content-checksum references in this recovery guide describe the default SHA-256 mode. Verification and retirement use each revision's recorded [file verification policy](FILE_VERIFICATION.md). Size/mtime mode permits a same-size edit with restored modification time to go undetected; changing Settings cannot upgrade an existing revision or reinterpret recovery authority.
-
-First stop writers and inspect status. Do not replace a snapshot from an empty or stale mountpoint.
-
-Long helper operations report completed work while population/export/quiesce
-advances. A timeout means no advancing progress arrived within the inactivity
-deadline; a disconnected or truncated reply means the connection ended before a
-complete final result. Both retain recovery data. The helper can still be working
-after its client times out or leaves, so inspect the session before repeating a
-mutating operation. No timeout automatically cancels a job, retries a command,
-deletes a stage, or starts recovery. See [helper operation details](HELPER_OPERATIONS.md).
+Stop writers and inspect `info REF --json`. Never replace a checkpoint from an
+empty, stale or uncertain mountpoint. Always use the appropriate selected store;
+parent tests must pass a fresh explicit `--store` on every command.
 
 ```sh
-artifacts/ramnest list --all --json
-artifacts/ramnest info 'Folder Name' --json
+/absolute/candidate/RAMNest.app/Contents/Helpers/ramnest --store /absolute/owned/store list --all --json
+/absolute/candidate/RAMNest.app/Contents/Helpers/ramnest --store /absolute/owned/store info REF --json
 ```
 
-For test repositories, put `--store /absolute/disposable/support` immediately after `ramnest` on every command. The default repository is `~/Library/Application Support/RAMNest`.
+## Native sessions
 
-`volumes/UUID/journal.json` records phase, verified population state, current/initial/restore revision, pending retirement references, exact evacuation entries, restore staging identity, completed-session sibling cleanup provenance and any error. Immutable snapshots are `volumes/UUID/revisions/REVISION/data` with a sibling manifest. Current revision is authoritative after a save. Normal retention is latest-only: mounted sessions retain the initial rollback anchor and any required restore revision. Successful idle restore/rollback transfers exact sibling identities into a durable cleanup queue before clearing transaction references. Snapshots needed to validate a queued original remain pinned until its cleanup completes. `priorRevision` is accepted from older journals but does not permanently pin history. A sibling `.ramnest-UUID-SESSION.original` holds original objects while mounted; a `.ramnest-UUID-restore-UUID/data` stage holds a verified restore during recovery. These are private 0700 containers, not guessed fallback paths.
+Native authority is recorded in `nativeTmpfs` and version-2 `nativeLink`, with the
+session uid, actual tmpfs fsid, root/data/underlying reservation identities and
+original-path link transaction. A native mount lives at the fixed internal slot;
+the public folder is its journal-bound link. `.fseventsd` is outside the logical
+user data tree. Unknown types/fsids, changed links/parents/inodes or nested mounts
+block save/eject/recovery rather than adopting a substitute.
 
-Retirement happens only after checksum verification of retained snapshots and durable journal replacement, while holding the repository lock. Only journal-linked deletion candidates are verified and inspected; there is no history-wide scan. Cleanup uses owned, no-follow directory handles and descriptor-relative unlinking, rejects symlink roots/ancestors/candidates, and refuses device or filesystem boundaries. A symlink leaf is unlinked without following its target. Completed-session siblings require durable idle, a valid committed snapshot and verified selected-directory identity/content. Normal-sync originals must still match the initial snapshot, including content and metadata; changed originals or unknown entries are retained. Temporary rollback moves the original inodes back without RAM export, then removes only the empty holding. A recorded restore stage is removed only with empty `data` and matching identities. The durable queue records a validated manifest and per-entry identities before deletion, so partial unlink failures can retry with bounded descriptors and stack. Unknown entries, corrupt revisions and incomplete captures/stages remain available for manual recovery. Failed/uncertain/recovery phases do not prune. A cleanup failure leaves the completed operation successful, reports a warning on stderr and records `cleanupWarning` when the journal is writable; the next safe operation can retry. A recovery error remains separate.
+If the exact native mount still exists, use Save/Eject with writers closed. A
+surviving ordinary-user pin can reconnect after GUI relaunch. `reconnect REF`
+repins an otherwise verified mounted session without thawing or creating another
+mount. An explicit `mount REF` can thaw that verified session after invalidating
+stale quiescence authority.
+An unverified/guarded population cannot be activated by guessing; use managed
+eject/recovery and retain the initial snapshot/original objects on uncertainty.
 
-If the helper is alive and the actual mount still exists, use Save/Eject. Relaunching the GUI reconnects; it does not create a second filesystem. A guarded, verified mount interrupted before write activation can be resumed by `mount REF`; an unverified population should be ejected/recovered rather than activated. If the helper is absent but a stale/orphaned mount remains, unmount only that known managed volume on the host first. Do not force-eject an active helper unless accepting loss of pending kernel writes.
+Save and synchronized eject remount read-only, verify the kernel identity/flag,
+and require a complete root mapping/reference scan. The gate rejects regular
+file fds and mappings, including `txt` mappings whose fd is already closed. Ignore
+Busy cannot bypass it. On failure, no new current-RAM checkpoint is promoted;
+old eject authority is invalidated durably before a verified thaw. If state or
+journal durability is uncertain, RAM remains guarded. See the
+[close-writers contract](NATIVE_TMPFS.md).
+
+**External forced unmount destroys native RAM.** A native helper does not retain
+an independently exportable tree after unmount. The pin discourages ordinary
+external unmount but does not defeat force-unmount, kernel failure or power loss.
+Automatic finalization refuses to fabricate a new export when the managed frozen
+checkpoint receipt is absent. Explicit `recover REF` restores the latest verified
+committed disk checkpoint and records a persistent `lossDisclosure`; unsaved work
+cannot be recovered. Temporary mode instead returns intact original directory
+objects. `export --live` fails when the bound native tree is absent; `export`
+without `--live` clearly exports only a committed disk revision.
 
 ```sh
-# Export the latest committed revision into a NEW directory.
-artifacts/ramnest export 'Folder Name' /absolute/new-recovery-directory
-# Export a transaction anchor or manually retained revision, only if it still exists.
-artifacts/ramnest export 'Folder Name' /absolute/new-retained-directory --revision REVISION_UUID
-# Explicitly rescue a still-running RAM tree, including temporary-mode work.
-artifacts/ramnest export 'Folder Name' /absolute/new-live-directory --live
-# Restore the authoritative local revision after an unclean session.
-artifacts/ramnest recover 'Folder Name'
+ramnest --store /absolute/owned/store export REF /absolute/NEW-recovery-directory
+ramnest --store /absolute/owned/store export REF /absolute/NEW-live-directory --live
+ramnest --store /absolute/owned/store recover REF
 ```
 
-`--revision` does not promise history. A revision removed by latest-only retention reports that it is **not retained on disk**. If the latest snapshot is damaged, preserve all remaining recovery data and original holding directories before investigating. Do not expect an older saved version to remain available.
+After managed unmount, disk publication resumes from the already committed
+checkpoint or original holding. The selected directory's restored inode/bookmark
+is committed before idle, and only the exact empty native runtime reservation is
+released. An interrupted verified publication can resume by its recorded
+identities. Lost administrator replies, an orphaned mount without committed fsid,
+an unrecorded slot, substituted authority, inaccessible final modes or incomplete
+materialization can require explicit host inspection/manual recovery. No path is
+adopted just because its basename resembles a session. Do not edit journals or
+force-unmount a user volume to make a recovery check pass.
 
-Recovery never overwrites unknown entries. If files were placed at the unmounted selected path, move them to a separate safe directory yourself, export the committed snapshot, compare the copies, then retry recovery. A partially completed restore is resumed only when present entries exactly match the committed manifest and the remaining stage identity still matches. A staging identity change or missing stage blocks recovery with the snapshot retained. Preserve the journal for investigation; export is always safer than editing transaction metadata.
+`nativeTmpfs.managedUnmount` is committed only after an acknowledged bounded
+unmount and verified absence. A prepared eject/checkpoint receipt alone does not
+authorize automatic restoration after disappearance. A crash before recording
+the unmount acknowledgment can therefore require explicit recovery and a loss
+disclosure even if the unmount itself completed.
 
-A failed initial conversion rolls back known entries with no-replace moves when the helper could not start. Uncertain mounts remain gated. Concurrent changes to retained originals can block rollback: both those original objects and the verified snapshot remain available for a manual choice. Temporary mode restores initial original objects, preserving their inodes when they are intact, and deliberately discards RAM modifications on eject. Do not use temporary mode for durable work.
+## Shared snapshot and holding safeguards
 
-On helper crash/power loss, only already committed revisions are recoverable; unsaved memory is gone. A normal external unmount is different: the surviving helper retains its tree, commits and restores it after FUSE teardown, and retries failures while keeping RAM alive. Normal GUI Quit waits for save/eject and offers Stay on failure. No actual shutdown test is performed.
+The default file policy is SHA-256. Each revision/session records its immutable
+[file verification policy](FILE_VERIFICATION.md); size/mtime can miss same-size
+edits with restored modification time. A new preference cannot reinterpret old
+revision authority.
 
-Deleted configurations leave remaining recovery storage intact. To recover it, inspect/copy the retained `data` directory directly and verify it against `manifest.json`, or temporarily restore the original configuration from a backup for CLI export. Cleanup never removes the latest verified committed snapshot. A legacy evacuation with a good recorded device/inode and valid initial snapshot can be attributed and cleaned at the next safe transaction. Missing/pruned initial snapshots or replaced paths cause retention and a warning. Legacy directories with no journal reference cannot be distinguished from uncommitted captures and are left for manual inspection after a verified export/backup. Opening the app or reading status does not scan/purge them.
+`volumes/UUID/journal.json` records phase, current/initial/restore revisions,
+population authority, original/restore publication receipts, staging identities,
+cleanup candidates and errors. Revision containers preserve their established
+manifest/mode-map/private-storage formats. Source capture and independent
+verification precede original moves. Whole original directories remain inside
+`.ramnest-FOLDER-SESSION.original/data` while linked; temporary restoration returns
+the original inode instead of copying stale disk contents over it.
+
+Latest-only retention is unchanged: retain the latest verified checkpoint and
+transaction/rollback/holding anchors while needed. Only journal-referenced
+committed revisions can be retired after durable replacement. Cleanup validates
+owned no-follow directory handles, devices, selected/holding content, inode maps
+and the recorded provenance/copy policy before descriptor-relative unlinking.
+Unknown entries, changed originals, opaque excluded Trash subtrees, damaged
+snapshots and unverified stages are retained with a separate warning. There is
+no history-wide scan or automatic purge. Failure/uncertainty phases do not prune.
+
+An export destination must be new. If the latest checkpoint is damaged or an
+original holding changed, preserve every journal/snapshot/holding before manual
+comparison. A revision explicitly retired by latest-only retention is not promised
+as history. Backup ACL equality remains outside the acceptance contract, while
+ownership, content, mode, metadata, topology and cleanup safety stay enforced.
+Recovery never overwrites an unrelated original-path entry or follows an unknown
+symlink. Resolve conflicts manually after a verified export.
+
+## Legacy sessions
+
+Old NFS/SMB/FSKit journals, version-1 `fsKitLink`, original rename receipts and
+snapshot formats remain decodable under their original validation rules. They
+never acquire native authority during recovery. A present malformed/partial/null
+layout cannot select legacy fallback.
+
+This native package will not launch/control a legacy FUSE data path. Finish a
+live legacy session using the original application/helper. Once its known mount
+is gone and helper authority is retired, offline recovery/export can use the
+retained committed checkpoint/original objects through the existing safe
+transaction. There is no runnable old engine or legacy live-export route in this package.
+The retained compatibility code restores durable data only.
+
+No cleanup, reset of Application Support, forced user-volume eject or service
+restart is part of candidate verification. Parent acceptance uses fresh owned
+fixtures and records actual lifecycle results separately from unit/static checks.

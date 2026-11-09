@@ -19,13 +19,50 @@ targets:
   RAMNestCore:
     type: library.static
     platform: macOS
-    sources: [Sources/RAMNestCore]
+    sources:
+      - path: Sources/RAMNestCore
+      # Explicit file reference even on a clean checkout; the prebuild creates it.
+      - path: $(DERIVED_FILE_DIR)/RAMNestNativeAuthority/NativeHelperBuildIdentity.swift
+        type: file
+        optional: true
+        buildPhase: sources
+        createIntermediateGroups: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: sh.ramnest.core
         PRODUCT_NAME: RAMNestCore
         DEFINES_MODULE: YES
         SWIFT_INSTALL_OBJC_HEADER: NO
+    preBuildScripts:
+      - name: Build finalized helper and compiled byte authority before Core
+        basedOnDependencyAnalysis: false
+        script: |
+          set -eu
+          native_config=RelWithDebInfo
+          if [ "$CONFIGURATION" = Debug ]; then native_config=Debug; fi
+          native="$TEMP_DIR/ramnest-native-$CONFIGURATION"
+          authority="$BUILT_PRODUCTS_DIR/RAMNestNativeAuthority-$CONFIGURATION"
+          /bin/rm -f "$authority/authority.json"
+          /bin/bash "$PROJECT_DIR/scripts/build-native.sh" "$native" "$native_config" ramnest-helper
+          python3 "$PROJECT_DIR/scripts/native-build-authority.py" generate "$native" "$CONFIGURATION" "$authority" "$DERIVED_FILE_DIR/RAMNestNativeAuthority/NativeHelperBuildIdentity.swift" --staging-dir "$TEMP_DIR/ramnest-authority-stage-$CONFIGURATION"
+        inputFiles:
+          - $(PROJECT_DIR)/Native/CMakeLists.txt
+          - $(PROJECT_DIR)/Native/NativeTmpfsHelper.cpp
+          - $(PROJECT_DIR)/Native/NativeTmpfsProtocol.hpp
+          - $(PROJECT_DIR)/Native/NativeTmpfsProtocolTests.cpp
+          - $(PROJECT_DIR)/scripts/native-provenance.py
+          - $(PROJECT_DIR)/scripts/native-build-authority.py
+          - $(PROJECT_DIR)/scripts/build-native.sh
+        outputFiles:
+          - $(TEMP_DIR)/ramnest-native-$(CONFIGURATION)
+          - $(TEMP_DIR)/ramnest-authority-stage-$(CONFIGURATION)
+          - $(BUILT_PRODUCTS_DIR)/RAMNestNativeAuthority-$(CONFIGURATION)
+          - $(BUILT_PRODUCTS_DIR)/RAMNestNativeAuthority-$(CONFIGURATION)/ramnest-helper
+          - $(BUILT_PRODUCTS_DIR)/RAMNestNativeAuthority-$(CONFIGURATION)/provenance.json
+          - $(BUILT_PRODUCTS_DIR)/RAMNestNativeAuthority-$(CONFIGURATION)/authority.json
+          - $(BUILT_PRODUCTS_DIR)/RAMNestNativeAuthority-$(CONFIGURATION)/NativeHelperBuildIdentity.swift
+          - $(DERIVED_FILE_DIR)/RAMNestNativeAuthority
+          - $(DERIVED_FILE_DIR)/RAMNestNativeAuthority/NativeHelperBuildIdentity.swift
   ramnest:
     type: tool
     platform: macOS
@@ -48,61 +85,20 @@ targets:
       - target: RAMNestCore
       - target: ramnest
         link: false
-    preBuildScripts:
-      - name: Rebuild native helper from current source
-        basedOnDependencyAnalysis: false
-        script: |
-          native_config=RelWithDebInfo
-          if [ "$CONFIGURATION" = Debug ]; then native_config=Debug; fi
-          /bin/bash "$PROJECT_DIR/scripts/build-native.sh" "$TEMP_DIR/ramnest-native-$CONFIGURATION" "$native_config" ramnest-helper
-        inputFiles:
-          - $(PROJECT_DIR)/Native
-          - $(PROJECT_DIR)/scripts/native-provenance.py
-          - $(PROJECT_DIR)/Native/MemoryFS.cpp
-          - $(PROJECT_DIR)/Native/MemoryFS.hpp
-          - $(PROJECT_DIR)/Native/NativeChecksumIntegrityTests.cpp
-          - $(PROJECT_DIR)/Native/FileVerificationTests.cpp
-          - $(PROJECT_DIR)/Native/NativeIoOptimizationTests.cpp
-          - $(PROJECT_DIR)/Native/NativeIoBenchmark.cpp
-          - $(PROJECT_DIR)/Native/DebugProfile.hpp
-          - $(PROJECT_DIR)/Native/DebugProfileTests.cpp
-          - $(PROJECT_DIR)/Native/StorageModes.hpp
-          - $(PROJECT_DIR)/Native/TrashExclusionTests.cpp
-          - $(PROJECT_DIR)/Native/StorageFormatFixture.cpp
-          - $(PROJECT_DIR)/Native/StorageFormatTests.cpp
-          - $(PROJECT_DIR)/Native/StorageProtocolFixture.cpp
-          - $(PROJECT_DIR)/Native/Helper.cpp
-          - $(PROJECT_DIR)/Native/CMakeLists.txt
-          - $(PROJECT_DIR)/Native/AttributeAbsenceTests.cpp
-          - $(PROJECT_DIR)/Native/CallbackTests.cpp
-          - $(PROJECT_DIR)/Native/CompressionTests.cpp
-          - $(PROJECT_DIR)/Native/ControlSocketFixtures.hpp
-          - $(PROJECT_DIR)/Native/ControlTests.cpp
-          - $(PROJECT_DIR)/Native/EngineProtocolFixture.cpp
-          - $(PROJECT_DIR)/Native/FollowupTests.cpp
-          - $(PROJECT_DIR)/Native/SparseExtentTests.cpp
-          - $(PROJECT_DIR)/Native/FootprintTests.cpp
-          - $(PROJECT_DIR)/Native/IncrementalTests.cpp
-          - $(PROJECT_DIR)/Native/MemoryTests.cpp
-          - $(PROJECT_DIR)/Native/PerformanceContracts.cpp
-          - $(PROJECT_DIR)/Native/ReviewRegressionTests.cpp
-          - $(PROJECT_DIR)/Native/ScalingBench.cpp
-          - $(PROJECT_DIR)/Native/StackTests.hpp
-          - $(PROJECT_DIR)/scripts/build-native.sh
-        outputFiles:
-          - $(TEMP_DIR)/ramnest-native-$(CONFIGURATION)
-          - $(TEMP_DIR)/ramnest-native-$(CONFIGURATION)/ramnest-helper
-          - $(TEMP_DIR)/ramnest-native-$(CONFIGURATION)/provenance.json
     postBuildScripts:
       - name: Embed freshly rebuilt private helper and CLI
         script: |
+          set -eu
           mkdir -p "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers" "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Resources"
-          cp "$TEMP_DIR/ramnest-native-$CONFIGURATION/ramnest-helper" "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers/"
-          cp "$TEMP_DIR/ramnest-native-$CONFIGURATION/provenance.json" "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Resources/native-provenance.json"
+          authority="$BUILT_PRODUCTS_DIR/RAMNestNativeAuthority-$CONFIGURATION"
+          python3 "$PROJECT_DIR/scripts/native-build-authority.py" embed "$authority" "$authority/NativeHelperBuildIdentity.swift" "$TARGET_BUILD_DIR/$WRAPPER_NAME"
           cp "$BUILT_PRODUCTS_DIR/ramnest" "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers/"
         inputFiles:
-          - $(TEMP_DIR)/ramnest-native-$(CONFIGURATION)/ramnest-helper
-          - $(TEMP_DIR)/ramnest-native-$(CONFIGURATION)/provenance.json
+          - $(PROJECT_DIR)/scripts/native-build-authority.py
+          - $(BUILT_PRODUCTS_DIR)/RAMNestNativeAuthority-$(CONFIGURATION)/ramnest-helper
+          - $(BUILT_PRODUCTS_DIR)/RAMNestNativeAuthority-$(CONFIGURATION)/provenance.json
+          - $(BUILT_PRODUCTS_DIR)/RAMNestNativeAuthority-$(CONFIGURATION)/authority.json
+          - $(BUILT_PRODUCTS_DIR)/RAMNestNativeAuthority-$(CONFIGURATION)/NativeHelperBuildIdentity.swift
           - $(BUILT_PRODUCTS_DIR)/ramnest
         outputFiles:
           - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/ramnest-helper

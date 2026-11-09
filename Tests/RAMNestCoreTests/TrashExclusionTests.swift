@@ -9,7 +9,6 @@ extension RAMNestTestSuite {
         @Test func `Old revision views`() throws { try TrashScenarios.oldRevisions() }
         @Test func `Original holding retention`() throws { try TrashScenarios.holding() }
         @Test func `Owned simulated lifecycle and rollback`() throws { try TrashScenarios.lifecycle() }
-        @Test func `Legacy fresh export exclusion`() throws { try TrashScenarios.legacyExport() }
         @Test func `Cross boundary hardlinks`() throws { try TrashScenarios.crossBoundary() }
     }
 }
@@ -19,7 +18,7 @@ enum TrashScenarios {
         if try !ok() { throw NestError("TRASH: " + message) }
     }
     static func root() throws -> URL {
-        guard let path = ProcessInfo.processInfo.environment["RAMNEST_TRASH_TEST_ROOT"] else { throw NestError("Owned test root required") }
+        let path = ProcessInfo.processInfo.environment["RAMNEST_TRASH_TEST_ROOT"] ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("artifacts/trash-tests").path
         let url = URL(fileURLWithPath:path).appendingPathComponent(UUID().uuidString)
         try Store.privateDirectory(url);return url
     }
@@ -128,24 +127,6 @@ enum TrashScenarios {
         try check(try evidence(trash) == before,"cleanup never opens/mutates excluded disk Trash")
         print("PASS original holding exclusion refuses deletion before opaque subtree access")
     }
-    static func legacyExport() throws {
-        let r = try root(), store = try Store(root:r.appendingPathComponent("store")), selected = r.appendingPathComponent("selected")
-        try Store.privateDirectory(selected);let identity = try DirectoryHandle.open(selected).identity()
-        let f = Folder(name:"legacy-trash",path:selected.path,capacity:16<<20,device:identity.device,inode:identity.inode)
-        let stage = try store.volume(f.id).appendingPathComponent("stage-"+UUID().uuidString)
-        try Store.privateDirectory(stage.appendingPathComponent("normal/.Trashes"))
-        try Store.privateDirectory(stage.appendingPathComponent(".Trashes"))
-        try Data("ignored legacy Trash".utf8).write(to:stage.appendingPathComponent(".Trashes/sentinel"))
-        try Data("ignored nested legacy Trash".utf8).write(to:stage.appendingPathComponent("normal/.Trashes/sentinel"))
-        try Data("included".utf8).write(to:stage.appendingPathComponent("normal/payload"))
-        try check(chmod(stage.appendingPathComponent(".Trashes").path,0o311) == 0 && chmod(stage.appendingPathComponent("normal/.Trashes").path,0) == 0,"legacy opaque")
-        let before = try evidence(stage.appendingPathComponent(".Trashes"))
-        let revision = try Snapshot.adoptExport(store:store,folder:f,stage:stage)
-        let (data,m) = try Snapshot.verified(store:store,id:f.id,revision:revision)
-        try check(m.entries.map(\.path) == ["normal","normal/payload"] && !FileManager.default.fileExists(atPath:data.appendingPathComponent(".Trashes").path),"new revision omits legacy physical Trash")
-        try check(try evidence(stage.appendingPathComponent(".Trashes")) == before && FileManager.default.fileExists(atPath:stage.path+".trash-retained.json"),"legacy stage retained without Trash mutation and durable location")
-        print("PASS legacy fresh export skips before normalization and copies an exact filtered revision; opaque stage retained")
-    }
     static func crossBoundary() throws {
         let r = try root(), stageParent = r.appendingPathComponent("volume"), stage = stageParent.appendingPathComponent("stage-"+UUID().uuidString)
         try Store.privateDirectory(stage.appendingPathComponent(".Trashes"))
@@ -153,8 +134,8 @@ enum TrashScenarios {
         try Data("must stay read-only".utf8).write(to:outside);try check(chmod(outside.path,0o400) == 0,"outside mode")
         try check(link(outside.path,stage.appendingPathComponent("alias").path) == 0,"outside alias")
         let before = try evidence(outside)
-        try rejects { _ = try StorageModes.normalizeFreshExport(stage,volume:stageParent) }
-        try check(try evidence(outside) == before,"outside inode mode/ctime never widened")
+        try rejects { _ = try Snapshot.scanManifest(stage, containedHardlinks: true) }
+        try check(try evidence(outside) == before, "outside hardlink never authorizes metadata mutation")
         let source = r.appendingPathComponent("source"),store = try Store(root:r.appendingPathComponent("store"))
         try Store.privateDirectory(source.appendingPathComponent(".Trashes"))
         let payload = source.appendingPathComponent(".Trashes/payload")
@@ -172,63 +153,25 @@ enum TrashScenarios {
         let committed = try evidence(data.appendingPathComponent("alias"))
         try rejects { _ = try Snapshot.verified(store:store,id:f.id,revision:rev) }
         try check(try evidence(data.appendingPathComponent("alias")) == committed,"old private boundary fails without mutation")
-        print("PASS original cross-boundary alias copies safely; fresh normalization with outside inode fails before chmod")
+        print("PASS original cross-boundary alias copies safely; private-tree outside hardlink fails without metadata mutation")
     }
     static func lifecycle() throws {
-        let r = try root(),source = r.appendingPathComponent("source"),store = try Store(root:r.appendingPathComponent("store"))
-        try Store.privateDirectory(source.appendingPathComponent("normal/.Trashes"));try Store.privateDirectory(source.appendingPathComponent(".Trashes"))
-        for path in [".Trashes/sentinel","normal/.Trashes/sentinel","normal/payload"] { try Data(path.utf8).write(to:source.appendingPathComponent(path)) }
-        try check(chmod(source.appendingPathComponent(".Trashes").path,0o311) == 0 && chmod(source.appendingPathComponent("normal/.Trashes").path,0) == 0,"opaque original")
-        try check(link(source.appendingPathComponent("normal/payload").path,source.appendingPathComponent("alias").path) == 0,"normal links")
-        let attribute = Data("included lifecycle metadata".utf8)
-        try check(attribute.withUnsafeBytes { setxattr(source.appendingPathComponent("alias").path,"user.lifecycle",$0.baseAddress,$0.count,0,0) } == 0,"included lifecycle xattr")
-        let f = try Engine(store:store).create(path:source,name:"lifecycle",capacity:16<<20)
-        let expected = try Snapshot.manifest(source)
-        var firstHolding: URL?,trashEvidence: [String] = []
-        for cycle in 0..<3 {
-            let revision = try Snapshot.capture(store:store,folder:f,source:source,previous:try store.journal(f.id).revision)
-            let (data,m) = try Snapshot.verified(store:store,id:f.id,revision:revision)
-            var j = try store.journal(f.id);j.session = UUID();j.initialRevision = revision;j.revision = revision;j.populationVerified = false;j.socket = "simulated-owned-session";j.phase = .preparing
-            try store.write(j,for:f.id)
-            var boundary = EngineSession(),mounted = true
-            boundary.mountedIdentity = { _,_ in true }
-            boundary.status = { _,id in HelperStatus(id:id,pid:getpid(),mounted:mounted,used:0,capacity:16<<20,active:true) }
-            boundary.populationRead = { _ in try Snapshot.manifest(data,context:.managedRevision) }
-            boundary.unmount = { _ in mounted = false }
-            boundary.request = { _,command in
-                let fields = command.components(separatedBy:"\t")
-                if fields[0] == "capabilities" { return [] }
-                if fields[0] == "export" || fields[0] == "quiesce" {
-                    try Snapshot.copyTree(from:data,to:URL(fileURLWithPath:fields[1]),manifest:m,publicationStaging:true,sourceContext:.managedRevision)
-                }
-                return []
-            }
-            let engine = Engine(store:store,session:boundary)
-            let (selected,holding) = try engine.evacuateOriginal(f,journal:&j,expected:m)
-            if cycle == 0 {
-                firstHolding = holding
-                trashEvidence = try [".Trashes","normal/.Trashes"].map { try evidence(holding.appendingPathComponent($0)) }
-                try check(j.evacuatedEntries.contains(".Trashes"),"opaque root Trash included in durable evacuation journal")
-            }
-            try engine.verifyAndActivatePopulation(f,journal:&j,expected:m,source:selected,original:holding)
-            try engine.save(f.id.uuidString);try engine.unmount(f.id.uuidString,ignoreBusy:true)
-            let idle = try store.journal(f.id)
-            try check(idle.phase == .idle && !idle.siblingCleanup!.isEmpty && idle.cleanupWarning?.contains(firstHolding!.path) == true,"idle nonfatal warning with durable original recovery location")
-            try check(try Snapshot.manifest(source).matchesExpected(expected),"included restore exact cycle \(cycle)")
-            try check(try [".Trashes","normal/.Trashes"].map { try evidence(firstHolding!.appendingPathComponent($0)) } == trashEvidence,"original excluded holdings immutable across repeated retirement")
-        }
-        // Journal a normal evacuation then recover before activation. Rollback
-        // moves originals back, and never equates a filtered view with emptiness.
-        var j = try store.journal(f.id);j.session = UUID();j.initialRevision = j.revision;j.populationVerified = false;j.phase = .preparing
-        let engine = Engine(store:store);_ = try engine.evacuateOriginal(f,journal:&j,expected:expected)
-        j.phase = .recoveryRequired;j.socket = nil;try store.write(j,for:f.id)
-        try engine.recover(f.id.uuidString)
-        try check(try Snapshot.manifest(source).matchesExpected(expected),"pre-activation rollback exact")
-        print("PASS simulated activation/save/eject plus two remount cycles; pinned opaque originals retained with warning; pre-activation rollback")
+        let r = try root()
+        let f = try LinkedTransactionDataFixture(r, "trash", temporary: true)
+        let opaque = f.selected.appendingPathComponent(".Trashes")
+        try Store.privateDirectory(opaque); try Data("retained opaque".utf8).write(to: opaque.appendingPathComponent("sentinel"))
+        let before = try evidence(opaque)
+        try f.prepare()
+        _ = try f.evacuate()
+        try f.publish()
+        try f.discardWorkingCopy()
+        try f.engine.recover(f.folder.id.uuidString)
+        try check(try evidence(opaque) == before, "temporary whole-root rollback retains opaque Trash and original inode")
     }
+
 }
 #if RAMNEST_TRASH_STANDALONE
 @main struct TrashRunner {
-    static func main() { do { try TrashScenarios.capture();try TrashScenarios.oldRevisions();try TrashScenarios.holding();try TrashScenarios.legacyExport();try TrashScenarios.crossBoundary();try TrashScenarios.lifecycle() } catch { print("FAIL \(error)");exit(1) } }
+    static func main() { do { try TrashScenarios.capture();try TrashScenarios.oldRevisions();try TrashScenarios.holding();try TrashScenarios.crossBoundary();try TrashScenarios.lifecycle() } catch { print("FAIL \(error)");exit(1) } }
 }
 #endif

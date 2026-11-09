@@ -39,7 +39,7 @@ public enum Paths {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let forbidden = ["/", "/Users", "/Volumes", "/private", "/private/tmp", "/private/var", "/tmp", "/System", "/Library", "/Applications", "/usr", "/bin", "/sbin", "/dev", "/etc", "/var", home, home + "/Library"]
         guard !forbidden.contains(path), !["/System", "/Library", "/Applications", "/usr", "/bin", "/sbin", "/dev"].contains(where: { path.hasPrefix($0 + "/") }) else { throw NestError("Choose a data folder, not a root, home, or system folder.", code: 4) }
-        for unsafe in [home + "/Library/Containers", home + "/Library/Group Containers", store.root.path] where overlaps(path, unsafe) { throw NestError("This location overlaps protected app storage.", code: 4) }
+        for unsafe in [home + "/Library/Containers", home + "/Library/Group Containers", store.root.path, NativeTmpfsPaths.root.path] where overlaps(path, unsafe) { throw NestError("This location overlaps protected app storage.", code: 4) }
         guard !folders.contains(where: { $0.id != excluding && overlaps(path, $0.path) }) else { throw NestError("RAM folders cannot overlap or nest.", code: 4) }
         guard !mounts().contains(where: { $0.path == path || $0.path.hasPrefix(path + "/") }) else { throw NestError("Folder is or contains an existing mount.", code: 4) }
         var st = stat()
@@ -98,10 +98,10 @@ public enum Paths {
 
 /// Persisted authority for the new layout. Strings locate objects; identities
 /// authorize them. Legacy journals never acquire this record during recovery.
-public struct FSKitLinkLayout: Codable, Equatable, Sendable {
+public struct LinkedFolderLayout: Codable, Equatable, Sendable {
     // Decoder context is supplied only by the internal owned-fixture seam.
     // Normal JSONDecoder and every public Store use the fixed internal root.
-    static let decoderRootKey = CodingUserInfoKey(rawValue: "RAMNest.FSKit.fixtureRoot")!
+    static let decoderRootKey = CodingUserInfoKey(rawValue: "RAMNest.LinkedFolder.dataFixtureRoot")!
     private struct Key: CodingKey {
         var stringValue: String
         var intValue: Int? { nil }
@@ -115,13 +115,13 @@ public struct FSKitLinkLayout: Codable, Equatable, Sendable {
         private enum CodingKeys: String, CodingKey { case device, inode }
         public init(from decoder: Decoder) throws {
             let all = try decoder.container(keyedBy: Key.self)
-            guard Set(all.allKeys.map(\.stringValue)) == ["device", "inode"] else { throw NestError("Malformed FSKit identity.", code: 6) }
+            guard Set(all.allKeys.map(\.stringValue)) == ["device", "inode"] else { throw NestError("Malformed linked-folder identity.", code: 6) }
             let values = try decoder.container(keyedBy: CodingKeys.self)
             device = try values.decode(UInt64.self, forKey: .device); inode = try values.decode(UInt64.self, forKey: .inode)
-            guard inode > 0 else { throw NestError("Invalid FSKit inode.", code: 6) }
+            guard inode > 0 else { throw NestError("Invalid linked-folder inode.", code: 6) }
         }
         func verify(_ handle: DirectoryHandle) throws {
-            guard try Identity(handle.identity()) == self else { throw NestError("FSKit directory identity changed; data retained.", code: 4) }
+            guard try Identity(handle.identity()) == self else { throw NestError("linked-folder directory identity changed; data retained.", code: 4) }
         }
         func matches(_ st: stat) -> Bool { device == Paths.deviceID(st.st_dev) && inode == UInt64(st.st_ino) }
     }
@@ -155,7 +155,7 @@ public struct FSKitLinkLayout: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let all = try decoder.container(keyedBy: Key.self)
         let allowed = Set(CodingKeys.allCases.map(\.rawValue))
-        guard all.allKeys.allSatisfy({ allowed.contains($0.stringValue) }) else { throw NestError("Unknown FSKit layout fields; recovery blocked.", code: 6) }
+        guard all.allKeys.allSatisfy({ allowed.contains($0.stringValue) }) else { throw NestError("Unknown linked-folder layout fields; recovery blocked.", code: 6) }
         let c = try decoder.container(keyedBy: CodingKeys.self)
         version = try c.decode(Int.self, forKey: .version)
         folderID = try c.decode(UUID.self, forKey: .folderID); session = try c.decode(UUID.self, forKey: .session)
@@ -183,11 +183,11 @@ public struct FSKitLinkLayout: Codable, Equatable, Sendable {
         let original = URL(fileURLWithPath: originalPath), mount = URL(fileURLWithPath: mountPath)
         let rootURL = URL(fileURLWithPath: mountRoot)
         let paths = [originalPath, mountRoot, mountPath, holdingPath, linkStagePath]
-        guard version == 1, Set(paths).count == paths.count,
+        guard [1, 2].contains(version), Set(paths).count == paths.count,
               paths.allSatisfy({ $0.hasPrefix("/") && URL(fileURLWithPath: $0).standardizedFileURL.path == $0 && !$0.contains(where: { $0.isNewline || $0 == "\t" || $0 == "\0" }) }),
-              rootURL.lastPathComponent == "RAMNest-Mounts-\(getuid())",
+              (version == 1 ? rootURL.lastPathComponent == "RAMNest-Mounts-\(getuid())" : mountRoot == NativeTmpfsPaths.root.path),
               original.lastPathComponent != ".", original.lastPathComponent != "..", !original.lastPathComponent.isEmpty,
-              mount.deletingLastPathComponent() == rootURL, mount.lastPathComponent == original.lastPathComponent,
+              (version == 1 ? (mount.deletingLastPathComponent() == rootURL && mount.lastPathComponent == original.lastPathComponent) : mountPath == NativeTmpfsPaths.data(session).path),
               !Paths.overlaps(originalPath, mountRoot),
               holdingPath == original.deletingLastPathComponent().appendingPathComponent(".ramnest-\(folderID.uuidString)-\(session.uuidString).original").path,
               linkStagePath == original.deletingLastPathComponent().appendingPathComponent(".ramnest-\(folderID.uuidString)-\(session.uuidString).link").path,
@@ -206,18 +206,18 @@ public struct FSKitLinkLayout: Codable, Equatable, Sendable {
               !mountReleased || stage == .restored,
               link.map({ $0.inode > 0 && $0.device == parent.device && $0 != source && $0 != parent }) ?? true,
               restored.map({ $0.inode > 0 && $0.device == parent.device }) ?? true else {
-            throw NestError("Invalid FSKit symlink authority; recovery blocked and all data retained.", code: 6)
+            throw NestError("Invalid linked-folder symlink authority; recovery blocked and all data retained.", code: 6)
         }
     }
 }
 
 /// No environment overrides. The internal initializer's root argument is an
 /// owned-fixture seam; public Engine always uses the fixed production root.
-enum FSKitLinks {
+enum LinkedFolders {
     static func requirePrivateDirectory(_ handle: DirectoryHandle, device: UInt64, checkACL: Bool = true) throws {
         try handle.requireOwnedDirectory(device: device, privateMode: true)
         var st = stat()
-        guard fstat(handle.fd, &st) == 0, st.st_mode & 0o7777 == 0o700 else { throw NestError("FSKit private directory must have mode 0700.", code: 4) }
+        guard fstat(handle.fd, &st) == 0, st.st_mode & 0o7777 == 0o700 else { throw NestError("linked-folder private directory must have mode 0700.", code: 4) }
         // Backup ACL fidelity is explicitly non-blocking. Live mount roots and
         // reservations keep the stricter access-control policy by default.
         guard checkACL else { return }
@@ -226,73 +226,37 @@ enum FSKitLinks {
             defer { acl_free(UnsafeMutableRawPointer(acl)) }
             var entry: acl_entry_t?
             let result = acl_get_entry(acl, Int32(ACL_FIRST_ENTRY.rawValue), &entry)
-            guard result != 0, errno == EINVAL else { throw NestError("ACL-bearing FSKit private directories are unsupported; retained.", code: 4) }
-        } else if errno != ENOENT && errno != ENOTSUP { throw NestError("Cannot inspect bound FSKit directory ACL; retained.", code: 4) }
+            guard result != 0, errno == EINVAL else { throw NestError("ACL-bearing linked-folder private directories are unsupported; retained.", code: 4) }
+        } else if errno != ENOENT && errno != ENOTSUP { throw NestError("Cannot inspect bound linked-folder directory ACL; retained.", code: 4) }
     }
-    static func holding(_ layout: FSKitLinkLayout, parent: DirectoryHandle) throws -> DirectoryHandle {
-        guard let identity = layout.holding else { throw NestError("Unrecorded FSKit backup wrapper; retained.", code: 4) }
+    static func holding(_ layout: LinkedFolderLayout, parent: DirectoryHandle) throws -> DirectoryHandle {
+        guard let identity = layout.holding else { throw NestError("Unrecorded linked-folder backup wrapper; retained.", code: 4) }
         let handle = try parent.child(URL(fileURLWithPath: layout.holdingPath).lastPathComponent)
         try identity.verify(handle); try requirePrivateDirectory(handle, device: identity.device, checkACL: false)
         return handle
     }
-    static var productionRoot: URL { URL(fileURLWithPath: "/Users/Shared/RAMNest-Mounts-\(getuid())", isDirectory: true) }
-    static func requireInternalFilesystem(_ parent: DirectoryHandle) throws {
-        var fs = statfs(), internalFS = statfs()
-        guard fstatfs(parent.fd, &fs) == 0, fs.f_flags & UInt32(MNT_LOCAL) != 0,
-              fs.f_flags & UInt32(MNT_RDONLY) == 0,
-              statfs("/Users/Shared", &internalFS) == 0,
-              fs.f_fsid.val.0 == internalFS.f_fsid.val.0, fs.f_fsid.val.1 == internalFS.f_fsid.val.1 else {
-            throw NestError("FSKit mount root requires writable internal storage.", code: 4)
-        }
-    }
-    static func reserve(_ folder: Folder, session: UUID, root: URL,
-                        filesystemCheck: (DirectoryHandle) throws -> Void = requireInternalFilesystem) throws -> FSKitLinkLayout {
-        try Paths.checkedIdentity(folder)
-        let selected = URL(fileURLWithPath: folder.path)
-        let parent = try DirectoryHandle.open(selected.deletingLastPathComponent())
-        let rootParent = try DirectoryHandle.open(root.deletingLastPathComponent())
-        // Check internal local storage before creating even the reservation.
-        try filesystemCheck(rootParent)
-        if try !rootParent.exists(root.lastPathComponent) { _ = try rootParent.createDirectory(root.lastPathComponent); try rootParent.sync() }
-        let rootHandle = try rootParent.child(root.lastPathComponent)
-        let rootIdentity = try rootHandle.identity()
-        try requirePrivateDirectory(rootHandle, device: rootIdentity.device)
-        var rootStat = stat()
-        guard fstat(rootHandle.fd, &rootStat) == 0, rootStat.st_mode & 0o7777 == 0o700 else { throw NestError("FSKit mount root must have mode 0700.", code: 4) }
-        let mountPath = root.appendingPathComponent(selected.lastPathComponent)
-        guard !Paths.mounts().contains(where: { $0.path == root.path || $0.path == mountPath.path || $0.path.hasPrefix(mountPath.path + "/") }),
-              try !rootHandle.exists(selected.lastPathComponent) else { throw NestError("Exact FSKit mount basename is already reserved; source unchanged.", code: 6) }
-        let mount = try rootHandle.createDirectory(selected.lastPathComponent)
-        try requirePrivateDirectory(mount, device: rootIdentity.device)
-        try rootHandle.sync()
-        let result = FSKitLinkLayout(folderID: folder.id, session: session, stage: .reserved,
-            originalPath: folder.path, mountRoot: root.path, mountPath: mountPath.path,
-            holdingPath: selected.deletingLastPathComponent().appendingPathComponent(".ramnest-\(folder.id.uuidString)-\(session.uuidString).original").path,
-            linkStagePath: selected.deletingLastPathComponent().appendingPathComponent(".ramnest-\(folder.id.uuidString)-\(session.uuidString).link").path,
-            parent: try .init(parent.identity()), root: .init(rootIdentity), mountpoint: try .init(mount.identity()),
-            source: .init((folder.device, folder.inode)))
-        try result.validate(); return result
-    }
-    static func parent(_ layout: FSKitLinkLayout, folder: Folder, root: URL) throws -> DirectoryHandle {
+    static var legacyRoot: URL { URL(fileURLWithPath: "/Users/Shared/RAMNest-Mounts-\(getuid())", isDirectory: true) }
+    static func parent(_ layout: LinkedFolderLayout, folder: Folder, root: URL) throws -> DirectoryHandle {
         try layout.validate()
-        guard layout.folderID == folder.id, layout.originalPath == folder.path, layout.mountRoot == root.path,
+        guard layout.folderID == folder.id, layout.originalPath == folder.path, layout.mountRoot == (layout.version == 2 ? NativeTmpfsPaths.root.path : root.path),
               (folder.device == layout.source.device && folder.inode == layout.source.inode) ||
               (layout.restored?.device == folder.device && layout.restored?.inode == folder.inode) else {
-            throw NestError("FSKit folder/configuration authority changed; recovery blocked.", code: 4)
+            throw NestError("linked-folder folder/configuration authority changed; recovery blocked.", code: 4)
         }
         let handle = try DirectoryHandle.open(URL(fileURLWithPath: layout.originalPath).deletingLastPathComponent())
         try layout.parent.verify(handle)
         return handle
     }
-    static func root(_ layout: FSKitLinkLayout) throws -> DirectoryHandle {
+    static func root(_ layout: LinkedFolderLayout) throws -> DirectoryHandle {
         let handle = try DirectoryHandle.open(URL(fileURLWithPath: layout.mountRoot))
         try layout.root.verify(handle)
+        if layout.version == 2 { try NativeTmpfsPaths.requireRoot(handle); return handle }
         try requirePrivateDirectory(handle, device: layout.root.device)
         var st = stat()
-        guard fstat(handle.fd, &st) == 0, st.st_mode & 0o7777 == 0o700 else { throw NestError("FSKit root mode changed.", code: 4) }
+        guard fstat(handle.fd, &st) == 0, st.st_mode & 0o7777 == 0o700 else { throw NestError("linked-folder root mode changed.", code: 4) }
         return handle
     }
-    static func verifyLink(_ layout: FSKitLinkLayout, parent: DirectoryHandle, name: String? = nil) throws {
+    static func verifyLink(_ layout: LinkedFolderLayout, parent: DirectoryHandle, name: String? = nil) throws {
         let leaf = name ?? URL(fileURLWithPath: layout.originalPath).lastPathComponent
         let st = try parent.entryStat(leaf)
         var bytes = [CChar](repeating: 0, count: Int(MAXPATHLEN) + 1)
@@ -303,7 +267,8 @@ enum FSKitLinks {
             throw NestError("Managed original-path link changed; data and RAM retained.", code: 4)
         }
     }
-    static func releaseMountpoint(_ layout: FSKitLinkLayout) throws {
+    static func releaseMountpoint(_ layout: LinkedFolderLayout) throws {
+        guard layout.version == 1 else { throw NestError("Native reservation release requires its bounded administrator operation.", code: 6) }
         guard !Paths.mounts().contains(where: { $0.path == layout.mountPath || $0.path.hasPrefix(layout.mountPath + "/") }) else { throw NestError("Internal mount is still present.", code: 6) }
         let root = try root(layout), name = URL(fileURLWithPath: layout.mountPath).lastPathComponent
         if try !root.exists(name) { return }

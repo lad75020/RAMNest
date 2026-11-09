@@ -8,7 +8,7 @@ import Darwin
 enum SparseContent {
     struct Result { var checksum: String; var allocated: UInt64; var bytesRead: UInt64; var sha256Bytes: UInt64 = 0 }
     typealias ExtentSeeker = (Int32, off_t, Int32) -> off_t
-    // SEEK_DATA is optional on filesystems such as FUSE-T NFS. Other errors
+    // SEEK_DATA is optional on source filesystems. Other errors
     // still fail closed; ENXIO retains its separate end-of-data meaning.
     private static func unsupportedExtents(_ error: Int32) -> Bool {
         error == EINVAL || error == ENOTSUP || error == ENOTTY
@@ -17,16 +17,26 @@ enum SparseContent {
                      seekExtent: ExtentSeeker = Darwin.lseek) throws {
         var buffer = [UInt8](repeating: 0, count: 65536)
         var info = stat();guard fstat(source, &info) == 0 else { throw NestError("Cannot inspect sparse copy source.", code: 6) }
+        var holes: [(Int64, Int64)] = []
+        func recordHole(_ start: Int64, _ end: Int64) {
+            guard end > start else { return }
+            if let last = holes.last, last.1 == start { holes[holes.count - 1].1 = end }
+            else { holes.append((start, end)) }
+        }
         var position: Int64 = 0, extents = info.st_flags & UInt32(UF_COMPRESSED) == 0
         while position < size {
             if extents {
                 let data = seekExtent(source, position, SEEK_DATA)
                 if data < 0 {
                     let error = errno
-                    if error == ENXIO { break }
+                    if error == ENXIO { recordHole(position, size); break }
                     if unsupportedExtents(error) { extents = false }
                     else { throw NestError("Cannot query copy extents (errno \(error)).", code: 6) }
-                } else { position = max(position, data / 65536 * 65536); if position >= size { break } }
+                } else {
+                    let next = max(position, data / 65536 * 65536)
+                    recordHole(position, min(next, size)); position = next
+                    if position >= size { break }
+                }
             }
             let count = Int(min(Int64(65536), size-position));var done = 0
             while done < count {
@@ -43,10 +53,33 @@ enum SparseContent {
                     guard wrote > 0 else { throw NestError("Sparse copy write failed.", code: 6) }
                     done += wrote
                 }
-            }
+            } else { recordHole(position, position + Int64(count)) }
             position += Int64(count)
         }
         guard ftruncate(destination, size) == 0 else { throw NestError("Sparse copy length failed.", code: 6) }
+        // APFS can allocate skipped zero ranges when dirty data is flushed.
+        // Deallocate only source-proven holes/zero blocks after all writes and
+        // length changes; partially nonzero filesystem blocks remain untouched.
+        if !holes.isEmpty {
+            var filesystem = statfs()
+            guard fstatfs(destination, &filesystem) == 0, filesystem.f_bsize > 0 else { throw NestError("Cannot inspect sparse copy destination.", code: 6) }
+            let type = withUnsafePointer(to: &filesystem.f_fstypename) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MFSTYPENAMELEN)) { String(cString: $0) }
+            }
+            if type == "apfs" {
+                let block = Int64(filesystem.f_bsize)
+                for (start, end) in holes {
+                    let alignedEnd = end / block * block
+                    let adjustment = (block - start % block) % block
+                    guard alignedEnd > start, alignedEnd - start > adjustment else { continue }
+                    let alignedStart = start + adjustment
+                    var hole = fpunchhole_t(fp_flags: 0, reserved: 0, fp_offset: alignedStart, fp_length: alignedEnd - alignedStart)
+                    var result: Int32
+                    repeat { result = fcntl(destination, F_PUNCHHOLE, &hole) } while result < 0 && errno == EINTR
+                    guard result == 0 else { throw NestError("Cannot preserve APFS sparse allocation (errno \(errno)).", code: 6) }
+                }
+            }
+        }
     }
     static func scan(_ fd: Int32, size: Int64, legacy: Bool = false, verification: FileVerification = .sha256,
                      seekExtent: ExtentSeeker = Darwin.lseek) throws -> Result {

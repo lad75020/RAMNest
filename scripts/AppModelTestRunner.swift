@@ -66,7 +66,7 @@ import SwiftUI
         let model = AppModel(repository: store, storageManager: manager, storagePicker: { pickerCalls += 1; return parent })
         await model.refresh()
         precondition(model.canMoveSnapshotStorage)
-        model.draft?.options.compression.toggle()
+        model.draft?.options.nobrowse.toggle()
         let edited = model.draft
         precondition(!model.canMoveSnapshotStorage)
         await model.moveSnapshotStorage(toParent: parent)
@@ -89,7 +89,7 @@ import SwiftUI
         precondition(model.engine?.store.root.path == parent.appendingPathComponent("RAMNest Snapshots").path)
         precondition(model.statuses.map(\.id) == [folder.id])
         precondition(model.selected == folder.id && model.draft?.id == folder.id)
-        precondition(model.backend == .fskit, "late old-engine refresh must be discarded")
+        precondition(model.backend == .tmpfs, "late old-engine refresh must be discarded")
         precondition(model.canMoveSnapshotStorage)
         print("PASS snapshot storage GUI model: injected picker/manager, dirty draft preservation, actual move/engine swap and stale refresh rejection")
     }

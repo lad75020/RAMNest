@@ -5,10 +5,10 @@ import CryptoKit
 public final class Store: @unchecked Sendable {
     var beforeJournalWrite: ((Journal, UUID) throws -> Void)?
     // Internal fixture injection only; no environment or public API override.
-    var fsKitFixtureRoot: URL?
+    var linkedFixtureRoot: URL?
     var journalDecoder: JSONDecoder {
         let decoder = JSONDecoder()
-        if let root = fsKitFixtureRoot { decoder.userInfo[FSKitLinkLayout.decoderRootKey] = root }
+        if let root = linkedFixtureRoot { decoder.userInfo[LinkedFolderLayout.decoderRootKey] = root }
         return decoder
     }
     public let root: URL
@@ -116,7 +116,14 @@ public final class Store: @unchecked Sendable {
     public func write(_ journal: Journal, for id: UUID) throws {
         try beforeJournalWrite?(journal, id)
         var j = journal; j.updated = Date()
-        try Self.atomicJSON(j, volume(id).appendingPathComponent("journal.json"))
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let bytes = try encoder.encode(j)
+        if j.backend == .tmpfs || j.nativeTmpfs != nil || j.nativeLink != nil {
+            // Validate the exact bytes before replacement. An invalid transition
+            // must retain the last readable durable journal, not strand recovery.
+            _ = try journalDecoder.decode(Journal.self, from: bytes)
+        }
+        try Self.atomicData(bytes, volume(id).appendingPathComponent("journal.json"))
     }
     public func resolve(_ ref: String, config: Configuration) throws -> Folder {
         let value = ref.hasPrefix("ram://") ? (String(ref.dropFirst(6)).removingPercentEncoding ?? "") : ref
@@ -602,7 +609,7 @@ extension StorageRelocation {
                 guard !forbidden.contains(where: { Paths.overlaps(destinationURL.path, $0) }) else { throw NestError("Snapshot storage overlaps a managed source or holding location.", code: 4) }
                 let selectedParent = URL(fileURLWithPath: folder.path).deletingLastPathComponent().path
                 if parent.path.lowercased().hasPrefix(selectedParent.lowercased() + "/.ramnest-\(folder.id.uuidString.lowercased())") { throw NestError("Choose storage outside managed holding/staging locations.", code: 4) }
-                if let layout = journal.fsKitLink, [layout.mountRoot, layout.holdingPath, layout.linkStagePath].contains(where: { Paths.overlaps(destinationURL.path, $0) }) { throw NestError("Snapshot storage cannot overlap an FSKit lifecycle location.", code: 4) }
+                if let layout = journal.managedLink, [layout.mountRoot, layout.holdingPath, layout.linkStagePath].contains(where: { Paths.overlaps(destinationURL.path, $0) }) { throw NestError("Snapshot storage cannot overlap a linked-folder lifecycle location.", code: 4) }
             }
             // Config topology cannot change while repository.lock is held.
             let parentRoot = try Root(parent), parentHandle = try parentRoot.open(privateMode: false)
@@ -651,7 +658,7 @@ extension StorageRelocation {
                   journal.evacuation == nil, journal.siblingCleanup?.isEmpty != false,
                   journal.retiringRevisions?.isEmpty != false, journal.cleanupWarning == nil,
                   journal.startupProtocol == nil || journal.startupRetired == true || journal.populationVerified,
-                  journal.fsKitLink == nil || (journal.fsKitLink?.stage == .restored && journal.fsKitLink?.mountReleased == true) else {
+                  journal.managedLink == nil || (journal.managedLink?.stage == .restored && journal.managedLink?.mountReleased == true) else {
                 throw NestError("\(folder.name) has unfinished restore, capture or cleanup work. Finish recovery before moving storage.", code: 7)
             }
             if let socket = journal.socket {
@@ -662,7 +669,7 @@ extension StorageRelocation {
             for pid in [journal.startupHelperPID, journal.quiescedHelperPID].compactMap({ $0 }) where pid > 0 {
                 if kill(pid, 0) == 0 || errno != ESRCH { throw NestError("A recorded helper process may still own \(folder.name). Finish its session before moving storage.", code: 7) }
             }
-            let paths = [folder.path, journal.fsKitLink?.mountPath].compactMap { $0 }
+            let paths = [folder.path, journal.nativeTmpfs.map { NativeTmpfsPaths.mount($0.session).path }, journal.managedLink?.mountPath].compactMap { $0 }
             guard !Paths.mounts().contains(where: { mount in paths.contains(where: { mount.path == $0 || mount.path.hasPrefix($0 + "/") }) }) else {
                 throw NestError("Eject \(folder.name) before moving snapshots.", code: 7)
             }

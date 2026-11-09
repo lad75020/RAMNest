@@ -56,36 +56,19 @@ enum LatestSnapshotScenarios {
         print("PASS: all latest-snapshot retention scenarios")
     }
 
-    final class Session {
-        let live: URL
-        let id: UUID
-        var mounted = true
-        var identityValid = true
-        var commands: [String] = []
-        var failExport = false
-        var afterExport: (() throws -> Void)?
-        var onStatus: (() throws -> Void)?
-        init(live: URL, id: UUID) { self.live = live; self.id = id }
-        var boundary: EngineSession {
-            EngineSession(request: { [self] _, command in
-                commands.append(command.components(separatedBy: "\t")[0])
-                let fields = command.components(separatedBy: "\t")
-                if fields[0] == "export" || fields[0] == "quiesce" {
-                    if failExport { throw NestError("Injected helper export failure", code: 6) }
-                    let manifest = try Snapshot.manifest(live)
-                    try Snapshot.copyTree(from: live, to: URL(fileURLWithPath: fields[1]), manifest: manifest)
-                    try afterExport?()
-                }
-                return []
-            }, status: { [self] journal, actual in
-                try onStatus?()
-                guard actual == id, journal.socket != nil else { throw NestError("No owned helper session", code: 2) }
-                return HelperStatus(id: id, pid: getpid(), mounted: mounted, used: 0, capacity: 16 << 20, active: true)
-            }, mountedIdentity: { [self] _, _ in identityValid && mounted })
-        }
+    // Ordinary disk data for snapshot/retention tests, never a mock storage
+    // engine or an alternate helper execution path. Native coherence has its
+    // own kernel observation/freeze transaction and exact-package tests.
+    final class CheckpointSource {
+        let source: URL
+        var identityValid = true, failCapture = false
+        var captures = 0
+        var afterCapture: (() throws -> Void)?
+        var beforeValidation: (() throws -> Void)?
+        init(source: URL) { self.source = source }
     }
     final class Fixture {
-        let root: URL, selected: URL, store: Store, folder: Folder, engine: Engine, helper: Session, initial: String
+        let root: URL, selected: URL, store: Store, folder: Folder, engine: Engine, data: CheckpointSource, initial: String
         init(_ parent: URL, _ name: String, temporary: Bool = false) throws {
             root = parent.appendingPathComponent(name); try Store.privateDirectory(root)
             selected = root.appendingPathComponent("selected"); try Store.privateDirectory(selected)
@@ -101,10 +84,10 @@ enum LatestSnapshotScenarios {
             try DirectoryHandle.open(selected).renameNoReplace("payload", to: holdingHandle, as: "payload")
             let live = root.appendingPathComponent("live"); try Store.privateDirectory(live)
             try Data("original".utf8).write(to: live.appendingPathComponent("payload"))
-            helper = Session(live: live, id: folder.id)
-            engine = Engine(store: store, session: helper.boundary)
+            data = CheckpointSource(source: live)
+            engine = Engine(store: store)
             var j = Journal(); j.phase = .mounted; j.revision = initial; j.initialRevision = initial
-            j.populationVerified = true; j.socket = "owned-recorder"; j.mountedDevice = 123
+            j.populationVerified = true // historical data journal only; no helper/socket/mount
             j.evacuation = holding.path; j.evacuatedEntries = ["payload"]
             let h = try holdingHandle.identity(); j.evacuationDevice = h.device; j.evacuationInode = h.inode
             try store.write(j, for: folder.id)
@@ -112,10 +95,33 @@ enum LatestSnapshotScenarios {
         func exists(_ revision: String) throws -> Bool {
             FileManager.default.fileExists(atPath: try Snapshot.dataURL(store: store, id: folder.id, revision: revision).deletingLastPathComponent().path)
         }
+        func captureSource(cleanup: Bool = true) throws -> String {
+            do {
+                try data.beforeValidation?()
+                guard data.identityValid, !data.failCapture else { throw NestError("Injected data source/capture failure", code: 6) }
+                let revision = try Snapshot.capture(store: store, folder: folder, source: data.source, previous: store.journal(folder.id).revision)
+                data.captures += 1; try data.afterCapture?()
+                var j = try store.journal(folder.id)
+                SnapshotRetention.remember(&j); j.priorRevision = j.revision; j.revision = revision; j.lastError = nil
+                try store.write(j, for: folder.id)
+                if cleanup { try retention() }
+                return revision
+            } catch {
+                if var j = try? store.journal(folder.id) { j.lastError = error.localizedDescription; try? store.write(j, for: folder.id) }
+                throw error
+            }
+        }
+        func retention() throws {
+            var j = try store.journal(folder.id)
+            SnapshotRetention.clean(store: store, folder: folder, journal: &j, validateSource: {
+                try self.data.beforeValidation?()
+                guard self.data.identityValid else { throw NestError("Data source identity changed", code: 6) }
+                _ = try DirectoryHandle.open(self.data.source)
+            })
+        }
         func save(_ value: String) throws -> String {
-            try Data(value.utf8).write(to: helper.live.appendingPathComponent("payload"))
-            try engine.save(folder.id.uuidString)
-            return try store.journal(folder.id).revision!
+            try Data(value.utf8).write(to: data.source.appendingPathComponent("payload"))
+            return try captureSource()
         }
         func verify(_ revision: String, _ value: String) throws {
             let (data, _) = try Snapshot.verified(store: store, id: folder.id, revision: revision)
@@ -127,14 +133,19 @@ enum LatestSnapshotScenarios {
             }
         }
         func finish() throws {
-            helper.mounted = false
-            try engine.finalize(folder.id.uuidString)
+            if folder.options.sync { _ = try captureSource(cleanup: false) }
+            try editJournal {
+                SnapshotRetention.remember(&$0)
+                $0.phase = .pendingRestore; $0.restoreRevision = $0.revision; $0.socket = nil
+            }
+            try engine.recover(folder.id.uuidString)
         }
         func revisionURL(_ revision: String) throws -> URL {
             try Snapshot.dataURL(store: store, id: folder.id, revision: revision).deletingLastPathComponent()
         }
         func cleanupExport() throws {
             try engine.export(folder.id.uuidString, destination: root.appendingPathComponent("export-\(UUID().uuidString)"))
+            if try store.journal(folder.id).phase == .mounted { try retention() }
         }
     }
     static func mountedSaves(_ root: URL) throws {
@@ -142,8 +153,8 @@ enum LatestSnapshotScenarios {
         let one = try f.save("one"), two = try f.save("two"), three = try f.save("three")
         try check(try !f.exists(one) && !f.exists(two) && f.exists(three) && f.exists(f.initial), "three saves keep latest and the actual mounted initial anchor")
         try f.verify(three, "three"); try f.verify(f.initial, "original")
-        try check(f.helper.commands == ["capabilities", "export", "capabilities", "export", "capabilities", "export"], "save exercises the actual export boundary")
-        print("PASS: three real Engine saves retire intermediate commits and verify latest plus initial anchor")
+        try check(f.data.captures == 3, "three independent verified data captures precede retention")
+        print("PASS: three verified snapshot captures retire intermediate commits and verify latest plus initial anchor")
         var message = ""
         do { try f.engine.export(f.folder.id.uuidString, destination: f.root.appendingPathComponent("pruned-export"), revision: one) }
         catch { message = error.localizedDescription }
@@ -163,15 +174,15 @@ enum LatestSnapshotScenarios {
         try f.verify(kept, "latest mounted")
         try check(try !f.exists(restore) && !f.exists(f.initial) && !f.exists(latest), "successful finalize drops obsolete transaction anchors")
         try check(idle.phase == .idle && idle.initialRevision == nil && idle.restoreRevision == nil && idle.priorRevision == nil && idle.retiringRevisions == nil, "idle references all clear")
-        try check(f.helper.commands == ["capabilities", "export", "capabilities", "export", "capabilities", "export", "capabilities", "quiesce", "retire"], "external eject finalization uses real quiesce route")
-        print("PASS: mounted actual restore anchor survives; successful external finalize leaves one committed revision")
+        try check(f.data.captures == 4, "disk publication consumes a fresh committed checkpoint; native unmount behavior is tested separately")
+        print("PASS: mounted actual restore anchor survives; successful disk recovery leaves one committed revision")
 
         let temp = try Fixture(root, "temporary-pins", temporary: true)
         let originalStat = try DirectoryHandle.open(temp.root.appendingPathComponent("originals")).entryStat("payload")
         var exports: [String] = []
         for value in ["temporary one", "temporary two"] {
-            try Data(value.utf8).write(to: temp.helper.live.appendingPathComponent("payload"))
-            try temp.engine.export(temp.folder.id.uuidString, destination: temp.root.appendingPathComponent(value), live: true)
+            _ = try temp.save(value)
+            try temp.engine.export(temp.folder.id.uuidString, destination: temp.root.appendingPathComponent(value))
             exports.append(try temp.store.journal(temp.folder.id).revision!)
         }
         try check(try temp.exists(temp.initial) && !temp.exists(exports[0]), "temporary exports retain original anchor and retire superseded rescue snapshot")
@@ -181,16 +192,16 @@ enum LatestSnapshotScenarios {
         try check(restoredStat.st_ino == originalStat.st_ino, "temporary rollback restores original inode after exports")
         try check(try String(contentsOf: temp.selected.appendingPathComponent("payload"), encoding: .utf8) == "original", "temporary rollback discards live modifications")
         try check(try !temp.exists(temp.initial) && temp.exists(exports[1]), "temporary rollback releases initial anchor, retaining latest explicit rescue snapshot")
-        try check(temp.helper.commands == ["capabilities", "export", "capabilities", "export"], "temporary finalize writes no new RAM stage")
+        try check(temp.data.captures == 2, "temporary disk rollback creates no new checkpoint")
         try temp.verify(exports[1], "temporary two")
         print("PASS: live exports preserve temporary-eject anchor; idle rollback restores original inode and clears pins")
     }
     static func failurePreservation(_ root: URL) throws {
         let failed = try Fixture(root, "failed-save")
         let before = try failed.save("last good")
-        failed.helper.failExport = true
+        failed.data.failCapture = true
         try rejects { _ = try failed.save("not committed") }
-        try check(try failed.exists(before) && failed.exists(failed.initial), "failed helper export preserves every committed revision")
+        try check(try failed.exists(before) && failed.exists(failed.initial), "failed data capture preserves every committed revision")
         try failed.verify(before, "last good")
         try check(try failed.store.journal(failed.folder.id).lastError != nil, "save error remains visible")
 
@@ -198,7 +209,7 @@ enum LatestSnapshotScenarios {
         let old = try writeFailure.save("durable before failed journal")
         let journalURL = try writeFailure.store.volume(writeFailure.folder.id).appendingPathComponent("journal.json")
         let journalBackup = writeFailure.root.appendingPathComponent("saved-journal.json")
-        writeFailure.helper.afterExport = {
+        writeFailure.data.afterCapture = {
             try FileManager.default.moveItem(at: journalURL, to: journalBackup)
             try Store.privateDirectory(journalURL) // rename of the new journal fails with EISDIR.
         }
@@ -207,13 +218,13 @@ enum LatestSnapshotScenarios {
         try writeFailure.verify(old, "durable before failed journal")
         let backup = try Store.read(Journal.self, journalBackup)
         try check(backup.revision == old, "last durable journal still selects old snapshot")
-        print("PASS: helper export and actual journal rename failures retain prior good snapshots")
+        print("PASS: data capture and actual journal rename failures retain prior good snapshots")
 
         let cleanupWrite = try Fixture(root, "cleanup-journal-write-failure")
         let cleanupOld = try cleanupWrite.save("keep before cleanup write failure")
         let volume = try cleanupWrite.store.volume(cleanupWrite.folder.id)
         var statusCalls = 0
-        cleanupWrite.helper.onStatus = {
+        cleanupWrite.data.beforeValidation = {
             statusCalls += 1
             // The second status is the cleanup source check, after both save
             // journal writes have succeeded. Make only cleanup writes fail.
@@ -231,7 +242,6 @@ enum LatestSnapshotScenarios {
         let bad = try corrupt.save("last valid bytes")
         let payload = try Snapshot.dataURL(store: corrupt.store, id: corrupt.folder.id, revision: bad).appendingPathComponent("payload")
         try Data("corrupt".utf8).write(to: payload)
-        corrupt.helper.mounted = false
         try corrupt.editJournal { $0.phase = .idle; $0.socket = nil }
         try corrupt.engine.recover(corrupt.folder.id.uuidString)
         try check(try corrupt.exists(corrupt.initial) && corrupt.exists(bad), "corrupt retained latest blocks all cleanup")
@@ -245,7 +255,6 @@ enum LatestSnapshotScenarios {
 
         let restoring = try Fixture(root, "restore-failure")
         let newest = try restoring.save("restore me")
-        restoring.helper.mounted = false
         try restoring.editJournal { $0.phase = .restoring; $0.restoreRevision = newest }
         try Data("unknown writer".utf8).write(to: restoring.selected.appendingPathComponent("unrelated"))
         try rejects { try restoring.engine.finalize(restoring.folder.id.uuidString) }
@@ -263,7 +272,7 @@ enum LatestSnapshotScenarios {
 
         let uncertain = try Fixture(root, "uncertain-mount")
         let oldLatest = try uncertain.save("old latest")
-        uncertain.helper.afterExport = { uncertain.helper.identityValid = false }
+        uncertain.data.afterCapture = { uncertain.data.identityValid = false }
         let unpruned = try uncertain.save("committed with uncertain mount")
         try check(try uncertain.exists(oldLatest) && uncertain.exists(unpruned) && uncertain.exists(uncertain.initial), "mount identity uncertainty disables cleanup")
         print("PASS: cleanup rechecks mounted identity after commit and skips uncertain sources")
@@ -285,7 +294,7 @@ enum LatestSnapshotScenarios {
         try Data("keep unknown".utf8).write(to: unknown.appendingPathComponent("sentinel"))
         try Data("failed capture".utf8).write(to: partial.appendingPathComponent("partial"))
         // Even a complete capture that was never journal-committed is unknown.
-        let orphan = try f.store.locked { try Snapshot.capture(store: f.store, folder: f.folder, source: f.helper.live, previous: nil) }
+        let orphan = try f.store.locked { try Snapshot.capture(store: f.store, folder: f.folder, source: f.data.source, previous: nil) }
         let stage = try f.store.volume(f.folder.id).appendingPathComponent("stage-owned-partial")
         try Store.privateDirectory(stage)
         _ = try f.save("kept")
@@ -294,10 +303,10 @@ enum LatestSnapshotScenarios {
         print("PASS: unknown names, partial UUID captures, complete uncommitted captures, and helper stages are retained")
 
         let startup = try Fixture(root, "no-eager-startup")
-        let known = try startup.store.locked { try Snapshot.capture(store: startup.store, folder: startup.folder, source: startup.helper.live, previous: nil) }
+        let known = try startup.store.locked { try Snapshot.capture(store: startup.store, folder: startup.folder, source: startup.data.source, previous: nil) }
         try startup.editJournal { $0.priorRevision = known }
         let reopened = try Store(root: startup.store.root)
-        let observer = Engine(store: reopened, session: startup.helper.boundary)
+        let observer = Engine(store: reopened)
         _ = try observer.statuses()
         try check(try startup.exists(known), "opening a store and reading status must not clean up")
         try startup.cleanupExport()
@@ -312,7 +321,7 @@ enum LatestSnapshotScenarios {
             if kind == "unexpected-entry" { try Data("unknown".utf8).write(to: initial.appendingPathComponent("data/unexpected")) }
             if kind == "read-only-data" { try check(chmod(initial.appendingPathComponent("data").path, 0o500) == 0, "set owned cleanup failure fixture mode") }
             // Finalization does not require the old initial snapshot in sync mode.
-            try Data("successful latest".utf8).write(to: x.helper.live.appendingPathComponent("payload"))
+            try Data("successful latest".utf8).write(to: x.data.source.appendingPathComponent("payload"))
             try x.finish()
             let j = try x.store.journal(x.folder.id)
             try check(j.phase == .idle && j.lastError == nil && j.cleanupWarning != nil, "cleanup failure is a warning after successful restore: \(kind)")

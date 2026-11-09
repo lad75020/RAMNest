@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public struct NestError: Error, LocalizedError, Sendable {
     public let message: String
@@ -13,7 +14,8 @@ public enum FileVerification: String, Codable, CaseIterable, Sendable {
     public var displayName: String { self == .sha256 ? "SHA-256" : "Size and modification time" }
 }
 public struct FolderOptions: Codable, Equatable, Sendable {
-    public var compression = true
+    // Historical decode-only preference; native tmpfs has no app page compressor.
+    public var legacyCompression: Bool?
     public var mountAtLaunch = true
     public var nobrowse = true
     public var sync = true
@@ -22,6 +24,20 @@ public struct FolderOptions: Codable, Equatable, Sendable {
     public var comparison = Comparison.sizeAndModTime
     public static let intervals = [5, 15, 30, 60, 360, 720, 1440]
     public init() {}
+    private enum CodingKeys: String, CodingKey {
+        case legacyCompression = "compression"
+        case mountAtLaunch, nobrowse, sync, periodicSave, intervalMinutes, comparison
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        legacyCompression = c.contains(.legacyCompression) ? try c.decode(Bool.self, forKey: .legacyCompression) : nil
+        mountAtLaunch = try c.decode(Bool.self, forKey: .mountAtLaunch)
+        nobrowse = try c.decode(Bool.self, forKey: .nobrowse); sync = try c.decode(Bool.self, forKey: .sync)
+        periodicSave = try c.decode(Bool.self, forKey: .periodicSave)
+        intervalMinutes = try c.decode(Int.self, forKey: .intervalMinutes)
+        comparison = try c.decode(Comparison.self, forKey: .comparison)
+    }
+
 }
 public struct Folder: Codable, Identifiable, Equatable, Sendable {
     public var id: UUID
@@ -74,7 +90,22 @@ public struct Journal: Codable, Equatable, Sendable {
     var publicationReceipt: PublicationReceipt?
     public var mountedDevice: UInt64?
     public var populationVerified = false
-    public var fsKitLink: FSKitLinkLayout?
+    public var legacyLink: LinkedFolderLayout?
+    public var nativeLink: LinkedFolderLayout?
+    public var nativeTmpfs: NativeTmpfsRecord?
+    // A completed layout is historical publication evidence, not live mount
+    // authority. Idle retention may release its initial/restore revision pins.
+    var nativeSessionCompleted: Bool {
+        phase == .idle && nativeTmpfs != nil && nativeLink?.stage == .restored && nativeLink?.mountReleased == true
+    }
+    // Shared transaction implementation, with separate on-disk discriminators.
+    var managedLink: LinkedFolderLayout? {
+        get { nativeLink ?? legacyLink }
+        set {
+            if newValue?.version == 2 { nativeLink = newValue; legacyLink = nil }
+            else { legacyLink = newValue; nativeLink = nil }
+        }
+    }
     // Only absence of all three keys selects the legacy recovery contract.
     // A negotiated pre-mount helper must be sealed + retired before rollback,
     // including after a coordinator crash when its OS mount is still absent.
@@ -90,8 +121,9 @@ public struct Journal: Codable, Equatable, Sendable {
         case retiringRevisions, cleanupWarning, siblingCleanup, evacuation, evacuationDevice, evacuationInode
         case evacuatedEntries, restoredEntries, initialSourceManifest, restoreManifest, restoreRevision, restoreStage, restoreStageDevice, restoreStageInode
         case restoreDataDevice, restoreDataInode, publicationReceipt, mountedDevice, populationVerified
-        case startupProtocol, startupHelperPID, startupRetired, lastError, updated, fsKitLink
-        case originalRename, publicationRename
+        case startupProtocol, startupHelperPID, startupRetired, lastError, updated
+        case legacyLink = "fsKitLink"
+        case originalRename, publicationRename, nativeLink, nativeTmpfs
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -101,7 +133,7 @@ public struct Journal: Codable, Equatable, Sendable {
         // startup record, even if its remaining startup values are null.
         if values.contains(.startupProtocol) {
             startupProtocol = try values.decode(String.self, forKey: .startupProtocol)
-            guard startupProtocol == GuardedPopulationStartup.version else {
+            guard startupProtocol == LegacyJournalFormat.startupVersion else {
                 throw DecodingError.dataCorruptedError(forKey: .startupProtocol, in: values,
                     debugDescription: "Unknown guarded startup journal; originals retained.")
             }
@@ -169,24 +201,52 @@ public struct Journal: Codable, Equatable, Sendable {
         updated = try values.decode(Date.self, forKey: .updated)
         // Presence is authority, including explicit null. Never downgrade a
         // malformed new layout into the legacy physical-path recovery branch.
-        fsKitLink = values.contains(.fsKitLink) ? try values.decode(FSKitLinkLayout.self, forKey: .fsKitLink) : nil
-        if let layout = fsKitLink {
+        legacyLink = values.contains(.legacyLink) ? try values.decode(LinkedFolderLayout.self, forKey: .legacyLink) : nil
+        nativeLink = values.contains(.nativeLink) ? try values.decode(LinkedFolderLayout.self, forKey: .nativeLink) : nil
+        nativeTmpfs = values.contains(.nativeTmpfs) ? try values.decode(NativeTmpfsRecord.self, forKey: .nativeTmpfs) : nil
+        guard legacyLink == nil || (nativeLink == nil && nativeTmpfs == nil),
+              legacyLink == nil || legacyLink?.version == 1,
+              (nativeLink == nil) == (nativeTmpfs == nil),
+              nativeLink == nil || (nativeLink?.version == 2 && backend == .tmpfs && nativeTmpfs?.session == session) else {
+            throw NestError("Mixed or partial native/legacy journal authority; all data retained.", code: 6)
+        }
+        guard backend != .tmpfs || nativeTmpfs != nil ||
+              ((phase == .idle || phase == .preparing || phase == .recoveryRequired) &&
+               !populationVerified && legacyLink == nil && evacuation == nil && originalRename == nil && publicationRename == nil) else {
+            throw NestError("Native session lacks native mount authority; legacy recovery is forbidden.", code: 6)
+        }
+        if let nativeTmpfs {
+            try nativeTmpfs.validate()
+            guard nativeTmpfs.uid == getuid(), nativeLink?.session == nativeTmpfs.session, startupProtocol == nil,
+                  phase == .idle || !populationVerified || mountedDevice == nativeTmpfs.data?.device,
+                  !populationVerified || (nativeTmpfs.filesystem != nil && nativeTmpfs.data != nil &&
+                    (nativeSessionCompleted || initialRevision.flatMap(UUID.init(uuidString:)) != nil) && revision.flatMap(UUID.init(uuidString:)) != nil),
+                  !nativeSessionCompleted || (mountedDevice == nil && nativeTmpfs.quiescence == nil &&
+                    quiescedRevision == nil && quiescedSession == nil && nativeTmpfs.periodicAuthorization == nil &&
+                    (!populationVerified || nativeTmpfs.managedUnmount || nativeTmpfs.lossDisclosure != nil)),
+                  !(populationVerified && (phase == .pendingRestore || phase == .restoring)) || nativeTmpfs.managedUnmount || nativeTmpfs.lossDisclosure != nil,
+                  nativeTmpfs.quiescence == nil || (populationVerified && quiescedRevision != nil &&
+                    quiescedRevision == revision && quiescedSession == session) else {
+                throw NestError("Native session identity is incomplete; retained.", code: 6)
+            }
+        }
+        if let layout = managedLink {
             try layout.validate()
-            let allowedRoot = (decoder.userInfo[FSKitLinkLayout.decoderRootKey] as? URL) ?? FSKitLinks.productionRoot
+            let allowedRoot = layout.version == 2 ? NativeTmpfsPaths.root : ((decoder.userInfo[LinkedFolderLayout.decoderRootKey] as? URL) ?? LinkedFolders.legacyRoot)
             guard layout.mountRoot == allowedRoot.path else {
-                throw DecodingError.dataCorruptedError(forKey: .fsKitLink, in: values,
-                    debugDescription: "FSKit journal names an unauthorized mount root; recovery blocked.")
+                throw DecodingError.dataCorruptedError(forKey: .legacyLink, in: values,
+                    debugDescription: "legacy linked-folder journal names an unauthorized mount root; recovery blocked.")
             }
             for key in [CodingKeys.evacuation, .evacuationDevice, .evacuationInode, .restoreStage,
                         .restoreStageDevice, .restoreStageInode, .restoreDataDevice, .restoreDataInode, .restoreRevision] {
                 if values.contains(key), try values.decodeNil(forKey: key) {
                     throw DecodingError.dataCorruptedError(forKey: key, in: values,
-                        debugDescription: "Null FSKit transaction authority; originals retained.")
+                        debugDescription: "Null legacy linked-folder transaction authority; originals retained.")
                 }
             }
-            guard backend == .fskit, session == layout.session else {
-                throw DecodingError.dataCorruptedError(forKey: .fsKitLink, in: values,
-                    debugDescription: "FSKit layout backend/session mismatch; all data retained.")
+            guard backend == (layout.version == 2 ? .tmpfs : .fskit), session == layout.session else {
+                throw DecodingError.dataCorruptedError(forKey: .legacyLink, in: values,
+                    debugDescription: "legacy linked-folder layout backend/session mismatch; all data retained.")
             }
             if let stage = restoreStage {
                 let url = URL(fileURLWithPath: stage)
@@ -197,11 +257,11 @@ public struct Journal: Codable, Equatable, Sendable {
                       UUID(uuidString: String(url.lastPathComponent.dropFirst(prefix.count))) != nil,
                       restoreStageDevice == layout.parent.device, (restoreStageInode ?? 0) > 0 else {
                     throw DecodingError.dataCorruptedError(forKey: .restoreStage, in: values,
-                        debugDescription: "Invalid FSKit staging authority; all data retained.")
+                        debugDescription: "Invalid legacy linked-folder staging authority; all data retained.")
                 }
             } else if restoreStageDevice != nil || restoreStageInode != nil || restoreDataDevice != nil || restoreDataInode != nil {
                 throw DecodingError.dataCorruptedError(forKey: .restoreStage, in: values,
-                    debugDescription: "Partial FSKit staging authority; all data retained.")
+                    debugDescription: "Partial legacy linked-folder staging authority; all data retained.")
             }
             guard phase != .mounted || (layout.stage == .linked && populationVerified),
                   phase != .idle || (layout.stage == .restored && layout.mountReleased),
@@ -215,27 +275,24 @@ public struct Journal: Codable, Equatable, Sendable {
                   layout.stage != .publishing || layout.restoration != .checkpoint ||
                     (restoreStage != nil && restoreStageDevice == layout.parent.device && restoreStageInode != nil &&
                      restoreDataDevice == layout.restored?.device && restoreDataInode == layout.restored?.inode) else {
-                throw DecodingError.dataCorruptedError(forKey: .fsKitLink, in: values,
-                    debugDescription: "Incoherent FSKit transaction stage; all data retained.")
+                throw DecodingError.dataCorruptedError(forKey: .legacyLink, in: values,
+                    debugDescription: "Incoherent legacy linked-folder transaction stage; all data retained.")
             }
         }
     }
 }
 public struct Configuration: Codable, Sendable {
-    public enum Backend: String, Codable, CaseIterable, Sendable {
-        case nfs, fskit, smb
+    public enum Backend: String, Codable, Sendable {
+        case nfs, fskit, smb, tmpfs
         public var displayName: String {
-            switch self { case .nfs: "NFS"; case .fskit: "FSKit"; case .smb: "SMB3" }
+            switch self { case .nfs: "NFS"; case .fskit: "legacy linked-folder"; case .smb: "SMB3"; case .tmpfs: "Native macOS tmpfs" }
         }
-        var mountFailureMessage: String {
-            let setup = self == .fskit ? " Open /Applications/fuse-t.app and follow its instructions to enable the FSKit extension; registration alone does not prove it is enabled. New FSKit sessions require RAMNest's writable internal mount directory and use a symlink at the original folder path." : ""
-            return "FUSE-T \(displayName) did not mount." + setup + " Sandbox may also prohibit mounts. Original data is retained; run recover before retrying. RAMNest does not retry using another backend."
-        }
+
     }
     public var version = 1
     public var menuBarMode = false
     public var folders: [Folder] = []
-    public var backend = Backend.nfs
+    public var backend = Backend.tmpfs
     public var fileVerification = FileVerification.sha256
     public init() {}
     private enum CodingKeys: String, CodingKey { case version, menuBarMode, folders, backend, fileVerification }
@@ -255,20 +312,28 @@ public struct FolderStatus: Codable, Identifiable, Sendable {
     public var connected: Bool
     public var mounted: Bool
     public var used: UInt64
-    public var contentBytes: UInt64
-    public var payloadBytes: UInt64
-    public var mappedBytes: UInt64
-    public var backingSavingsFraction: Double
+    public var nativeCapacityBytes: UInt64? = nil
+    public var nativeReadOnly: Bool? = nil
     public var helperActive: Bool? = nil
     public var isReady: Bool { connected && mounted && helperActive == true && journal.populationVerified && journal.phase == .mounted }
     public var needsAttention: Bool { !isReady && (mounted || journal.phase != .idle) }
-    public var statusTitle: String { isReady ? "Mounted in RAM" : mounted ? "Needs attention · Read-only (guarded)" : journal.phase == .idle ? "Files are on disk" : "Needs attention" }
+    public var statusTitle: String {
+        if journal.nativeTmpfs != nil && mounted && !isReady {
+            return nativeReadOnly == true ? "Needs attention · Read-only (guarded)" : "Needs attention · Native mount retained"
+        }
+        return isReady ? "Mounted in RAM" : mounted ? "Needs attention · Read-only (guarded)" : journal.phase == .idle ? "Files are on disk" : "Needs attention" }
     public var canMount: Bool { !mounted && !connected && journal.phase == .idle }
-    public var canEject: Bool { mounted && connected && (journal.phase == .mounted || journal.phase == .recoveryRequired) }
-    public var canSave: Bool { isReady && folder.options.sync }
-    public var canResize: Bool { isReady || (!mounted && !connected && journal.phase == .idle) }
+    public var canEject: Bool {
+        let nativePending = journal.nativeTmpfs != nil && (journal.phase == .ejecting ||
+            (!journal.populationVerified && [.preparing, .mounting, .evacuated].contains(journal.phase)))
+        return mounted && (connected || journal.nativeTmpfs != nil) &&
+            (journal.phase == .mounted || journal.phase == .recoveryRequired || nativePending)
+    }
+    public var canSave: Bool { isReady && folder.options.sync && (journal.nativeTmpfs == nil || NativeSnapshotSafety.supported) }
+    public var snapshotBlocker: String? { journal.nativeTmpfs != nil && !NativeSnapshotSafety.supported ? NativeSnapshotSafety.blockedMessage : nil }
+    public var canResize: Bool { !mounted && !connected && journal.phase == .idle }
     public var canRecover: Bool { !mounted && journal.phase != .idle }
-    public var primaryActionTitle: String { mounted ? (isReady ? "Save and Eject" : "Eject") : "Mount" }
+    public var primaryActionTitle: String { mounted ? (isReady && folder.options.sync ? "Save and Eject" : "Eject") : "Mount" }
     public var id: UUID { folder.id }
 }
 public enum SizeParser {
@@ -282,5 +347,30 @@ public enum SizeParser {
     }
     public static func validate(_ bytes: UInt64) throws {
         guard bytes >= 16<<20, bytes <= ProcessInfo.processInfo.physicalMemory / 4 * 3 else { throw NestError("Capacity must be 16 MiB through 75% of physical memory.", code: 64) }
+    }
+}
+
+extension FolderStatus {
+    private enum CodingKeys: String, CodingKey {
+        case folder, journal, connected, mounted, used
+        case nativeCapacityBytes, nativeReadOnly, helperActive, snapshotPolicy
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        folder = try c.decode(Folder.self, forKey: .folder); journal = try c.decode(Journal.self, forKey: .journal)
+        connected = try c.decode(Bool.self, forKey: .connected); mounted = try c.decode(Bool.self, forKey: .mounted)
+        used = try c.decode(UInt64.self, forKey: .used)
+        nativeCapacityBytes = try c.decodeIfPresent(UInt64.self, forKey: .nativeCapacityBytes)
+        nativeReadOnly = try c.decodeIfPresent(Bool.self, forKey: .nativeReadOnly)
+        helperActive = try c.decodeIfPresent(Bool.self, forKey: .helperActive)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(folder, forKey: .folder); try c.encode(journal, forKey: .journal)
+        try c.encode(connected, forKey: .connected); try c.encode(mounted, forKey: .mounted); try c.encode(used, forKey: .used)
+        if journal.nativeTmpfs != nil { try c.encode("close-writers-mapping-scan-v1", forKey: .snapshotPolicy) }
+        try c.encodeIfPresent(nativeCapacityBytes, forKey: .nativeCapacityBytes)
+        try c.encodeIfPresent(nativeReadOnly, forKey: .nativeReadOnly)
+        try c.encodeIfPresent(helperActive, forKey: .helperActive)
     }
 }

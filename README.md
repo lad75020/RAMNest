@@ -1,121 +1,182 @@
-# RAMNest
+# RAMNest — native macOS tmpfs folders
 
-RAMNest is a native macOS 27.0+ Apple Silicon app that keeps an existing folder accessible **at its original path** while its contents run in a FUSE-T memory filesystem. NFS/SMB mount there directly; new FSKit sessions use a private internal mountpoint and an original-path symlink. It includes a SwiftUI app, shared Swift core, detached C++ per-volume helper, and bundled `ramnest` CLI. Storage is local only. There is no telemetry, trial, licensing server, automatic updater, cloud credential handling, or S3 implementation.
+RAMNest keeps an existing folder at its usual path while its working files live
+on the native macOS tmpfs filesystem. Ordinary reads and writes go directly to
+the kernel. The default app/helper build has no FUSE-T, NFS, SMB, FSKit, custom
+MemoryFS, LZ4 page engine or checksum-per-RAM-page dependency.
 
-Content uses transparent, default-on LZ4 compression through Apple's system Compression API. Each 64 KiB logical block owns anonymous `mmap` backing rounded to 16 KiB VM pages. Incompressible blocks stay raw; truncation/deletion releases mappings with `munmap`. Capacity is an uncompressed allocation ceiling, not an eager reservation. Sparse holes remain unallocated. [Memory and compression details](docs/MEMORY.md) explain counters, quotas, OS caching/compression/swap, and measured RSS.
+This migration targets macOS 27 and preserves the verified local snapshot,
+original-holding, publication and recovery transactions. Source implementation
+and static diagnostics are distinct from release acceptance: the parent owns
+Xcode tests, exact-package administrator probes, GUI checks and host measurements.
+See [delivery and pending verification](docs/NATIVE_TMPFS_MIGRATION.md).
 
-**Settings → Snapshot storage** can move checkpoints and their journals/settings
-to a private **RAMNest Snapshots** child under a selected parent directory.
-All folders must be idle and option edits applied or discarded. The move verifies
-the copied store before publishing its location and retiring obsolete payloads;
-interrupted work remains visible with Retry. Normal retention keeps the latest
-checkpoint, not an unlimited history. See [snapshot storage](docs/SNAPSHOT_STORAGE.md).
+## Working with folders
 
-## Build and run
+Choose an existing owned directory, a maximum capacity and synchronized or
+temporary mode. RAMNest captures and verifies an initial checkpoint before moving
+any original objects. An administrator-authorized helper creates an internal,
+protected native mount slot. A symlink at the original folder path points to the
+user data directory inside that mount; original objects remain in their
+identity-bound private sibling holding until restoration/verified cleanup.
 
-The local `SymLinks` work adds FSKit mounting for external-source folders through
-an internal target. See [the FSKit symlink layout](docs/FSKIT_SYMLINK_LAYOUT.md)
-for behavior, recovery limits and verification. The earlier
-[Trash-exclusion delivery report](docs/TRASH_EXCLUSION_DELIVERY.md) remains
-historical evidence, not proof of this new layout.
+The physical layout is:
 
-Requires Xcode 27 / Swift 6, CMake, macOS 27.0+, and an independently installed [FUSE-T](https://github.com/macos-fuse-t/fuse-t/wiki) runtime. This build uses **only** `/Library/Application Support/fuse-t/include/fuse` and `/Library/Application Support/fuse-t/lib/libfuse-t-1.2.9.dylib`. It never picks global macFUSE headers or installs anything as root. The third-party FUSE-T runtime is not redistributed.
+```text
+/Users/Shared/RAMNestNative-<uid>/           root-owned 0755
+  <session UUID>/                          root-owned 0755
+    control.lock                          root-owned 0600
+    mount/                                native tmpfs, root-owned 0755
+      .fseventsd/                         OS metadata, outside the logical tree
+      tree/                               user-owned 0700
+        data/                             original logical root metadata
 
-**Settings → Backend for next mount** selects **NFS**, **FSKit**, or **SMB3** for the next new mount of any folder. The app-wide `Configuration.backend` persists as `nfs`, `fskit`, or `smb`. NFS is the default, including existing configuration JSON that lacks this field; unknown or malformed values fail decoding. Existing mounts and helpers are never changed by this preference. A new session records its selected backend in the journal, and mounted captions use that record. Legacy sessions without a record are labeled “backend not recorded.”
-
-Every new session explicitly passes its recorded `--backend` to the helper, which emits exactly one per-mount `backend=...` option. SMB3 uses the FUSE-T id `smb` and additionally forces `listen_addr=127.0.0.1:0,nobonjour`, without LAN advertising. FSKit uses the validated id `fskit` (the requested “fsdisk” choice is labeled FSKit). Before using FSKit, open `/Applications/fuse-t.app` and follow its instructions to manually enable the extension; registration alone does not prove activation. New FSKit sessions mount at `/Users/Shared/RAMNest-Mounts-<uid>/<original basename>` and publish a symlink at the original folder path, avoiding an OS mount on the external source volume. The private mount root is current-user-only, requires no elevation, and rejects basename collisions. NFS, SMB and existing absent-layout FSKit sessions keep their old paths. RAMNest never changes global `fuse-t.ini` or retries with a different backend. See [backend settings and FSKit validation](docs/FSKIT_BACKEND.md).
-
-```sh
-cd /Volumes/WDBlack4TB/Code/RAMNest
-scripts/test.sh
-scripts/package.sh
-open artifacts/RAMNest.app
-artifacts/ramnest --help
+<original path> -> .../<session>/mount/tree/data
+<original parent>/.ramnest-<folder>-<session>.original/data
 ```
 
-`build.sh` compiles the real Swift app/core/CLI and C++ helper, patches the helper's private FUSE-T dylib install name, and ad-hoc signs the bundle. It uses project-local caches and temporary files. No compiler or filesystem sandbox is disabled. SwiftPM's nested manifest sandbox cannot start in the coding sandbox here; direct `swiftc` builds cover exactly the same source targets. On an unrestricted development host, SwiftPM remains available:
+Native mounts use `mount_tmpfs -e` to preserve distinct case-sensitive names.
+Snapshots may remain on the selected local snapshot store, including an external
+volume. Physical tmpfs mount slots use internal storage because measured external
+SSD mounting returned `EPERM` even with administrator authorization.
+
+- **Synchronized mode:** Save commits a verified checkpoint; eject makes a new
+  checkpoint and restores the latest committed working tree to the original path.
+- **Temporary mode:** eject returns the original directory objects and discards
+  RAM changes. `export --live` can explicitly checkpoint and export current work.
+- **Periodic save:** uses the same close-writers gate as Save, with administrator
+  authorization as needed. It can fail while applications keep files mapped/open;
+  the journal reports the error and leaves the prior committed checkpoint intact.
+- **Relaunch:** reconnects to the ordinary-user pin helper. `reconnect REF` can
+  repin a verified surviving native session without thawing. Explicit `mount REF`
+  can resume that session; it never mounts over an uncertain session.
+- **Snapshot selection:** Settings retains the existing safe snapshot-store move
+  transaction. Every folder must be idle before moving storage.
+
+## Close writers before saving
+
+A read-only remount blocks normal writes, but the measured macOS kernel allows
+pre-existing writable `MAP_SHARED` mappings to keep writing. RAMNest therefore
+remounts read-only, checks exact tmpfs type/path/fsid and the real read-only flag,
+and runs a privileged, filesystem-wide `lsof -nP -F pcftn +f -- MOUNT` scan.
+
+The gate rejects every regular vnode reference in the logical user tree,
+including numeric fds, read-only readers, `txt` mappings with no remaining fd,
+and unknown/incomplete scan results. Warnings, nonzero status, timeout and an
+unobserved scanner mount pin fail closed. OS-owned `.fseventsd` files at the
+protected mount root are outside the logical tree. **Ignore Busy cannot bypass
+this gate.** Failed saves invalidate old eject authority before attempting a
+verified thaw; uncertainty retains a guarded mount and the previous checkpoint.
+
+This is an accepted cooperative close-writers contract. Stop writers, close
+mapped files and let the gate verify their absence. `lsof` enumeration is not
+atomic mapping revocation against an adversarial process that hands references
+between processes during inspection. RAMNest neither terminates writers nor
+claims that stronger guarantee. Existing strict source-before/source-after,
+independent-copy, metadata, hardlink and provenance checks remain in force.
+
+## Memory and capacity
+
+The mounted capacity is a maximum, not preallocated payload RAM. Kernel filesystem
+allocation grows with written content and releases blocks after truncation and
+deletion when no references retain them. The parent probe verifies those changes.
+Changing the maximum on a live native mount is unsupported: a measured `-s` update
+returned success without changing capacity. Resize rejects without changing the
+persisted capacity; edit capacity while idle and mount again.
+
+UI/JSON native usage and capacity come from actual `statfs`. They include kernel
+filesystem metadata and are not physical RAM, process RSS, encoded payload or an
+app compression ratio. Deprecated MemoryFS metrics are omitted from native JSON.
+macOS controls memory compression and swap; RAMNest does not disable swap or
+promise zero disk writes or secure erasure. See [memory accounting](docs/MEMORY.md).
+
+## Administrator and recovery boundaries
+
+Each privileged operation is a one-shot macOS administrator authorization. No
+permanent root daemon, LaunchDaemon, service installation, SIP/TCC change or
+credential handling is introduced. Root operations accept numeric identity
+values, uid and canonical session UUIDs; their paths are derived under the fixed
+runtime parent. They cannot execute arbitrary commands or access a snapshot
+store. The session pin/control socket runs as the ordinary user.
+
+External forced unmount destroys native RAM. A pin discourages ordinary external
+unmount; it cannot defeat a force-unmount or power loss. RAMNest never exports a
+vanished native tree or silently saves a stale disk checkpoint as current RAM.
+Explicit recovery restores only the latest committed checkpoint (or intact
+original objects in temporary mode) and retains a clear loss disclosure.
+See [recovery](docs/RECOVERY.md) and [security](SECURITY.md).
+
+Old configurations, journals and snapshot formats remain decodable. Legacy
+backend/compression fields are preserved as history, never relabeled as native.
+Native RAMNest will not control a live legacy FUSE session; finish it using its
+original version or recover a committed checkpoint after that known mount is
+gone. Unknown, malformed, mixed or partial authority fails closed.
+
+## CLI
+
+Use the CLI embedded in the exact candidate app:
 
 ```sh
-export CLANG_MODULE_CACHE_PATH="$PWD/.build/cache/clang"
-export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
-swift test --scratch-path .build/swift --cache-path .build/cache
+"/absolute/candidate/RAMNest.app/Contents/Helpers/ramnest" --help
+"/absolute/candidate/RAMNest.app/Contents/Helpers/ramnest" --store /absolute/new-owned/store create /absolute/owned/source --size 128MB --no-mount
+"/absolute/candidate/RAMNest.app/Contents/Helpers/ramnest" --store /absolute/new-owned/store mount NAME
+"/absolute/candidate/RAMNest.app/Contents/Helpers/ramnest" --store /absolute/new-owned/store save NAME
+"/absolute/candidate/RAMNest.app/Contents/Helpers/ramnest" --store /absolute/new-owned/store unmount NAME
 ```
 
-An XcodeGen specification is included. Canonical Xcode validation uses
-`BuildProject` for the Release app and `RunSomeTests`/`RunAllTests` for enabled
-Debug Swift Testing cases; its static shared core, bundled CLI and native helper are built together.
-The [test modernization record](docs/TEST_MODERNIZATION.md) maps the original
-coverage, parameterized cases and preserved standalone harnesses.
+`--store` is optional in ordinary use; omitting it uses the configured snapshot
+location. Always supply a new explicit store during candidate tests. `list --all
+--json`, `info`, `options`, `recover`, verified checkpoint `export`, `export --live`,
+offline `resize`, rename, keep/delete and launcher installation remain available.
+No compression/backend selector is offered for new mounts. Deletion still needs
+its explicit destructive confirmation; tests use disposable fixtures only.
 
-The direct-build scripts above are historical alternatives, not this delivery's
-accepted packaging path: the direct-build variant failed a rootless-legacy
-metadata check by acquiring an additional OS provenance attribute. That failure
-was not hidden by changing metadata rules. Bundles are local ad-hoc signed, not
-Developer ID signed/notarized or App Store sandboxed.
+## Build and verify
 
-## Working with a folder
-
-Directories named exactly `.Trashes`, at any depth, are excluded from snapshots,
-verification, population and reload. The check uses no-follow directory metadata
-before entering the subtree or reading its permissions, ACLs, xattrs or contents.
-Files and symlinks named `.Trashes`, and names such as `.trashes`, `.Trash` and
-`.TrashesBackup`, retain the normal strict preservation contract. Finder can
-create Trash in RAM and that usage counts toward capacity. **Trash created in RAM
-is disposable at eject and is never checkpointed or restored.**
-
-Preexisting disk Trash is preserved. Mount preparation moves originals through
-the normal durable evacuation journal into a private holding directory. A holding
-that contains excluded Trash is retained with its snapshot pins and a nonfatal
-cleanup warning containing the recovery location. Nested Trash retains that
-holding too; a filtered comparison never authorizes recursive deletion. See
-[Trash exclusion and recovery](docs/TRASH_EXCLUSION.md) before removing any retained
-holding manually.
-
-Use **New RAM Folder**, drop a folder on the window/Dock, or select an existing directory. Choose capacity in MB/GB (binary MiB/GiB), optional unique display name, synchronization and compression. The original folder path remains usable, directly for NFS/SMB and through a managed symlink for new FSKit sessions. The physical mount retains the original folder basename; `--name` and `rename` set only the RAMNest display alias, which remains usable for CLI lookup. Minimum capacity is 16 MiB; maximum is 75% of physical memory. Close writers before the first conversion. Root/home/system directories, app sandbox storage, arbitrary symlink traversal, overlapping RAM folders, app-support nesting and foreign/nested mounts are rejected. The runtime FSKit link is a narrow journal-owned exception, not a relaxation of those checks.
-
-Capacity must cover the uncompressed logical payload: each non-hardlinked file rounds up to 64 KiB, plus symlink and extended-attribute bytes. Compression does not lower this quota. Metadata has a separate `max(64 KiB, capacity / 4)` budget with no fixed 64 MiB ceiling; neither budget preallocates memory. For a roughly 55,000-entry tree with about 4.1 GiB of rounded payload, choose **8GB** (8 GiB) as a starting point: that allows 2 GiB of metadata, with room for attributes and growth subject to the existing 75%-of-RAM limit. Preflight errors report which budget failed, required/allowed bytes and entry counts before any files move.
-
-Before changing the selected directory, RAMNest copies and verifies its contents under the session's recorded policy into private local storage. Direct mounts move exact top-level entries into a 0700 sibling holding directory. New FSKit sessions instead move the complete original directory into that private wrapper's `data` child, preserving original objects while vacating the public path. With a negotiated `pre-mount-population-v1` helper, the coordinator pins the authenticated control identity, populates the **guarded tree before mounting**, then explicitly authorizes the mount. Its first callbacks therefore expose the populated namespace and root mode. RAMNest observes the physical mount identity, strictly verifies mounted data including xattrs/hardlinks, checks retained originals, publishes the bound FSKit symlink where applicable, journals verification, and only then enables writes. Older helpers retain their legacy ordering for direct mounts. Source files remain recoverable throughout. It does not use `hdiutil`, native RAM devices, tmpfs, or a disk mirror.
-
-Settings offers **File verification for next mount**: SHA-256 (the default) or size and modification time. The latter skips regular-file verification SHA-256, so a same-size edit with a restored modification time can go undetected. Sessions and snapshots retain their recorded policy after Settings changes. RAM page payload SHA-256 is also disabled in this mode, so structurally valid memory corruption can go undetected. Structural decoding, symlink/xattr checks and control-record hashes remain active. The folder's Snapshot comparison remains a separate incremental-selection option. CLI: `ramnest file-verification sha256` or `ramnest file-verification sizeAndModTime`. See the [file verification contract](docs/FILE_VERIFICATION.md).
-
-The sidebar displays all configured folders; detail shows logical allocation, capacity, file bytes, encoded payload and mapped backing. Options have Apply/Discard and unsaved-change guards. Compression and Finder visibility changes take effect on the next mount. Resize changes the live capacity without unmounting, including temporary mode, and rejects shrink below allocated usage. Names, paths and `ram://` percent-encoded names all work in the CLI.
-
-Defaults: mount at app launch, `nobrowse`, synchronization and compression on; periodic save off, selected interval 15 minutes. Available intervals are 5/15/30/60/360/720/1440 minutes. Periodic saves are scheduled by the detached helper while it is alive, so they continue after a GUI crash. FSEvents suppression is unavailable: no unsupported mount option is advertised. Mounts explicitly select the recorded session backend and retain `namedattr,use_ino` and the ordinary rename callback. Production `renamex` remains omitted as a conservative wire-decoder workaround pending separate FSKit evidence; this omission does not select the backend. See the [complete callback matrix](docs/FUSE_COMPATIBILITY.md).
-
-## Save, eject and recovery
-
-Snapshot copies preserve existing `com.apple.quarantine` bytes along with other verified metadata, including on read-only files and directories. macOS's copy API can rewrite quarantine flags; RAMNest restores only the manifest-validated source value on its new private copy and restores the exact final permissions. It does not strip quarantine, invent approval flags, or change Gatekeeper settings. Verification failures identify a bounded entry path and differing field/attribute without exposing file contents or attribute values; source files remain untouched.
-
-A save serializes against all RAM operations, exports a coherent tree, handles short writes/EINTR, syncs files, reads back allocated bytes against held RAM, verifies metadata/content, and atomically promotes an immutable revision. RAMNest normally keeps **only the latest verified committed snapshot per RAM drive** after a successful idle operation. While mounted, it also retains the initial snapshot needed for temporary eject/crash rollback and any active restore revision. Pending cleanup of completed-session originals also pins the snapshots needed to validate that cleanup. An older committed revision is retired only after the latest snapshot is verified and its journal is durable, under the repository lock. Snapshots are never overwritten in place. Periodic/manual saves update the private snapshot; **eject restores the committed snapshot to the selected folder**. In temporary mode, eject returns the original entries unchanged instead of saving RAM changes.
-
-Eject freezes writes until unmount/restore completes; an unmount failure thaws a previously active tree. The GUI lists busy processes and offers Cancel/Ignore. It never force-kills applications. Normal Quit saves and ejects all mounted folders, offers Stay on failure, and uses the normal macOS termination callback; actual machine shutdown is deliberately not tested. Menu-bar mode keeps the app running after window close. A native status item handles this presentation outside the SwiftUI scene graph; the application delegate owns the single model and starts it once after launch. SMAppService registration is triggered only by the Open at Login setting.
-
-The detached helper closes inherited descriptors and survives a GUI crash. A GUI restart reconnects by private per-session Unix socket and checks the mount device. When Finder, `diskutil`, or `umount` externally ejects the volume, the FUSE destroy callback **does not free the RAM tree**. After the FUSE loop exits, the helper invokes the bundled coordinator to export, commit and restore the held tree. On failure it retains memory and retries; a helper crash/power loss can preserve only the latest already committed local revision. A forced unmount may lose kernel-cached/unsubmitted writes. No claim is made to save after SIGKILL or power loss.
-
-On an unclean session, startup auto-mount is gated before any snapshot can be replaced. Recovery refuses unknown files rather than guessing a merge. Active originals remain throughout mounted, temporary, crashed, uncertain and unfinished transactions. After verified restore/rollback and durable idle, exact journal-attributed sibling containers can be cleaned: normal-mode originals must still match the initial verified manifest; rollback holdings and recorded restore-stage data must be empty. A durable identity/manifest queue supports retry after partial cleanup and preserves required snapshot pins. Changed originals, unknown entries, incomplete stages, identity replacements and missing legacy provenance are retained with a nonfatal `cleanupWarning` in status JSON and stderr. Older journals remain readable; an attributed legacy holding with a valid recorded identity and initial snapshot can be cleaned at the next safe operation. Unreferenced legacy directories remain for manual inspection. Cleanup never guesses a historical purge or replaces a recovery error. See [recovery instructions](docs/RECOVERY.md). Configuration removal retains the remaining recovery storage.
+The established `project.yml` workflow is the source of Xcode source membership:
 
 ```sh
-# Use disposable data while validating a new build.
-mkdir -p artifacts/example-folder
-artifacts/ramnest create "$PWD/artifacts/example-folder" --size 256MB --name 'Fast Work'
-artifacts/ramnest info 'ram://Fast%20Work' --json
-artifacts/ramnest save 'Fast Work'
-artifacts/ramnest resize 'Fast Work' --size 512MB
-artifacts/ramnest unmount 'Fast Work' --ignore-busy
-artifacts/ramnest delete 'Fast Work' --keep
+xcodegen generate --spec project.yml
+# Parent: open THIS worktree project, then BuildProject/GetTestList/RunAllTests.
 ```
 
-Shared state defaults to `~/Library/Application Support/RAMNest`; use `--store PATH` for an isolated repository. `delete` defaults to keeping files. Removing the selected directory requires **both** `--destroy --confirm-delete`; durable snapshots remain retained. `export REF NEW_DIRECTORY [--revision UUID] [--live]` rescues snapshots/current RAM. CLI installation is explicit via the app's Install Command Line Tool action or `ramnest install-cli DIRECTORY`, and creates a launcher only in the chosen existing directory. No system installation or mandatory sudo occurs.
+Core's prebuild first compiles/signs `Native/NativeTmpfsHelper.cpp`, then generates
+its final SHA-256/engine/configuration as Swift source compiled into RAMNestCore.
+The GUI and embedded CLI link that Core before the app embeds the exact same
+helper/provenance. No mutable manifest supplies the expected runtime hash. Missing
+authority fails compilation; use this XcodeGen workflow or `scripts/build.sh`.
+Raw SwiftPM/standalone compiler invocations must include the generated identity
+source from the same finalized helper; there is no missing-authority fallback.
+CMake's default
+has no FUSE dependency. The former engine, callbacks, protocol fixtures and benchmarks are removed.
+Only persisted data compatibility readers and data fixtures remain.
 
-## Verification and distribution differences
+Parent-only no-mount and exact-package gates:
 
-See [historical host verification results](docs/VERIFICATION_RESULTS.md) for the executed NFS filesystem, real-memory/compression, temporary-file, Xcode and GUI/normal-Quit checks. These reports predate explicit FSKit selection and do not validate FSKit mounts. The selector has focused configuration, session, Settings-model and installed-libfuse parser coverage. Run `scripts/backend-selector-tests.sh` for these no-mount checks; products, fixtures and logs belong under `artifacts/backend-selector`. Host packaging, GUI interaction, extension activation and isolated backend mount validation remain separate checks in [backend settings and FSKit validation](docs/FSKIT_BACKEND.md). For disposable working data, turn **Save changes on eject** off: temporary eject restores the original folder without exporting RAM-only content to a local stage.
+```sh
+python3 -B scripts/native-production-static-tests.py
+python3 -B scripts/package-provenance-tests.py /absolute/owned/scratch
+bash scripts/test.sh /absolute/new-owned/native-test-output
+python3 -B scripts/native-tmpfs-package-probe.py \
+  --app /absolute/NEW-Xcode-candidate/RAMNest.app \
+  --scratch-parent /absolute/owned/scratch --ack-admin-prompts
+# Optional explicit loss test on an additional fresh fixture created by the probe:
+# add --force-loss
+```
 
-[FEATURE_MATRIX.md](FEATURE_MATRIX.md) records implemented, tested, deviation and unverified scope. [HOST_VERIFICATION.md](docs/HOST_VERIFICATION.md) gives exact parent-host mount, process-footprint, lifecycle and GUI checks. Automated tests use disposable fixtures, the real memory engine, real libfuse dispatcher and real subprocesses; they do not substitute a mock backend and call it mount proof. Logs are in `artifacts/logs`.
+The exact-package probe creates two independent source/store fixtures, runs two
+mount/write/save-or-live-export/eject cycles per mode (including remount), tests
+the fd-closed mapping guard with Ignore Busy, rejects live resize without changing
+configuration, verifies metadata/sparse data/original inodes/cleanup, and measures
+allocation growth/truncation/deletion at fixed capacity. It records raw `vm_stat`
+context separately, without claiming isolated physical RAM attribution.
+On failure it retains evidence and the exact owned slot; it performs no automatic
+force-unmount or broad cleanup. A successful source/static check is not a claim
+that these unrun runtime gates passed.
 
-The operational reference was [RAM Folder's help center](https://less-software.sh/ram-folder/help-center), including its linked creation/options/synchronization/data-safety/mounting/memory/remote/CLI/troubleshooting pages. RAMNest has independent branding and code. Its deliberate differences include FUSE-T instead of tmpfs, no privileged helper or license/trial restriction, no telemetry/update server, local-only storage by user instruction, lossless in-place resize, stricter blocking recovery and supported metadata preservation. Snapshot retention is latest-only, with no history UI. It does not redistribute the reference help text or vendor assets. Source packaging explicitly excludes `docs/reference` captures.
-
-Run `bash scripts/latest-snapshot-tests.sh green` for focused retention tests without mounts, native-helper builds, GUI operations or packaging. The compiler commands, RED/GREEN logs and owned fixtures are under `artifacts/latest-snapshot`. These coordinator fixtures exercise real snapshot/journal/deletion behavior through a controlled helper-session boundary; actual NFS verification remains a separate host check.
-
-Run `bash scripts/holding-cleanup-tests.sh green` for completed-session sibling cleanup and the existing retention/recovery scenarios. Its RED/GREEN logs, compiler products and fixtures are under `artifacts/holding-cleanup`; the process uses a 96-descriptor limit and a 1 MiB stack. Xcode and live mount/distribution checks are separate parent-owned validation.
+Further details: [native backend/protocol](docs/NATIVE_TMPFS.md),
+[file verification](docs/FILE_VERIFICATION.md),
+[snapshot storage](docs/SNAPSHOT_STORAGE.md),
+[provenance copy policy](docs/PROVENANCE_COPY_POLICY.md).
+Obsolete engine requirements and reports have been removed. Legacy on-disk
+discriminators remain readable without an executable old storage backend.

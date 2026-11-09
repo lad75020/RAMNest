@@ -1,13 +1,35 @@
-# Content-proportional backing and compression
+# Native memory and filesystem accounting
 
-Capacity is an uncompressed **allocated block** ceiling. Files use 64 KiB logical slots; sparse holes have no slot. A one-byte file may consume one logical slot, and a high-offset write allocates only touched slots. Preflight rounds each non-hardlinked file to 64 KiB, adds symlink/attribute bytes and rejects overflow before originals move. This estimate is conservative for sparse files. Multiple hardlinks charge their inode once. Unlinked open files keep their blocks until the final handle closes.
+Production RAMNest uses macOS native tmpfs. The kernel allocates/reclaims backing
+for ordinary files; RAMNest no longer maps/encodes/checksums 64 KiB RAM pages or
+runs a custom LZ4 compressor. Capacity is a fixed maximum for that mounted session,
+not a reservation of payload bytes. Filesystem allocation must grow with writes
+and fall with truncation/unlink after references are released.
 
-On every partial write, the old block is decoded to a bounded 64 KiB scratch array, changed, LZ4 encoded, checksummed and staged. Only after every changed block succeeds are valid old mappings replaced. Individual I/O requests are capped at 4 MiB; LZ4 workspace is bounded at 16 MiB, and scratch is independent of whole-file size. Decode checks length and a stored block checksum; corruption/failure returns EIO and preserves previous valid data. Partial-block truncation clears the suffix before committing; regrowth reads as zeros. Full block deletion uses munmap. Writes may temporarily hold old and staged blocks simultaneously.
+Native `used` is `(f_blocks - f_bfree) * f_bsize`; native capacity is
+`f_blocks * f_bsize` from the actual bound tmpfs `statfs`. Both include filesystem
+metadata, including OS root bookkeeping. They are neither a sum of file lengths
+nor process RSS, physical RAM attribution, app compression savings or swap usage.
+Native JSON omits deprecated `contentBytes`, `payloadBytes`, `mappedBytes` and
+`backingSavingsFraction`; old status JSON still decodes. UI displays actual native
+capacity separately from the folder's configured maximum.
 
-Compressed payloads are mapped in exact native 16 KiB page multiples. Compression is used only if the rounded mapping saves pages compared with a raw 64 KiB block. Highly repeated data generally uses one page per block, saving 75% of backing; incompressible blocks use four pages. Compression disabled stores raw blocks through the same mmap/munmap path. The option defaults on, is persisted per folder, and takes effect on the next mount. It does not affect file bytes or the durable snapshot format.
+The parent exact-package probe writes 16 MiB of random owned content, truncates
+to 4 MiB, then unlinks it with all fds closed. It asserts substantial kernel
+allocation growth/release and unchanged capacity, allowing metadata overhead.
+It records raw host `vm_stat` alongside those readings. A shared-host memory
+reading is context, not an isolated physical RAM reclaim measurement. Open or
+mapped/unlinked files can retain resources until their last reference is gone.
 
-The UI/JSON distinguish logical allocation (`used`), sum of file lengths (`contentBytes`, including sparse holes/open-unlinked files), encoded payload (`payloadBytes`), backing mapping length (`mappedBytes`) and `backingSavingsFraction`. Attribute/symlink content is separately charged in logical allocation and is not part of mapped file-block counters. Namespace metadata is bounded separately by `max(64 KiB, capacity / 4)`, with no fixed 64 MiB ceiling or preallocation. Swift preflight and the native helper use this same budget; preflight conservatively estimates node/entry/attribute charges, while the helper also accounts for live handles and directory-name snapshots. The 100,000 live-inode and 4,096 open-handle limits remain. ENOSPC/EMFILE/ENOMEM are controlled errors; the unsaved sentinel remains readable on quota exhaustion.
+macOS can compress/swap memory. RAMNest neither disables swap nor guarantees zero
+SSD writes or secure erasure. Source conversion, snapshots, live exports and
+restoration intentionally write durable disk data. File-verification preferences
+apply to snapshots, not ordinary kernel page I/O.
 
-Native `FootprintTests.cpp` uses Mach process resident size, random data, full checksum reads, delayed measurements, truncation, unlink and highly compressible content. `artifacts/logs/footprint.json` and verbose CTest logs record actual bytes. One observed run: initial 2,113,536; random 128 MiB 136,822,784; truncate-to-64 MiB 69,713,920; unlink 2,605,056; compressible 128 MiB 36,175,872 with 33,554,432 mapped backing; final unlink 2,621,440. These are measured results from that run, not fixed performance guarantees. Parent independently confirmed the same allocation/savings behavior in `artifacts/parent-native-compression.json`.
-
-Whole-process RSS includes executable pages, malloc metadata, compressor workspaces and other runtime state. Kernel caches live outside the helper. macOS can compress/swap anonymous pages; RAMNest does not disable swap or claim zero SSD writes. An mmap count or a short encoded payload is not alone proof of physical savings. The parent-host integration procedure checks process RSS separately from helper counters on the mounted filesystem.
+The measured native size-update command returned exit 0 while capacity remained
+unchanged. Live resize therefore rejects before configuration changes. Offline
+capacity edits are checked against admitted folder contents and apply at the next
+mount. The legacy snapshot admission estimate remains conservative and preserves
+its overflow/metadata/hardlink/sparse safety rules; it is not a native live-memory
+counter. The former compressor, memory-page engine and their benchmarks/tests are
+removed. Sparse file hashing remains a snapshot data-format concern only.

@@ -1,17 +1,115 @@
 # Security and data boundaries
 
-File-content checksum guarantees below describe the default SHA-256 policy. The optional [size and modification time policy](docs/FILE_VERIFICATION.md) skips regular-file verification SHA-256 and cannot detect same-size edits whose modification time is restored. Each session/revision records its immutable policy; missing legacy fields mean SHA-256, while explicit null/unknown policies reject. Metadata mode also disables internal RAM-page payload SHA: raw corruption or compressed corruption that still decodes to the expected length can go undetected. Structural bounds/decompression checks, xattrs, symlinks, control-record hashing, path/identity and capture/epoch checks retain their rules in both modes.
+RAMNest is a local macOS application. Its production I/O path is native tmpfs,
+with no FUSE transport, app page compressor or RAM-page checksum engine. It does
+not change SIP/TCC/swap/security settings, install a privileged service, contact
+network services, read credential files or handle administrator credentials.
 
-RAMNest is a local user application for macOS 27.0+. It does not request root, alter TCC/security settings, install launch daemons, contact network services, read credential files or use remote credentials. FUSE-T is a separately installed dependency. Its default loopback NFS transport is used; RAMNest never supplies an external listen-address override. Consult FUSE-T's own security/runtime documentation before deploying it to a shared machine.
+Mount controls use bounded one-shot macOS administrator authorization. The
+packaged C++ helper accepts only allowlisted operations, uid, canonical UUIDs,
+numeric capacity and recorded inode/fsid authority; it derives every root path
+inside a fixed internal runtime namespace. No store/source/executable/shell
+argument is accepted in privileged mode, and no root IPC process remains.
+Before the authorization dialog, the running app/embedded CLI requires its
+co-located signed app/helper, validates running-code and static signatures plus
+the bundle's sealed resources/native provenance, and hashes a pinned regular
+helper descriptor with stable inode/content checks. Path-based signature/seal
+success does NOT bind a later mutable receipt to the bytes observed during that
+validation. The mandatory byte decision therefore requires BOTH the pinned
+helper SHA-256 and receipt engine/hash/configuration to match immutable authority
+compiled into the Core code actually running in the GUI/embedded CLI. A matching
+self-signed replacement and forged receipt cannot replace that expected value.
+No manifest, environment, IPC, default hash or runtime path supplies it.
+Ad-hoc development signatures are not a claim of
+Apple/notarized publisher trust; the user authorizes this selected package.
 
-Each repository, volume directory and revision container is owned by the current uid with mode 0700. Configuration, journals and socket permissions are private. IPC verifies the same uid with `getpeereid`, uses unguessable session paths, does not unlink a predecessor socket, validates operation destinations, and verifies volume identity. GUI, CLI and helper-coordinator operations serialize through a close-on-exec `flock` repository lock. All child stdio is detached to `/dev/null`; descriptors are closed before the daemon starts and `POSIX_SPAWN_CLOEXEC_DEFAULT` protects coordinator children. Credentials and payloads are never put in process arguments; only local paths/settings are passed.
+Core's prebuild builds and finalizes/signs the native helper FIRST, then generates
+the expected engine/SHA-256/configuration Swift source and provenance from those
+final bytes. That explicit generated source is compiled into Core before either
+client can link. The app only embeds the same configuration-scoped artifact; it
+does not rebuild or re-sign a different helper after Core compilation. Missing
+generated authority fails compilation, and incoherent generation/embedding fails
+the build. `native-build-identity --json` reports linked constants without opening
+a store. See the native protocol document for source/output paths and verification.
 
-A verified durable snapshot precedes any original-file move. Atomic journal replacement uses temporary exclusive files, `fsync`, rename and directory sync. Immutable revisions preserve prior good data until the latest verified snapshot and journal are durable. Safe operations then retire obsolete journal-linked committed revisions, retaining the latest and any mounted rollback/restore anchors. Failed, uncertain and recovery phases retain all recovery data. Cleanup opens owned no-follow directory chains, pins repository and retained snapshot identities, checks devices/mounts, and uses descriptor-relative unlinking. Unknown, partial, corrupt or unexpected entries are retained; cleanup failures are separate warnings. Mounted identity, source checksums, inode identity and no-follow path traversal gate destructive steps. Recovery opens directory chains with `openat(O_NOFOLLOW|O_DIRECTORY)` and performs descriptor-relative atomic `renameatx_np(RENAME_EXCL)`; concurrent destinations cannot be overwritten, and path substitution cannot redirect the move into a substitute directory. Staging identities are journaled and checked. Snapshot copying uses anchored descriptors and never follows source symlinks. Files with unsupported flags and devices/FIFOs/sockets are rejected before conversion.
+The elevated command invokes only fixed system utilities before any helper code:
+it validates the root/sticky-protected Shared parent, creates a fresh root-owned
+0700 `.RAMNestNativeExec.*` directory, copies at most the captured image length
+into a new root-owned file, verifies its exact SHA-256 (including signature bytes)
+and all-architecture code signature, then executes that protected 0500 copy.
+The user-writable source pathname is never executed as root. Source replacement
+or tampering fails staged verification before custom code runs. The protected
+directory prevents replacement between verification and execution. Arguments are
+shell-quoted before AppleScript escaping, with a sanitized environment. No image,
+digest or executable selection is accepted through helper IPC/environment.
 
-The memory tree serializes all operations with a recursive mutex. Every registered FUSE callback catches exceptions at the C ABI boundary. Content offsets, logical block quotas, mapped lengths, xattr lengths, handle counts and namespace/directory snapshot budgets are bounded. Logical content capacity is independent of compression; a compressible file cannot bypass ENOSPC. Corrupt blocks return EIO and failed partial rewrites retain last valid blocks. Only UF_HIDDEN/UF_NODUMP are supported; UF_APPEND/UF_IMMUTABLE and system flags are explicitly rejected. Ownership changes are restricted to the process uid/gid. This is not a hostile multi-tenant filesystem or a defense against an administrator or malicious code running as the same uid.
+An exit/signal trap verifies the stage's recorded device/inode/owner/mode, removes
+only its exact helper file and then the empty directory. No recursive cleanup or
+pre-existing-directory ownership/mode repair is performed. Cleanup uncertainty
+returns failure and retains evidence; a killed bootstrap or power loss may leave
+a private root-owned stage requiring explicit inspection. Parent security review,
+signing/injection/cancellation/cleanup and exact-package probes remain required.
 
-RAM is volatile, and anonymous memory can be compressed or swapped by macOS. Compression does not guarantee zero disk writes, and RAMNest does not change OS swap settings or claim secure erasure. Backing counters are not RSS. Closing/unlinking the last reference unmaps payload; compiler/runtime/kernel metadata and caches have their own lifetimes. Disk payload writes occur during explicit conversion/saves/exports/eject restoration and configured periodic saves. No telemetry or content logging is configured.
+The fixed mount parent and slots are root-owned, with non-writable directory
+modes and no extended ACL. Ancestors are opened without symlink traversal; root
+controls check internal filesystem, exact type/path/fsid, inode ownership/modes,
+capacity bounds and the read-only flag. The protected slot lock serializes
+controls and holds a root-only identity/fsid/capacity receipt checked before
+destructive operations. Pre-existing directories are never repaired/chowned. Only the newly
+created mounted workspace is handed to the user by descriptor. Ordinary unmount
+has no force flag. Release removes only exact bound empty runtime objects.
 
-External eject preserves helper-held acknowledged RAM content after FUSE destroy until commit and restore succeed. It cannot preserve writes still only in the kernel cache, survive a helper SIGKILL, or save during power loss. The latest committed snapshot survives those failures. Busy processes are detected, not terminated automatically. Tests do not terminate user applications or shut down the host. Auto-mount is blocked after unfinished sessions. Unknown restore entries produce a conflict requiring export/manual resolution.
+The independent pin/socket/periodic coordinator runs as the ordinary uid. It
+refuses elevated execution, uses a fresh private socket name, checks peer uid,
+holds the verified mount and removes only its own socket inode. Its IPC cannot
+mount, copy as root or execute a privileged command. Periodic child CLIs remain
+unprivileged and use the same volume/repository locks and administrator control
+boundary as user operations. Each queued worker carries session/fsid, pin socket,
+verification policy, interval and a replaceable schedule ticket. It checks all
+authority/configuration after taking the volume lock, before authorization and
+before checkpoint promotion. Disabled/replaced/retired work cannot save a successor
+session. Scheduling changes and retirement reap only the pin's own unreaped save
+child; no user writer or IPC-supplied PID is signalled.
 
-The current artifacts are ad-hoc signed development builds, not notarized distribution releases. Application/runtime entitlement and transport behavior should be reviewed for the intended deployment. Report reproducible issues with disposable fixtures, sanitized logs and the relevant snapshot/journal phase; never send private payloads or credential files.
+A read-only remount alone cannot freeze existing writable shared mappings on the
+measured platform. Before snapshot copying, the root helper therefore runs a
+bounded filesystem-wide mapping/reference scan. All regular references in the
+logical tree, including fd-closed `txt` mappings and read-only file fds, reject.
+Warnings, errors, timeouts, malformed/partial records, unknown types/paths and a
+missing self-observed mount pin fail closed. The only regular-reference exemption
+is OS-owned `.fseventsd` outside the logical tree. Ignore Busy cannot bypass the
+gate. This accepted close-writers policy assumes cooperative clients; it is not
+atomic mapping revocation against adversarial cross-process reference handoff.
+Writers are never killed. Strict source-before/after and independent snapshot
+copy verification remain mandatory.
+
+Every repository, revision and holding wrapper retains its private ownership and
+identity policy. Verified durable capture precedes original moves. Atomic journal
+replacement, no-follow anchored directory handles, no-replace rename/swap,
+immutable revision validation, sparse/hardlink/xattr/mode checks and narrow
+provenance normalization remain unchanged. Unknown entries, unsupported metadata,
+source changes, incomplete captures and damaged snapshots retain recovery data.
+Cleanup is limited to journal-authorized verified siblings/revisions; there is no
+broad purge or automatic fallback to another backend.
+
+Native journals and linked layouts have separate discriminators from legacy
+FUSE sessions. Legacy configuration values are preserved on decode. Malformed,
+null, mixed, unknown or partial authority cannot fall back to a less strict
+recovery branch. Native RAMNest does not mutate a live legacy helper/mount.
+
+A managed session pins its mount to discourage normal external eject. A forced
+unmount, kernel loss or power loss can destroy unsaved native data. No helper-held
+export survives that destruction. Explicit recovery restores only a verified
+committed disk checkpoint or the intact temporary-mode originals, with durable
+loss disclosure. RAMNest does not silently relabel disk snapshots as current RAM.
+Busy/unknown/replaced mounts remain fail-closed.
+
+macOS manages compression and swap, so volatile memory does not imply zero disk
+activity or secure erasure. Native statfs accounting is not physical RAM/RSS.
+Optional size/mtime snapshot verification can miss same-size edits with restored
+mtime; SHA-256 remains the default. Metadata/control-record integrity and path,
+inode, topology and provenance checks remain enforced in either policy.
+
+Parent acceptance must verify the exact packaged helper, signatures/dependencies,
+administrator/cancellation behavior, mapping guard, lifecycle/recovery and GUI.
+No runtime or notarization acceptance is inferred from source/static checks.

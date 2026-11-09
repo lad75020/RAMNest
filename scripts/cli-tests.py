@@ -23,12 +23,13 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
     created = list(pool.map(create,range(8)))
 statuses = json.loads(call('ls','--all','--json').stdout)
 assert len(statuses) == 8
-assert all(s['folder']['options']['compression'] for s in statuses)
+assert all('compression' not in s['folder']['options'] for s in statuses)
 info = json.loads(call('info','ram://Folder%200','--json').stdout)
 assert info['folder']['id'] == created[0]['id']
-call('options','Folder 0','--no-compression','--periodic','5','--no-mount-at-launch')
+call('options','Folder 0','--periodic','5','--no-mount-at-launch')
+call('options','Folder 0','--compression',expected=64)
 info = json.loads(call('info','Folder 0','--json').stdout)
-assert not info['folder']['options']['compression'] and info['folder']['options']['periodicSave']
+assert 'compression' not in info['folder']['options'] and info['folder']['options']['periodicSave']
 call('rename','Folder 0','--name','Renamed')
 call('resize','Renamed','--size','32MB')
 assert json.loads(call('info','Renamed','--json').stdout)['folder']['capacity'] == 32*1024*1024
@@ -43,5 +44,5 @@ call('remote','list',expected=64)
 binpath=fixture/'bin';binpath.mkdir();call('install-cli',binpath)
 launcher=subprocess.run([str(binpath/'ramnest'),'--version'],capture_output=True,text=True,timeout=10);assert launcher.returncode==0 and 'RAMNest' in launcher.stdout
 call('install-cli',binpath,expected=4)
-print('PASS real CLI: help/version/JSON, eight concurrent creators, shared locking/state, references, options/compression/periodic, rename/resize, duplicate and malformed arguments, explicit destructive confirmation, keep-default deletion, local-only surface')
+print('PASS real CLI: help/version/JSON, eight concurrent creators, shared locking/state, references, options/native-only/periodic, rename/resize, duplicate and malformed arguments, explicit destructive confirmation, keep-default deletion, local-only surface')
 print('Fixtures:',fixture)

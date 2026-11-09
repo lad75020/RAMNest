@@ -13,7 +13,11 @@ if [[ -z "$cmake_command" ]]; then
   done
 fi
 [[ -n "$cmake_command" ]] || { printf 'CMake is required to build the native helper.\n' >&2; exit 69; }
-"$cmake_command" -S "$source_root/Native" -B "$build" -DCMAKE_BUILD_TYPE="$configuration" -DRAMNEST_TEST_ROOT="$build/fixtures"
+"$cmake_command" -S "$source_root/Native" -B "$build" -DCMAKE_BUILD_TYPE="$configuration"
 python3 "$source_root/scripts/native-provenance.py" "$source_root" "$build" "$configuration" --prepare
 "$cmake_command" --build "$build" --target "${3:-all}" -j 4
+# Finalize the executable BEFORE recording or compiling its byte authority.
+# It must never be re-signed after this receipt is generated.
+/usr/bin/codesign --force --sign - "$build/ramnest-helper"
+/usr/bin/codesign --verify --strict "$build/ramnest-helper"
 python3 "$source_root/scripts/native-provenance.py" "$source_root" "$build" "$configuration"

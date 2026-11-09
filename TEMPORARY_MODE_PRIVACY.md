@@ -1,7 +1,13 @@
-# Final local privacy regression to fix with bookmark retry
+# Temporary mode and durability
 
-Observed static path: Engine.unmount(sync=false) still sends `quiesce\t<stage-UUID>`. Helper quiesce calls tree.exportTree(stage,true), writing ALL temporary RAM changes to SSD even though they are discarded from selected folder afterward. These stage dirs remain. This contradicts the useful temporary/sync-disabled behavior and needlessly persists volatile working content. Original-folder startup snapshots may remain, but NEW RAM-only data must not be written on a temporary eject.
+Temporary eject uses a verified read-only native mount control, retires the pin,
+normal-unmounts and restores the original folder objects. It does not capture
+current RAM contents. Explicit live export is the opt-in rescue path and uses the
+same mandatory mapping guard as synchronized snapshots. Periodic save is disabled
+when synchronization is off.
 
-Add a freeze-only helper command (no export, no payload I/O) and use it in temporary unmount. Continue restoring original folder objects and skipping periodic saves when sync is off; explicit live export remains opt-in rescue. Keep save/eject atomic/freeze semantics and failure-thaw paths. Test actual command boundary plus a local host fixture: create original, mount temporary, write unique RAM-only sentinel, eject; original unchanged and sentinel absent from ALL retained snapshot/stage/original-holding data files. Do not delete recovery storage as a way to hide a write; prove no stage/payload export occurred. Existing original source snapshot behavior okay.
-
-Keep changes narrowly to helper command, temporary Engine route, regression/tests/docs. Bookmark transient retry fix remains active; do both together, then run tests/package. Parent confirmed Debug + Release GUI and normal quit; don't refactor GUI. No S3; macOS27+. Core is otherwise passing host ops/compression/recovery.
+The initial source checkpoint, original holdings and any explicit export remain
+on disk according to the existing retention policy. macOS can compress/swap
+memory; temporary mode is not secure erasure or a zero-disk-write guarantee.
+Forced native unmount loses unsaved work. Test only fresh disposable fixtures;
+never erase snapshots/stages to make a privacy assertion appear to pass.

@@ -4,14 +4,7 @@ import ServiceManagement
 import RAMNestCore
 
 @MainActor final class AppModel: ObservableObject {
-#if DEBUG
-    @Published var benchmarkReport: DebugBenchmarkReport?
-    @Published var benchmarkProgress: DebugBenchmarkProgress?
-    @Published var benchmarkRunning = false
-    var benchmarkAdmission = DebugBenchmarkAdmission()
-    var benchmarkCancellation: DebugBenchmarkCancellation?
-    var benchmarkTask: Task<Void, Never>?
-#endif
+
     @Published var statuses: [FolderStatus] = []
     @Published var selected: UUID?
     @Published var draft: Folder?
@@ -21,8 +14,7 @@ import RAMNestCore
     @Published var showCreate = false
     @Published var creationPath: URL?
     @Published var menuBarMode = false
-    @Published private(set) var backend = Configuration.Backend.nfs
-    @Published private(set) var backendError: String?
+    @Published private(set) var backend = Configuration.Backend.tmpfs
     @Published private(set) var fileVerification = FileVerification.sha256
     @Published private(set) var fileVerificationError: String?
     @Published var memoryUsed: Double = 0
@@ -59,11 +51,11 @@ import RAMNestCore
             if repository == nil, args.last == "--store" { throw NestError("--store requires a directory.", code: 64) }
             let store = try repository ?? (explicit.map { try Store(root: $0) } ?? storageManager!.open())
             let config = try store.locked { try store.load() }
-            engine = Engine(store: store); menuBarMode = config.menuBarMode; backend = config.backend; snapshotStoragePath = store.root.path
+            engine = Engine(store: store); menuBarMode = config.menuBarMode; backend = .tmpfs; snapshotStoragePath = store.root.path
             fileVerification = config.fileVerification
             if let storageManager { let state = try storageManager.state(); storagePending = state.pending }
         } catch {
-            engine = nil; self.error = error.localizedDescription; backendError = error.localizedDescription; storageError = error.localizedDescription
+            engine = nil; self.error = error.localizedDescription; storageError = error.localizedDescription
             if let state = try? storageManager?.state() { snapshotStoragePath = state.path; storagePending = state.pending }
         }
     }
@@ -75,6 +67,10 @@ import RAMNestCore
             guard let self else { return }
             await refresh()
             if let engine, engineGeneration == 0, !movingStorage, storagePending == nil {
+                for status in statuses where status.journal.nativeTmpfs != nil && status.mounted && !status.connected && status.journal.phase == .mounted && status.journal.populationVerified {
+                    guard engineGeneration == 0, !movingStorage, storagePending == nil, self.engine === engine else { break }
+                    await perform("Reconnecting \(status.folder.name)…") { try engine.reconnect(status.id.uuidString) }
+                }
                 let unclean = statuses.contains { !$0.connected && $0.journal.phase != .idle }
                 if unclean { error = "A previous session did not finish cleanly. Automatic mounting is paused. Recover or export each affected folder first." }
                 else {
@@ -160,7 +156,7 @@ import RAMNestCore
         if let state = try? manager.state() { snapshotStoragePath = state.path; storagePending = state.pending }
         do {
             let store = try manager.open(), config = try store.locked { try store.load() }
-            self.engine = Engine(store: store); menuBarMode = config.menuBarMode; backend = config.backend
+            self.engine = Engine(store: store); menuBarMode = config.menuBarMode; backend = .tmpfs
             fileVerification = config.fileVerification
         } catch {
             // A committed-but-not-retired destination stays fenced. Settings
@@ -218,6 +214,9 @@ import RAMNestCore
             }
         }
     }
+    func reconnect(_ status: FolderStatus) {
+        guarded { guard let engine = self.engine else { return }; Task { await self.perform("Reconnecting native mount…") { try engine.reconnect(status.id.uuidString) } } }
+    }
     func save() {
         guard selectedStatus?.canSave == true else { return }
         guarded { guard let s = self.selectedStatus, s.canSave, let engine = self.engine else { return }; Task { await self.perform("Saving a coherent local snapshot…") { try engine.save(s.id.uuidString) } } }
@@ -227,7 +226,7 @@ import RAMNestCore
         guard selectedStatus?.canResize == true else { return }
         guarded {
             guard let s = self.selectedStatus, s.canResize, let engine = self.engine else { return }
-            let alert = NSAlert(); alert.messageText = "Resize \(s.folder.name)"; alert.informativeText = "Enter a capacity such as 512MB or 4GB. Mounted data stays in RAM, including temporary folders. Shrinking below allocated logical usage is rejected."
+            let alert = NSAlert(); alert.messageText = "Resize \(s.folder.name)"; alert.informativeText = "Enter an offline capacity such as 512MB or 4GB. Native tmpfs does not support live resize. Eject before editing; shrinking below admitted contents is rejected."
             let field = NSTextField(string: "\(s.folder.capacity / (1<<20))MB"); field.frame = NSRect(x: 0, y: 0, width: 260, height: 24); alert.accessoryView = field
             alert.addButton(withTitle: "Resize"); alert.addButton(withTitle: "Cancel")
             if alert.runModal() == .alertFirstButtonReturn {
@@ -290,26 +289,14 @@ import RAMNestCore
             }
         }
     }
-    func setBackend(_ value: Configuration.Backend) {
-        guard !busy, let engine else { return }
-        busy = true; progress = "Saving next mount backend…"; backendError = nil
-        Task {
-            defer { busy = false; progress = "" }
-            do { backend = try await Task.detached { try engine.setBackend(value) }.value }
-            catch {
-                backendError = error.localizedDescription
-                if let saved = try? await Task.detached(operation: { try engine.backend() }).value { backend = saved }
-            }
-        }
-    }
     func backendCaption(for status: FolderStatus) -> String {
         if status.mounted {
-            return status.journal.backend.map { "Mounted with FUSE-T \($0.displayName)" } ?? "Mounted with FUSE-T · backend not recorded"
+            return status.journal.backend.map { $0 == .tmpfs ? "Mounted with native macOS tmpfs" : "Legacy FUSE-T \($0.displayName) session · use original version to control" } ?? "Legacy session · backend not recorded"
         }
         if status.journal.phase != .idle {
-            return status.journal.backend.map { "Session backend: FUSE-T \($0.displayName)" } ?? "Session backend not recorded"
+            return status.journal.backend.map { "Session engine: \($0.displayName)" } ?? "Session backend not recorded"
         }
-        return "Next mount: FUSE-T \(backend.displayName)"
+        return "Next mount: native macOS tmpfs"
     }
     func quit() async -> Bool {
         guard !busy else { error = "Wait for the current transaction to finish before quitting."; return false }

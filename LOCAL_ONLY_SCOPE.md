@@ -1,5 +1,10 @@
-# Scope update — no remote storage
+# Local-only scope
 
-Latest direct user instruction: **“do not implement the S3 remote storage.”**
+RAMNest uses native macOS tmpfs and local snapshot storage. Ordinary I/O has no
+network transport or alternate storage engine. The user pin uses a private local
+Unix socket; bounded root controls use one-shot macOS administrator authorization.
+No permanent privileged service, network credential handling, SIP/TCC change or
+remote storage integration is part of this product.
 
-This supersedes every earlier S3/remote-storage item in BUILD_BRIEF.md. Implement and deliver LOCAL-ONLY persistence. Do not implement S3, cloud provider lists, AWS signing, remote upload/retry, credential configuration, Keychain credentials for remote, or remote UI controls. Remove any such code already generated, remote fields and bookkeeping if unused, and related tests/dependencies. CLI should not advertise remote commands (an explicit unsupported explanation is optional, not an implementation). Feature matrix marks remote storage intentionally excluded by user, not an incomplete feature. No network access from the running app is required. All other app/core/filesystem/safety/CLI/physical-memory/callback requirements remain active. Continue to a built/tested working application, not a partial scaffold.
+Candidate verification is isolated to new owned source/store fixtures. Installed
+apps, other mounts and existing user stores are not test targets.

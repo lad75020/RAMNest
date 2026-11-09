@@ -317,7 +317,7 @@ public struct Manifest: Codable, Equatable, Sendable {
     }
     static func metadataBudget(capacity: UInt64) -> UInt64 { max(65536, capacity / 4) }
     public func preflight(capacity: UInt64) throws {
-        guard entries.lazy.filter({ $0.hardlink == nil }).count < 100000 else { throw NestError("Native node limit is 100000 including the root. No files were moved.", code: 6) }
+        guard entries.lazy.filter({ $0.hardlink == nil }).count < 100000 else { throw NestError("Snapshot admission node limit is 100000 including the root. No files were moved.", code: 6) }
         let logicalRequired = allocatedEstimate, metadataRequired = metadataEstimate
         let metadataAllowed = Self.metadataBudget(capacity: capacity)
         guard logicalRequired > capacity || metadataRequired > metadataAllowed else { return }
@@ -325,7 +325,7 @@ public struct Manifest: Codable, Equatable, Sendable {
         let attributes = entries.reduce(0) { $0 + $1.attributes.count }
         let detail = "\(entries.count) entries, \(files) regular files, \(attributes) extended attributes"
         if logicalRequired > capacity {
-            throw NestError("Source exceeds logical capacity: requires \(logicalRequired) bytes; allowed \(capacity) bytes (\(detail)). Files round up to 64 KiB; compression does not reduce this quota. Increase capacity before mounting; no files were moved.", code: 6)
+            throw NestError("Source exceeds logical capacity: requires \(logicalRequired) bytes; allowed \(capacity) bytes (\(detail)). Conservative snapshot admission rounds files to 64 KiB; live kernel usage is measured separately. Increase capacity before mounting; no files were moved.", code: 6)
         }
         throw NestError("Source exceeds metadata budget: estimated required \(metadataRequired) bytes; allowed \(metadataAllowed) bytes at capacity \(capacity) bytes (\(detail)). Metadata budget is max(64 KiB, capacity / 4). Increase capacity or reduce entry/attribute count before mounting; no files were moved.", code: 6)
     }
@@ -517,7 +517,7 @@ public enum Snapshot {
                 try supportedSecurity(child, st)
                 let type = st.st_mode & S_IFMT
                 // Regular reads and hashes use kernel-decoded logical bytes.
-                // RAMNest's own compression must not claim APFS decmpfs storage.
+                // Copy logical bytes without claiming an APFS decmpfs representation.
                 let logicalFlags = type == S_IFREG ? st.st_flags & ~UInt32(UF_COMPRESSED) : st.st_flags
                 var entry = Entry(path: path, kind: "", size: 0, mode: UInt16(st.st_mode & 0o7777), mtimeSeconds: 0, mtimeNanos: 0, checksum: "", attributes: try relativeAttributes(child,path), hardlink: nil, flags: logicalFlags, attributeBytes: 0)
                 guard logicalFlags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else { throw NestError("Unsupported file flags on \(path). Clear immutable/append/system flags before conversion.", code: 4) }
@@ -782,12 +782,9 @@ public enum Snapshot {
         try Store.atomicJSON(receipt,staging.deletingLastPathComponent().appendingPathComponent("publication.json"))
         return copied
     }
-    @discardableResult static func copyAccessibleTree(from source: URL, to destination: URL, manifest: Manifest, previous: URL? = nil, comparison: Comparison = .checksum, sourceContext: SourceContext = .original, previousContext: SourceContext = .original, freshExportModes: StorageModes? = nil) throws -> Manifest {
-        // Only adoptExport supplies this capability, after full native receipt
-        // or fresh-normalization validation. It confers no authority on a path.
+    @discardableResult static func copyAccessibleTree(from source: URL, to destination: URL, manifest: Manifest, previous: URL? = nil, comparison: Comparison = .checksum, sourceContext: SourceContext = .original, previousContext: SourceContext = .original) throws -> Manifest {
         func observe(_ phase: String) throws -> Manifest {
-            if let modes = freshExportModes { return try modes.projecting(scanManifest(source,matching:manifest,phase:phase,containedHardlinks:true)) }
-            return try self.manifest(source,matching:manifest,phase:phase,context:sourceContext)
+            try self.manifest(source, matching: manifest, phase: phase, context: sourceContext)
         }
         let before = try observe("copy-source-before")
         guard before.matchesExpected(manifest) else { throw NestError("Copy source changed \(mismatchDetail(before,manifest)). No source files were removed.", code: 6) }
@@ -910,7 +907,14 @@ public enum Snapshot {
         let revision = UUID().uuidString
         let directory = try store.volume(folder.id).appendingPathComponent("revisions/\(revision)")
         try Store.privateDirectory(directory)
-        let old = try previous.map { try dataURL(store: store, id: folder.id, revision: $0) }
+        // A prior revision is only an optimization, never current source
+        // authority. Damaged/incompatible prior data is retained and cannot be
+        // reused; the new source still receives full independent verification.
+        let old = previous.flatMap { prior -> URL? in
+            guard let verified = try? self.verified(store: store, id: folder.id, revision: prior),
+                  verified.1.fileVerification == initial.fileVerification else { return nil }
+            return verified.0
+        }
         let copied = try copyTree(from: source, to: directory.appendingPathComponent("data"), manifest: initial, previous: old, comparison: folder.options.comparison, privateStorage: true,sourceContext:sourceContext,previousContext:.managedRevision)
         let final = try manifest(source, matching: initial, phase: "capture-source-after",context:sourceContext)
         guard final == initial else { throw NestError("Source changed during snapshot \(mismatchDetail(final, initial)). Close writers and retry. No source files were removed.", code: 6) }
@@ -918,44 +922,6 @@ public enum Snapshot {
         let modes = try StorageModes(copied)
         try modes.write(directory.appendingPathComponent("modes.bin"))
         try Store.atomicJSON(StoredManifest(copied,modes:modes), directory.appendingPathComponent("manifest.json")); try Store.syncDirectory(directory); try Store.syncDirectory(directory.deletingLastPathComponent())
-        return revision
-    }
-    public static func adoptExport(store: Store, folder: Folder, stage: URL, privateStorage: Bool = false, modeMapDigest: String? = nil, verification: FileVerification = .sha256) throws -> String {
-        let volume = try store.volume(folder.id)
-        guard stage.deletingLastPathComponent() == volume, stage.lastPathComponent.hasPrefix("stage-"), UUID(uuidString:String(stage.lastPathComponent.dropFirst(6))) != nil else { throw NestError("Invalid fresh export stage.", code: 6) }
-        let modes: StorageModes
-        if privateStorage {
-            let bytes = try StorageModes.read(URL(fileURLWithPath:stage.path+".modes"))
-            guard let modeMapDigest, digest(bytes) == modeMapDigest else { throw NestError("Native original logical-mode receipt is missing or mismatches the fresh export map; stage retained.", code: 6) }
-            modes = try StorageModes(data:bytes)
-        } else {
-            guard modeMapDigest == nil else { throw NestError("Legacy helper/storage receipt mismatch; stage retained.", code: 6) }
-            modes = try StorageModes.normalizeFreshExport(stage,volume:volume)
-        }
-        var manifest = try modes.projecting(scanManifest(stage,phase:"export-independent-readback",containedHardlinks:true,verification:verification))
-        try manifest.preflight(capacity: folder.capacity)
-        let includedModes = try StorageModes(manifest)
-        let excluded = try excludedDirectoryPaths(stage)
-        let revision = UUID().uuidString
-        let directory = try store.volume(folder.id).appendingPathComponent("revisions/\(revision)")
-        try Store.privateDirectory(directory)
-        let parent = try DirectoryHandle.open(volume), target = try DirectoryHandle.open(directory)
-        if excluded.isEmpty {
-            try parent.renameNoReplace(stage.lastPathComponent,to:target,as:"data")
-            if privateStorage { try parent.renameNoReplace(stage.lastPathComponent+".modes",to:target,as:"modes.bin") }
-            else { try includedModes.write(directory.appendingPathComponent("modes.bin")) }
-        } else {
-            // A running old helper may still export Trash. Copy only the
-            // authenticated included view; leave opaque stage Trash untouched.
-            manifest = try copyAccessibleTree(from:stage,to:directory.appendingPathComponent("data"),manifest:manifest,freshExportModes:modes)
-            try includedModes.write(directory.appendingPathComponent("modes.bin"))
-            let warning = "Legacy helper exported excluded RAM Trash. Opaque export retained at " + stage.path
-            try Store.atomicJSON(["stage":stage.path,"reason":warning],URL(fileURLWithPath:stage.path+".trash-retained.json"))
-            FileHandle.standardError.write(Data((warning+"\n").utf8))
-        }
-        try manifest.preflight(capacity: folder.capacity)
-        guard digest(try StorageModes.read(directory.appendingPathComponent("modes.bin"))) == digest(includedModes.encoded) else { throw NestError("Promoted logical mode map changed; uncommitted revision retained.", code: 6) }
-        try Store.atomicJSON(StoredManifest(manifest,modes:includedModes), directory.appendingPathComponent("manifest.json")); try Store.syncDirectory(directory); try Store.syncDirectory(directory.deletingLastPathComponent());try parent.sync()
         return revision
     }
     // Metadata-only, pinned no-follow walk. Stops at each excluded directory.

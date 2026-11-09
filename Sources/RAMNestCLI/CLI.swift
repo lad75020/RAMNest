@@ -4,21 +4,22 @@ import RAMNestCore
 
 @main struct RAMNestCLI {
     static let help = """
-    RAMNest 1.0 — local-only RAM folders powered by FUSE-T
+    RAMNest 1.0 — local-only RAM folders using native macOS tmpfs
     Usage: ramnest [--store PATH] COMMAND [arguments] [--json]
       --help / help / --version
       list | ls [--all | -a] [--json]
       info REF [--json]
       create PATH --size 512MB [--name NAME] [--no-mount]
-          [--no-sync-folder] [--no-compression] [--no-nobrowse] [--no-mount-at-launch]
+          [--no-sync-folder] [--no-nobrowse] [--no-mount-at-launch]
           [--periodic MINUTES] [--file-comparison-method checksum|sizeAndModTime]
       mount REF
+      reconnect REF
       unmount | eject REF [--ignore-busy]
       save REF
       resize REF --size 1GB
       rename REF --name NAME
       options REF [--sync-folder|--no-sync-folder] [--nobrowse|--no-nobrowse]
-          [--mount-at-launch|--no-mount-at-launch] [--compression|--no-compression] [--periodic MINUTES|--no-periodic]
+          [--mount-at-launch|--no-mount-at-launch] [--periodic MINUTES|--no-periodic]
       delete REF [--keep] [--destroy --confirm-delete]
       recover REF
       export REF DESTINATION [--revision UUID] [--live]
@@ -28,10 +29,18 @@ import RAMNestCore
     REF is a name, original path, UUID, or ram://percent-encoded-name.
     create uses an existing directory; defaults: sync/nobrowse/startup on,
     periodic off (15 minutes). Capacity: integer MB/GB, 16 MiB–75% RAM.
-    FSEvents suppression is unsupported by FUSE-T; no remote storage.
+    Mount/control operations require one-shot macOS administrator authorization.
+    No FUSE or app LZ4 page engine. Capacity changes require an idle folder.
+    Close all regular files and mappings before save/sync eject/live export. A
+    mandatory privileged mapping scan follows read-only remount; Ignore Busy
+    cannot override it. Cooperative writer quiescence is required (not atomic
+    mapping revocation against adversarial fd handoff).
+    Temporary eject restores originals and discards RAM changes; force-unmount
+    loses unsaved native RAM. Recovery/export without --live uses disk checkpoints.
+    FSEvents suppression is unsupported; OS root metadata is outside the data tree.
     Delete defaults to keep. Snapshots are retained for manual recovery.
     Exit codes: 0 success, 1 error, 2 helper, 4 unsafe path, 6 persistence/recovery,
-    7 busy processes, 64 invalid usage. JSON errors go to stderr.
+    7 busy processes, 64 invalid usage, 78 coherence capability blocked. JSON errors go to stderr.
     """
     static func main() {
         var args = Array(CommandLine.arguments.dropFirst())
@@ -44,10 +53,16 @@ import RAMNestCore
             } else { root = nil }
             if args.isEmpty || ["--help", "help", "-h"].contains(args[0]) { print(help); return }
             if args[0] == "--version" { print("RAMNest 1.0.0"); return }
+            // Read-only package diagnostic, before opening any selected/default
+            // store. This reports linked code constants, never an external file.
+            if args[0] == "native-build-identity" {
+                guard args.count == 1 || args == ["native-build-identity", "--json"] else { throw NestError("native-build-identity accepts only --json.", code: 64) }
+                try output(NativeHelperCompiledAuthority.current); return
+            }
             let command = args.removeFirst()
             var values: [String: String] = [:]; var flags: Set<String> = []; var positional: [String] = []
             let valued: Set<String> = ["--size", "-s", "--name", "-n", "--periodic", "--file-comparison-method", "--revision"]
-            let allowed: Set<String> = ["--compression", "--no-compression", "--json", "--all", "-a", "--no-mount", "--keep", "--destroy", "--confirm-delete", "--ignore-busy", "--live", "--sync-folder", "--no-sync-folder", "--nobrowse", "--no-nobrowse", "--mount-at-launch", "--no-mount-at-launch", "--no-periodic"]
+            let allowed: Set<String> = [ "--json", "--all", "-a", "--no-mount", "--keep", "--destroy", "--confirm-delete", "--ignore-busy", "--live", "--sync-folder", "--no-sync-folder", "--nobrowse", "--no-nobrowse", "--mount-at-launch", "--no-mount-at-launch", "--no-periodic"]
             var i = 0
             while i < args.count {
                 let value = args[i]
@@ -61,7 +76,6 @@ import RAMNestCore
             func options(_ initial: FolderOptions) throws -> FolderOptions {
                 var o = initial
                 for (yes, no) in [("--sync-folder", "--no-sync-folder"), ("--nobrowse", "--no-nobrowse"), ("--mount-at-launch", "--no-mount-at-launch")] where flags.contains(yes) && flags.contains(no) { throw NestError("Conflicting options: \(yes) and \(no)", code: 64) }
-                if flags.contains("--compression") { o.compression = true }; if flags.contains("--no-compression") { o.compression = false }
                 if flags.contains("--sync-folder") { o.sync = true }; if flags.contains("--no-sync-folder") { o.sync = false }
                 if flags.contains("--nobrowse") { o.nobrowse = true }; if flags.contains("--no-nobrowse") { o.nobrowse = false }
                 if flags.contains("--mount-at-launch") { o.mountAtLaunch = true }; if flags.contains("--no-mount-at-launch") { o.mountAtLaunch = false }
@@ -86,14 +100,24 @@ import RAMNestCore
                 if json { try output(statuses) } else { for s in statuses { print("\(s.folder.name)\t\(s.mounted ? "mounted" : s.journal.phase.rawValue)\t\(s.folder.path)\t\(s.used)/\(s.folder.capacity)") } }
             case "info":
                 try require(1); let f = try engine.folder(positional[0]); guard let status = try engine.statuses().first(where: { $0.id == f.id }) else { throw NestError("Folder disappeared.") }
-                if json { try output(status) } else { print("\(f.name)\nPath: \(f.path)\nID: \(f.id)\nState: \(status.journal.phase.rawValue), helper \(status.connected ? "connected" : "absent")\nCapacity: \(f.capacity), allocated: \(status.used)\nSnapshot: \(status.journal.revision ?? "none")\nError: \(status.journal.lastError ?? "none")") }
+                if json { try output(status) } else { print("\(f.name)\nPath: \(f.path)\nID: \(f.id)\nState: \(status.journal.phase.rawValue), helper \(status.connected ? "connected" : "absent")\nCapacity: \(f.capacity), allocated: \(status.used)\nSnapshot: \(status.journal.revision ?? "none")\nSnapshot capability: \(status.snapshotBlocker ?? (status.journal.nativeTmpfs == nil ? "legacy checkpoint" : "close writers; mandatory privileged mapping scan"))\nError: \(status.journal.lastError ?? "none")") }
             case "create":
                 try require(1); let f = try engine.create(path: URL(fileURLWithPath: (positional[0] as NSString).expandingTildeInPath), name: values["--name"] ?? values["-n"], capacity: size(), options: options(.init()))
                 if !flags.contains("--no-mount") { try engine.mount(f.id.uuidString) }
                 if json { try output(f) } else { print("Created \(f.name) (\(f.id))") }
+            case "reconnect": try require(1); try engine.reconnect(positional[0]); try success(json)
             case "mount": try require(1); try engine.mount(positional[0]); try success(json)
             case "unmount", "eject": try require(1); try engine.unmount(positional[0], ignoreBusy: flags.contains("--ignore-busy")); try success(json)
             case "save": try require(1); try engine.save(positional[0]); try success(json)
+            case "internal-periodic-save":
+                try require(8)
+                guard let session = UUID(uuidString: positional[1]), let first = UInt32(positional[2]),
+                      let second = UInt32(positional[3]), let verification = FileVerification(rawValue: positional[4]),
+                      let interval = Int(positional[5]), let authorization = UUID(uuidString: positional[6]) else {
+                    throw NestError("Invalid native periodic scheduling authority.", code: 64)
+                }
+                try engine.periodicSave(positional[0], expected: .init(session: session, first: first, second: second,
+                    verification: verification, interval: interval, authorization: authorization, socket: positional[7]))
             case "resize": try require(1); try engine.resize(positional[0], capacity: size()); try success(json)
             case "rename":
                 try require(1); guard let name = values["--name"] ?? values["-n"] else { throw NestError("--name is required.", code: 64) }; var f = try engine.folder(positional[0]); f.name = name; try engine.update(f); try success(json)

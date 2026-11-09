@@ -93,68 +93,6 @@ struct ReviewAcceptanceRunner {
         try check((event["bytesRead"] as? Int)==2<<20 && (event["hardlinkDigestsReused"] as? Int)==16,"one stable inode digest per walk")
         try check(links.allocatedEstimate<UInt64(3<<20),"aliases not charged twice")
         print("PASS item7 17 aliases: 2MiB read instead of 34MiB, 16 inode-stable cache hits; independent manifests/readback retained")
-        let coordinatorRoot=base.appendingPathComponent("coordinator");try Store.privateDirectory(coordinatorRoot)
-        try coordinator(coordinatorRoot)
-        try volumes(base.appendingPathComponent("volumes"))
-        print("PASS review Swift acceptance; fixtures: \(base.path)")
-    }
-    static func coordinator(_ root: URL) throws {
-        let f=try LatestSnapshotScenarios.Fixture(root,"normal-eject")
-        var boundary=f.helper.boundary;boundary.unmount={ _ in f.helper.mounted=false }
-        let engine=Engine(store:f.store,session:boundary)
-        try engine.unmount(f.folder.id.uuidString,ignoreBusy:true)
-        try check(f.helper.commands.filter{$0=="quiesce"}.count==1,"successful eject performs exactly one quiesce/export")
-        let failed=try LatestSnapshotScenarios.Fixture(root,"failed-eject")
-        var fail=failed.helper.boundary;fail.unmount={ _ in throw NestError("injected unmount failure") }
-        try rejects { try Engine(store:failed.store,session:fail).unmount(failed.folder.id.uuidString,ignoreBusy:true) }
-        let j=try failed.store.journal(failed.folder.id)
-        try check(j.phase == .mounted && j.quiescedRevision == nil && failed.helper.commands.contains("thaw"),"failed eject invalidates quiesced receipt before thaw")
-        _ = try failed.save("changed-after-thaw")
-        try failed.finish()
-        try check(failed.helper.commands.filter{$0=="quiesce"}.count==2,"retry captures newer data")
-        print("PASS item8 successful eject one quiesce; failed unmount/thaw invalidates receipt, write/save/finalize captures newer generation")
-    }
-    final class Gate: @unchecked Sendable {
-        let status=DispatchSemaphore(value:0),entered=DispatchSemaphore(value:0),release=DispatchSemaphore(value:0),done=DispatchSemaphore(value:0),second=DispatchSemaphore(value:0)
-        let lock=NSLock();var failures:[String]=[]
-        func failure(_ error: Error){lock.lock();failures.append(error.localizedDescription);lock.unlock()}
-    }
-    static func volumes(_ root: URL) throws {
-        try Store.privateDirectory(root);let store=try Store(root:root.appendingPathComponent("store")),gate=Gate()
-        var folders:[Folder]=[],live:[String:URL]=[:]
-        for i in 1...2 {
-            let selected=root.appendingPathComponent("selected\(i)");try Store.privateDirectory(selected)
-            let identity=try DirectoryHandle.open(selected).identity()
-            let f=Folder(name:"volume\(i)",path:selected.path,capacity:16<<20,device:identity.device,inode:identity.inode);folders.append(f)
-            try Data("payload\(i)".utf8).write(to:selected.appendingPathComponent("payload"))
-            let initial=try Snapshot.capture(store:store,folder:f,source:selected,previous:nil)
-            let ram=root.appendingPathComponent("live\(i)");try Store.privateDirectory(ram);try FileManager.default.moveItem(at:selected.appendingPathComponent("payload"),to:ram.appendingPathComponent("payload"));live["owned-\(i)"]=ram
-            var j=Journal();j.phase = .mounted;j.populationVerified=true;j.revision=initial;j.initialRevision=initial;j.socket="owned-\(i)";try store.write(j,for:f.id)
-        }
-        var c=Configuration();c.folders=folders;try store.save(c)
-        let session=EngineSession(request:{ socket,command in
-            let fields=command.components(separatedBy:"\t")
-            if fields[0]=="export" {
-                if socket=="owned-1" { gate.entered.signal();guard gate.release.wait(timeout:.now()+10) == .success else { throw NestError("export gate timeout") } }
-                guard let source=live[socket] else { throw NestError("unknown fixture") }
-                try Snapshot.copyTree(from:source,to:URL(fileURLWithPath:fields[1]),manifest:Snapshot.manifest(source))
-            };return []
-        },status:{ j,id in HelperStatus(id:id,pid:getpid(),mounted:true,used:0,capacity:16<<20,active:true) },mountedIdentity:{_,_ in true})
-        let engine=Engine(store:store,session:session),first=folders[0].id.uuidString,second=folders[1].id.uuidString
-        let work = DispatchGroup()
-        // Drain every callback even if an earlier bounded observation fails.
-        // A confirmation would count callbacks but would not wait for them.
-        defer { gate.release.signal(); work.wait() }
-        DispatchQueue.global().async(group: work) { do{try engine.save(first)}catch{gate.failure(error)};gate.done.signal() }
-        try check(gate.entered.wait(timeout:.now()+5) == .success,"first volume export entered")
-        let started=ProcessInfo.processInfo.systemUptime
-        DispatchQueue.global().async(group: work) { do { _ = try engine.statuses() } catch { gate.failure(error) };gate.status.signal() }
-        let statusResult=gate.status.wait(timeout:.now()+5)
-        DispatchQueue.global().async(group: work) { do{try engine.save(second)}catch{gate.failure(error)};gate.second.signal() }
-        let result=gate.second.wait(timeout:.now()+5)
-        gate.release.signal(); work.wait()
-        try check(gate.done.wait(timeout:.now()+5) == .success,"first save completed")
-        try check(statusResult == .success && result == .success && gate.failures.isEmpty,"independent volume completes while first export blocked: \(gate.failures)")
-        print("PASS item10 two volumes in same store: status and second save progress while first export paused; seconds=\(ProcessInfo.processInfo.systemUptime-started)")
+        print("PASS snapshot ACL, public-root and hardlink hashing acceptance; native checkpoint ordering is covered separately")
     }
 }

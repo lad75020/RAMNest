@@ -40,14 +40,7 @@ struct ContentView: View {
             }.navigationSplitViewColumnWidth(min: 245, ideal: 270)
         } detail: {
             if let status = model.selectedStatus {
-#if DEBUG
-                VStack(spacing: 0) {
-                    FolderDetail(status: status)
-                    DebugBenchmarkView()
-                }
-#else
                 FolderDetail(status: status)
-#endif
             }
             else {
                 ContentUnavailableView {
@@ -79,7 +72,7 @@ struct FolderDetail: View {
                 HStack(alignment: .top, spacing: 16) {
                     Image(systemName: "folder.badge.gearshape").font(.system(size: 46)).foregroundStyle(status.needsAttention ? Color.orange.gradient : Color.green.gradient).accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 6) {
-                        TextField("Display name", text: Binding(get: { model.draft?.name ?? status.folder.name }, set: { model.draft?.name = $0 })).font(.largeTitle.bold()).textFieldStyle(.plain).help("Display name in RAMNest. The mounted volume keeps the original folder name.")
+                        TextField("Display name", text: Binding(get: { model.draft?.name ?? status.folder.name }, set: { model.draft?.name = $0 })).font(.largeTitle.bold()).textFieldStyle(.plain).help("Display name in RAMNest. Files remain accessible at the original folder path.")
                         Button(status.folder.path) { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: status.folder.path) }.buttonStyle(.link).lineLimit(2).font(.callout)
                         Label(status.statusTitle, systemImage: status.needsAttention ? "exclamationmark.triangle" : status.isReady ? "circle.fill" : "circle").font(.caption).foregroundStyle(status.isReady ? Color.green : status.needsAttention ? Color.orange : Color.secondary)
                         Text(model.backendCaption(for: status)).font(.caption).foregroundStyle(.secondary)
@@ -89,16 +82,21 @@ struct FolderDetail: View {
                 }
                 GroupBox {
                     VStack(alignment: .leading, spacing: 12) {
-                        HStack { Text("\(formatted(status.used)) logical allocation").font(.headline); Spacer(); Button("of \(formatted(status.folder.capacity)) 􀈊") { model.resize() }.buttonStyle(.link).help("Resize without remounting").disabled(!status.canResize || model.busy) }
+                        HStack { Text("\(formatted(status.used)) kernel filesystem usage").font(.headline); Spacer(); Button("of \(formatted(status.folder.capacity)) 􀈊") { model.resize() }.buttonStyle(.link).help("Edit capacity after eject; live resize is unsupported").disabled(!status.canResize || model.busy) }
                         ProgressView(value: Double(status.used), total: Double(status.folder.capacity)).tint(.green)
-                        HStack(spacing: 24) { metric("File bytes", status.contentBytes); metric("Encoded payload", status.payloadBytes); metric("Mapped backing", status.mappedBytes) }
-                        Text("\(Int(status.backingSavingsFraction * 100))% backing saved versus logical allocation").font(.caption).foregroundStyle(.secondary)
-                        Text("Backing metrics exclude metadata, temporary compression buffers, and kernel caches. They are not process RSS.").font(.caption).foregroundStyle(.secondary)
+                        if let capacity = status.nativeCapacityBytes { metric("Kernel capacity (statfs)", capacity) }
+                        Text("Native usage includes filesystem metadata and open files. It is not physical RAM or RSS. macOS manages memory compression and swap; RAMNest has no LZ4 page engine.").font(.caption).foregroundStyle(.secondary)
                     }.padding(10)
                 }
+                if status.journal.nativeTmpfs != nil { Text("Close every file and mapping before saving. RAMNest remounts read-only and rejects remaining regular vnode references; Ignore Busy cannot bypass this check. This requires cooperative writers and does not revoke existing mappings.").font(.caption).foregroundStyle(.secondary) }
+                if let blocker = status.snapshotBlocker { Label(blocker, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled) }
+                if let loss = status.journal.nativeTmpfs?.lossDisclosure { Label(loss, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled) }
                 if let error = status.journal.lastError { Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled) }
                 if let warning = status.journal.cleanupWarning { Label(warning, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled) }
                 HStack {
+                    if status.journal.nativeTmpfs != nil && status.mounted && !status.connected && status.journal.phase == .mounted {
+                        Button("Reconnect", systemImage: "arrow.triangle.2.circlepath") { model.reconnect(status) }.disabled(model.busy)
+                    }
                     Button("Save Snapshot", systemImage: "square.and.arrow.down") { model.save() }.disabled(!status.canSave || model.busy)
                     Button("Export Snapshot…", systemImage: "arrow.up.doc") { model.exportSnapshot() }.disabled(status.journal.revision == nil || model.busy)
                     Button("Recover", systemImage: "arrow.counterclockwise") { model.recover() }.disabled(!status.canRecover || model.busy)
@@ -111,15 +109,14 @@ struct FolderDetail: View {
                         Toggle("Hide from Desktop and Finder sidebar", isOn: option(\.nobrowse, fallback: true))
                         Toggle("Save changes when ejecting", isOn: option(\.sync, fallback: true))
                         Text(model.draft?.options.sync == false ? "Temporary mode: each mount begins with the original files. Eject restores the original folder and discards RAM changes." : "Periodic saves update the private snapshot. Eject restores the latest committed data to your folder.").font(.callout).foregroundStyle(.secondary)
-                        Toggle("Save a snapshot periodically", isOn: option(\.periodicSave, fallback: false)).disabled(model.draft?.options.sync == false)
-                        Picker("Save every", selection: option(\.intervalMinutes, fallback: 15)) { ForEach(FolderOptions.intervals, id: \.self) { Text($0 < 60 ? "\($0) minutes" : "\($0 / 60) hours").tag($0) } }.frame(maxWidth: 340).disabled(model.draft?.options.sync == false || model.draft?.options.periodicSave == false)
+                        Toggle("Save a snapshot periodically", isOn: option(\.periodicSave, fallback: false)).disabled(model.draft?.options.sync == false || status.snapshotBlocker != nil)
+                        Picker("Save every", selection: option(\.intervalMinutes, fallback: 15)) { ForEach(FolderOptions.intervals, id: \.self) { Text($0 < 60 ? "\($0) minutes" : "\($0 / 60) hours").tag($0) } }.frame(maxWidth: 340).disabled(model.draft?.options.sync == false || model.draft?.options.periodicSave == false || status.snapshotBlocker != nil)
                     } else {
-                        Toggle("Real-time LZ4 compression", isOn: option(\.compression, fallback: true))
-                        Text("Compresses each 64 KiB content block as you write. Incompressible blocks stay raw. This option and Finder visibility take effect at the next mount.").font(.callout).foregroundStyle(.secondary)
+                        Text("Native macOS tmpfs handles ordinary reads and writes. RAMNest performs verified disk snapshot copies; macOS controls compression and swap.").font(.callout).foregroundStyle(.secondary)
                         Picker("Snapshot comparison", selection: option(\.comparison, fallback: .sizeAndModTime)) { Text("Size & modification time").tag(Comparison.sizeAndModTime); Text("File checksum").tag(Comparison.checksum) }.frame(maxWidth: 430)
                         Text("Controls incremental file selection. File integrity uses the policy recorded when this session mounted; choose the policy for future mounts in Settings.").font(.caption).foregroundStyle(.secondary)
                         Label("FSEvents suppression is unavailable", systemImage: "info.circle").font(.callout)
-                        Text("RAMNest does not request FSEvents suppression. Folder watcher behavior depends on the mount backend.").font(.caption).foregroundStyle(.secondary)
+                        Text("RAMNest does not request FSEvents suppression. Folder watcher behavior depends on native macOS tmpfs.").font(.caption).foregroundStyle(.secondary)
                         Label("Local persistence only", systemImage: "internaldrive").font(.callout)
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
@@ -138,17 +135,16 @@ struct CreateFolderView: View {
     @ViewState<String> private var name = ""
     @ViewState<String> private var size = "4"
     @ViewState<String> private var unit = "GB"
-    @ViewState<Bool> private var compression = true
     @ViewState<Bool> private var sync = true
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             Label("New RAM folder", systemImage: "folder.badge.plus").font(.title2.bold())
             Text("Use an existing folder at its usual path. RAMNest verifies a private local snapshot before moving any original files.").foregroundStyle(.secondary)
             HStack { VStack(alignment: .leading, spacing: 4) { Text("Mount at").font(.caption); Text(path?.path ?? "Choose an existing folder").lineLimit(3).textSelection(.enabled) }; Spacer(); Button("Choose…") { let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false; if panel.runModal() == .OK { path = panel.url } } }
-            TextField("Display name (optional)", text: $name).help("Display name in RAMNest. The mounted volume keeps the original folder name.")
+            TextField("Display name (optional)", text: $name).help("Display name in RAMNest. Files remain accessible at the original folder path.")
             HStack { Text("Capacity"); TextField("4", text: $size).frame(width: 100); Picker("Unit", selection: $unit) { Text("MB").tag("MB"); Text("GB").tag("GB") }.labelsHidden().frame(width: 100) }
             Text("16 MiB to \(formatted(ProcessInfo.processInfo.physicalMemory / 4 * 3)). The ceiling is not reserved in advance.").font(.caption).foregroundStyle(.secondary)
-            Toggle("Real-time LZ4 compression", isOn: $compression)
+            Text("Administrator authorization is required for bounded native mount operations. Close all files and mappings before saving. A mandatory privileged scan rejects remaining file/mapping references, even with Ignore Busy. Temporary mode restores the original and discards RAM changes.").font(.caption).foregroundStyle(.orange)
             Toggle("Save changes on eject", isOn: $sync)
             HStack { Spacer(); Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction); Button("Create and Mount") { create() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(path == nil || model.busy) }
         }.padding(28).frame(width: 530).onAppear { path = initialPath }.interactiveDismissDisabled(model.busy)
@@ -156,7 +152,7 @@ struct CreateFolderView: View {
     private func create() {
         guard let path, let engine = model.engine else { return }
         do {
-            let capacity = try SizeParser.parse(size + unit); var options = FolderOptions(); options.compression = compression; options.sync = sync
+            let capacity = try SizeParser.parse(size + unit); var options = FolderOptions(); options.sync = sync
             let chosen = options; let label = name.isEmpty ? nil : name
             dismiss()
             Task { await model.perform("Creating and mounting RAM folder…") { let folder = try engine.create(path: path, name: label, capacity: capacity, options: chosen); try engine.mount(folder.id.uuidString) } }
@@ -190,18 +186,12 @@ struct AppSettingsView: View {
                 }
                 if let error = model.storageError { Text(error).foregroundStyle(.red).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
             }
-            Picker("Backend for next mount", selection: Binding(get: { model.backend }, set: { model.setBackend($0) })) {
-                ForEach(Configuration.Backend.allCases, id: \.self) { backend in Text(backend.displayName).tag(backend) }
-            }.disabled(model.busy || model.engine == nil)
-            Text("Applies to the next new mount for all folders. Changing this setting leaves running mounts and their helpers unchanged.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            if model.backend == .fskit {
-                Text("FSKit requires the FUSE-T extension to be enabled through /Applications/fuse-t.app. New mounts use a private internal location and a symlink at your folder’s original path, including for external-volume folders. RAMNest does not fall back to another backend.").font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
-            }
-            if let error = model.backendError { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+            LabeledContent("Storage engine", value: "Native macOS tmpfs")
+            Text("New sessions use an internal root-owned mount slot and a journal-bound link at the original folder path. Each mount/control operation uses macOS administrator authorization. No permanent privileged service or FUSE dependency is installed. Legacy records retain their original backend for recovery.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Picker("File verification for next mount", selection: Binding(get: { model.fileVerification }, set: { model.setFileVerification($0) })) {
                 ForEach(FileVerification.allCases, id: \.self) { policy in Text(policy.displayName).tag(policy) }
             }.disabled(model.busy || model.engine == nil)
-            Text("Applies to new mounts for all folders. Running sessions and retained snapshots keep their recorded policy. Size and modification time skips regular-file content SHA-256; an edit with the same size and restored modification time can go undetected. RAM payload corruption can also go undetected when structural decoding succeeds. Bounds, decompression checks, symlinks, extended attributes and control metadata retain their checks.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text("Applies to new mounts for all folders. Running sessions and retained snapshots keep their recorded policy. Size and modification time skips regular-file content SHA-256; an edit with the same size and restored modification time can go undetected. Snapshot verification does not add checksums to ordinary kernel I/O. Symlinks, extended attributes and control metadata retain their checks.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let error = model.fileVerificationError { Text(error).foregroundStyle(.red).textSelection(.enabled) }
             Toggle("Show in menu bar instead of Dock", isOn: Binding(get: { model.menuBarMode }, set: { model.setMenuMode($0) })).disabled(model.busy || model.engine == nil)
             Toggle("Open at login", isOn: $login).disabled(model.busy).onChange(of: login) { _, enabled in

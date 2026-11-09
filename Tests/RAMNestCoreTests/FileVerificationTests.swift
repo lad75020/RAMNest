@@ -61,27 +61,11 @@ enum FileVerificationScenarios {
             try check(engine.setFileVerification(policy) == policy, "save/readback")
             try check(Engine(store: Store(root: store.root)).fileVerification() == policy, "reopen store")
             try check(Data(contentsOf: journalURL) == before, "next-mount setting leaves session byte-exact")
-            var prepared = journal; prepared.fileVerification = policy
-            let args = try engine.helperArguments(folder, journal: prepared, source: root)
-            try check(args.contains("--file-verification") == (policy != .sha256), "weak policy bound in helper startup arguments")
-            if policy != .sha256 { try check(args.last == policy.rawValue, "exact wire policy") }
         }
-        try HelperFileVerification.negotiate(.sha256) { throw NestError("old helper") }
-        try rejects { try HelperFileVerification.negotiate(.sizeAndModTime) { throw NestError("old helper") } }
-        try rejects { try HelperFileVerification.negotiate(.sizeAndModTime) { "unsupported" } }
-        try HelperFileVerification.negotiate(.sizeAndModTime) { HelperFileVerification.version }
-        journal.fileVerification = .sizeAndModTime
-        for reply in [[], [HelperFileVerification.version], [HelperFileVerification.version, "sha256"], ["unknown", "sizeAndModTime"]] {
-            try rejects { try HelperFileVerification.verify(journal) { _ in reply } }
-        }
-        try HelperFileVerification.verify(journal) { _ in [HelperFileVerification.version, "sizeAndModTime"] }
-        print("PASS persisted setting/reopen, next-mount journal isolation, helper propagation, old/unknown/mismatched helper rejection")
+        print("PASS persisted setting/reopen and immutable historical session policy")
         for policy in FileVerification.allCases { try roundTrip(root.appendingPathComponent(policy.rawValue), policy) }
         try legacyCompatibility(root.appendingPathComponent("legacy-bytes"))
         try legacyRestrictiveRecovery(root.appendingPathComponent("legacy-recovery"))
-#if DEBUG
-        try debugProfiles()
-#endif
         try transitions(root.appendingPathComponent("transitions"))
         try relocation(root.appendingPathComponent("relocation"))
         try cleanupHistory(root.appendingPathComponent("cleanup-history"))
@@ -140,43 +124,20 @@ enum FileVerificationScenarios {
         let exported = root.appendingPathComponent("exported")
         try Snapshot.copyTree(from: data, to: exported, manifest: expected, sourceContext: .managedRevision)
         try check(Snapshot.manifest(exported, matching: expected).matchesCopy(of: expected), "materialized export")
-        // Fresh native-format adoption uses the session policy, not Settings.
-        let stage = try store.volume(folder.id).appendingPathComponent("stage-\(UUID().uuidString)")
-        let copied = try Snapshot.copyTree(from: data, to: stage, manifest: expected, privateStorage: true, sourceContext: .managedRevision)
-        let modes = try StorageModes(copied); try modes.write(URL(fileURLWithPath: stage.path + ".modes"))
-        let adopted = try Snapshot.adoptExport(store: store, folder: folder, stage: stage, privateStorage: true, modeMapDigest: Snapshot.digest(modes.encoded), verification: policy)
-        try check(Snapshot.verified(store: store, id: folder.id, revision: adopted).1.fileVerification == policy, "adopted export authority")
-        // Exercise evacuation plus cold recovery against the real Swift engine.
-        var j = Journal(); j.session = UUID(); j.backend = .nfs; j.fileVerification = policy; j.phase = .preparing
-        j.revision = revision; j.initialRevision = revision; j.initialSourceManifest = observed
-        let engine = Engine(store: store, session: EngineSession(status: { _, _ in throw NestError("no helper in owned fixture") }))
-        _ = try engine.evacuateOriginal(folder, journal: &j, expected: observed)
-        j.phase = .recoveryRequired; try store.write(j, for: folder.id)
+        // Exercise cold checkpoint publication as a data transaction. Native
+        // root authorization and freeze ordering are covered in NativeTmpfsTests.
+        try FileManager.default.removeItem(at: source)
+        try Store.privateDirectory(source)
+        let identity = try DirectoryHandle.open(source).identity()
+        var currentFolder = folder; currentFolder.device = identity.device; currentFolder.inode = identity.inode
+        var current = try store.load(); current.folders = [currentFolder]; try store.save(current)
+        var pending = Journal(); pending.fileVerification = policy; pending.phase = .pendingRestore
+        pending.populationVerified = true; pending.revision = revision; pending.restoreRevision = revision
+        try store.write(pending, for: folder.id)
+        let engine = Engine(store: store)
         _ = try engine.setFileVerification(policy == .sha256 ? .sizeAndModTime : .sha256)
         try engine.recover(folder.id.uuidString)
-        try check(store.journal(folder.id).phase == .idle && Snapshot.manifest(source, matching: observed).matchesExpected(observed), "cold rollback uses recorded policy after Settings change")
-        // Exercise the actual save coordinator, then a cold checkpoint restore.
-        var live = Journal(); live.session = UUID(); live.backend = .nfs; live.fileVerification = policy; live.phase = .preparing
-        live.revision = revision; live.initialRevision = revision; live.initialSourceManifest = observed
-        _ = try engine.evacuateOriginal(folder, journal: &live, expected: observed)
-        live.phase = .mounted; live.populationVerified = true; live.socket = root.appendingPathComponent("fixture.sock").path
-        try store.write(live, for: folder.id)
-        let liveSession = EngineSession(request: { _, command in
-            if command == "verification-policy" { return [HelperFileVerification.version, policy.rawValue] }
-            if command == "capabilities" { return ["incremental-v1", "private-storage-v2", "trash-directory-exclusion-v1"] }
-            let fields = command.split(separator: "\t").map(String.init)
-            guard fields.first == "export3", fields.count == 2 else { throw NestError("Unexpected fixture request: \(command)") }
-            let stage = URL(fileURLWithPath: fields[1])
-            let copied = try Snapshot.copyTree(from: data, to: stage, manifest: expected, privateStorage: true, sourceContext: .managedRevision)
-            let modes = try StorageModes(copied); try modes.write(URL(fileURLWithPath: stage.path + ".modes"))
-            return ["1", "exported", "0", "0", UUID().uuidString, Snapshot.digest(modes.encoded)]
-        }, status: { _, _ in HelperStatus(id: folder.id, pid: getpid(), mounted: true, used: 0, capacity: folder.capacity, active: true) }, mountedIdentity: { _, _ in true })
-        try Engine(store: store, session: liveSession).save(folder.id.uuidString)
-        live = try store.journal(folder.id)
-        try check(live.revision != revision && live.fileVerification == policy, "real save coordinator adopts the journal policy")
-        live.restoreRevision = live.revision; live.phase = .pendingRestore; live.socket = nil; try store.write(live, for: folder.id)
-        try engine.recover(folder.id.uuidString)
-        try check(store.journal(folder.id).phase == .idle && Snapshot.manifest(source, matching: observed).matchesCopy(of: observed), "cold checkpoint restore")
+        try check(store.journal(folder.id).phase == .idle && Snapshot.manifest(source, matching: observed).matchesCopy(of: observed), "cold publication keeps recorded policy after preference change")
         let checkpoint = try store.journal(folder.id).revision!
         let checkpointData = try Snapshot.dataURL(store: store, id: folder.id, revision: checkpoint)
         let copiedFile = checkpointData.appendingPathComponent("payload")
@@ -314,29 +275,6 @@ extension FileVerificationScenarios {
         try check(observed.withUnsafeMutableBytes { pread(pinned, $0.baseAddress, $0.count, 0) } == bytes.count && observed == bytes, "published payload via pinned evidence")
         print("PASS cold restrictive publication recovery using digest from frozen pre-change encoder; mode 000 and pinned payload verified")
     }
-#if DEBUG
-    static func debugProfiles() throws {
-        let run = UUID()
-        let rows = DebugHelperProfile.metricNames.map { ["id": $0, "calls": 0, "ns": 0, "requested": 0, "returned": 0, "errors": 0, "histogram": [0,0,0,0,0]] as [String: Any] }
-        for policy in FileVerification.allCases {
-            var object: [String: Any] = ["version": 2, "integrityAlgorithm": policy.rawValue, "run": run.uuidString, "phase": "read", "backend": "nfs", "compression": true, "periodicMinutes": 0, "debugBuild": true, "clock": "steady_clock_ns", "elapsedNS": 0, "stopped": true, "expired": false, "inFlight": 0, "metrics": rows]
-            func frame() throws -> String { String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self) }
-            let profile = try DebugHelperProfile.parse([frame()], run: run, phase: "read", verification: policy)
-            try rejects { _ = try DebugHelperProfile.parse([frame()], run: run, phase: "read", verification: policy == .sha256 ? .sizeAndModTime : .sha256) }
-            var report = DebugBenchmarkReport(run: run, requestedBytes: 1, blockBytes: 1, mode: .read), phase = DebugBenchmarkPhase(phase: "read")
-            phase.helper = profile; report.phases = [phase]
-            try check(report.text.contains(policy == .sha256 ? "full logical 64 KiB SHA" : "regular-file payload SHA disabled"), "runtime report policy text")
-            if policy == .sizeAndModTime {
-                try check(profile.seconds(for: "sha256") == nil, "disabled SHA is N/A")
-                var changedRows = rows; changedRows[8]["calls"] = 1; changedRows[8]["requested"] = 65536; object["metrics"] = changedRows
-                try rejects { _ = try DebugHelperProfile.parse([frame()], run: run, phase: "read", verification: policy) }
-            }
-            object["integrityAlgorithm"] = "unknown"
-            try rejects { _ = try DebugHelperProfile.parse([frame()], run: run, phase: "read", verification: policy) }
-        }
-        print("PASS strict Debug v2 schema, both runtime algorithms, mismatched/unknown algorithm rejection, metadata SHA counter rejection and honest report text")
-    }
-#endif
 }
 
 extension FileVerificationScenarios {

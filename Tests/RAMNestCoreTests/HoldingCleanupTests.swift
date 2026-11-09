@@ -36,12 +36,12 @@ enum HoldingCleanupScenarios {
         scenario("temporary rollback removes empty holding and preserves original inode without RAM I/O") {
             let f = try Fixture(root, "temporary", temporary: true)
             let original = try DirectoryHandle.open(f.root.appendingPathComponent("originals")).entryStat("payload")
-            try Data("private RAM changes".utf8).write(to: f.helper.live.appendingPathComponent("payload"))
+            try Data("private RAM changes".utf8).write(to: f.data.source.appendingPathComponent("payload"))
             try f.finish()
             let restored = try DirectoryHandle.open(f.selected).entryStat("payload")
             try check(original.st_ino == restored.st_ino, "original inode returned")
             try check(try String(contentsOf: f.selected.appendingPathComponent("payload"), encoding: .utf8) == "original", "original data returned")
-            try check(f.helper.commands == [], "rollback exports no RAM and socket is cleared")
+            try check(f.data.captures == 0, "rollback exports no RAM and socket is cleared")
             try check(!FileManager.default.fileExists(atPath: f.root.appendingPathComponent("originals").path), "empty rollback holding removed")
         }
         scenario("active and uncertain holdings survive") {
@@ -121,7 +121,7 @@ enum HoldingCleanupScenarios {
         try f.editJournal { $0.initialRevision = initial }
         _ = try f.save("latest")
         var calls = 0, injected = false
-        var boundary = f.helper.boundary
+        var boundary = EngineSession()
         boundary.beforeCleanupUnlink = { parent, name in
             let current = try parent.identity()
             if current == (try DirectoryHandle.open(holding).identity()) {
@@ -133,7 +133,6 @@ enum HoldingCleanupScenarios {
             }
         }
         let engine = Engine(store: f.store, session: boundary)
-        f.helper.mounted = false
         try engine.finalize(f.folder.id.uuidString)
         try check(injected, "real unlink failure injected after first deletion")
         let j = try f.store.journal(f.folder.id)
@@ -222,11 +221,10 @@ enum HoldingCleanupScenarios {
     static func changedStage(_ root: URL) throws {
         for kind in ["unknown", "root", "data"] {
             let f = try Fixture(root, "stage-\(kind)")
-            var boundary = f.helper.boundary
-            let request = boundary.request
-            boundary.request = { socket, command in
-                let result = try request(socket, command)
-                if command == "retire", let stage = try f.store.journal(f.folder.id).restoreStage {
+            var injected = false
+            f.store.beforeJournalWrite = { next, _ in
+                if next.phase == .idle, !injected, let stage = next.restoreStage {
+                    injected = true
                     let stageURL = URL(fileURLWithPath: stage)
                     if kind == "unknown" { try Data("unknown".utf8).write(to: stageURL.appendingPathComponent("data/unknown")) }
                     else if kind == "root" {
@@ -237,10 +235,10 @@ enum HoldingCleanupScenarios {
                         try Store.privateDirectory(stageURL.appendingPathComponent("data"))
                     }
                 }
-                return result
             }
-            f.helper.mounted = false
-            try Engine(store: f.store, session: boundary).finalize(f.folder.id.uuidString)
+            try f.engine.finalize(f.folder.id.uuidString)
+            f.store.beforeJournalWrite = nil
+            try check(injected, "data stage mutation injected before cleanup")
             let j = try f.store.journal(f.folder.id)
             try check(j.phase == .idle && j.lastError == nil && j.cleanupWarning != nil, "stage anomaly nonfatal: \(kind)")
             try check(j.siblingCleanup?.contains { $0.kind == .restoreStage } == true, "stage provenance retained: \(kind)")
@@ -257,11 +255,10 @@ enum HoldingCleanupScenarios {
                 try DirectoryHandle.open(f.selected).renameNoReplace("payload", to: handle, as: "payload")
                 let identity = try handle.identity()
                 try f.editJournal {
-                    $0.phase = .mounted; $0.populationVerified = true; $0.socket = "owned-recorder"; $0.mountedDevice = 123
+                    $0.phase = .mounted; $0.populationVerified = true; $0.socket = nil; $0.mountedDevice = nil
                     $0.priorRevision = previous; $0.revision = revision; $0.initialRevision = revision; $0.restoreRevision = nil
                     $0.evacuation = holding.path; $0.evacuationDevice = identity.device; $0.evacuationInode = identity.inode
                 }
-                f.helper.mounted = true
             }
             _ = try f.save("cycle \(cycle)")
             try f.finish()
