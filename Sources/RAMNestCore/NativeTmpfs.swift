@@ -109,16 +109,6 @@ struct NativeMountObservation {
 enum NativeTmpfsControl {
     static let protocolVersion = "native-tmpfs-v1"
     static func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-    static func authorize(helper: URL, arguments: [String]) throws -> [String] {
-        let image = try NativeHelperImage.capture(helper: helper)
-        let script = try NativeHelperBootstrap.administratorScript(image: image, arguments: arguments)
-        let result: String
-        do { result = try Control.run("/usr/bin/osascript", ["-e", script], currentDirectory: URL(fileURLWithPath: "/")) }
-        catch { throw NestError((arguments.dropFirst().first == "freeze" ? "Native freeze/mapping validation failed; no checkpoint was authorized. " : "Native tmpfs control could not complete using one-shot macOS administrator authorization. ") + error.localizedDescription, code: arguments.dropFirst().first == "freeze" ? 78 : 2) }
-        let fields = result.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\t")
-        guard fields.first == "OK" else { throw NestError("Invalid native control receipt; inspect the owned slot before retrying.", code: 6) }
-        return Array(fields.dropFirst())
-    }
     static func arguments(_ operation: String, layout: LinkedFolderLayout, record: NativeTmpfsRecord) throws -> [String] {
         try layout.validate(); try record.validate()
         guard layout.version == 2, layout.session == record.session, record.uid == getuid(),

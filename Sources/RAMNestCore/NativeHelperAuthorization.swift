@@ -1,6 +1,129 @@
 import Foundation
 import Darwin
 import Security
+import Carbon
+
+/// A retained script, not a cache of credentials or successful command results.
+/// The seam lets tests count contexts and simulated prompts without authorization.
+protocol NativeAdministratorExecuting: AnyObject {
+    func execute(command: String) throws -> String
+    func finish()
+}
+
+struct NativeAppleScriptFailure: LocalizedError {
+    let number: Int
+    let message: String
+    var errorDescription: String? { "\(message) (AppleScript \(number))" }
+    var authorizationStopped: Bool {
+        number == -128 || number == Int(errAuthorizationCanceled) || number == Int(errAuthorizationDenied)
+    }
+    init(number: Int, message: String) { self.number = number; self.message = message }
+    init(_ info: NSDictionary?) {
+        number = (info?[NSAppleScript.errorNumber] as? NSNumber)?.intValue ?? -1
+        message = info?[NSAppleScript.errorMessage] as? String ?? "macOS could not execute the native administrator operation."
+    }
+}
+
+final class NativeAppleScriptContext: NativeAdministratorExecuting {
+    // Apple DTS confirms secondary-thread use since 10.6, provided work is
+    // serialized (developer.apple.com/forums/thread/759287). Include creation,
+    // compilation and disposal, across all operation-local instances.
+    private static let lock = NSLock()
+    private var script: NSAppleScript?
+
+    static func source(operation: UUID) -> String {
+        // TN2065: authentication belongs to this unchanged script, normally for
+        // five minutes. Commands are handler DATA; never recompile per step.
+        // A unique source also prevents reuse by a later user operation.
+        """
+        use scripting additions
+        property operationIdentity : "\(operation.uuidString)"
+        on ramnest_authorize(commandText)
+            return do shell script commandText with administrator privileges without altering line endings
+        end ramnest_authorize
+        """
+    }
+    init(source: String) throws {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        var info: NSDictionary?
+        guard let script = NSAppleScript(source: source), script.compileAndReturnError(&info) else {
+            throw NativeAppleScriptFailure(info)
+        }
+        self.script = script
+    }
+    func execute(command: String) throws -> String {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        guard let script else { throw NestError("Native administrator context is closed.", code: 2) }
+        let event = NSAppleEventDescriptor(eventClass: AEEventClass(kASAppleScriptSuite),
+            eventID: AEEventID(kASSubroutineEvent), targetDescriptor: nil,
+            returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+        event.setParam(NSAppleEventDescriptor(string: "ramnest_authorize"), forKeyword: AEKeyword(keyASSubroutineName))
+        let parameters = NSAppleEventDescriptor.list()
+        parameters.insert(NSAppleEventDescriptor(string: command), at: 1)
+        event.setParam(parameters, forKeyword: AEKeyword(keyDirectObject))
+        var info: NSDictionary?
+        guard let result = script.executeAppleEvent(event, error: &info) as NSAppleEventDescriptor?,
+              let text = result.stringValue, info == nil else { throw NativeAppleScriptFailure(info) }
+        return text
+    }
+    func finish() {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        script = nil
+    }
+    deinit { finish() }
+}
+
+/// Owned by ONE synchronous mount/save/eject/recovery call, including its error
+/// cleanup and linked restoration. Never stored on Engine, the journal or disk.
+/// Each step still captures compiled byte authority and stages/verifies a fresh
+/// root helper. No privileged process, socket or arbitrary-exec service survives.
+final class NativeTmpfsAuthorization {
+    private let helper: URL
+    private let capture: (URL) throws -> NativeHelperImage
+    private let makeScript: (String) throws -> any NativeAdministratorExecuting
+    private let source = NativeAppleScriptContext.source(operation: UUID())
+    private let lock = NSLock()
+    private var script: (any NativeAdministratorExecuting)?
+    private var slot: [String]?
+    private var stopped = false
+
+    init(helper: URL, capture: @escaping (URL) throws -> NativeHelperImage = { try NativeHelperImage.capture(helper: $0) },
+         makeScript: @escaping (String) throws -> any NativeAdministratorExecuting = { try NativeAppleScriptContext(source: $0) }) {
+        self.helper = helper; self.capture = capture; self.makeScript = makeScript
+    }
+    func authorize(arguments: [String]) throws -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        guard !stopped else { throw NestError("Native administrator operation was cancelled or closed; retry the user operation explicitly.", code: 2) }
+        let image = try capture(helper)
+        let command = try NativeHelperBootstrap.command(image: image, arguments: arguments)
+        let requestedSlot = Array(arguments.dropFirst(2).prefix(2))
+        guard requestedSlot.count == 2, slot == nil || slot == requestedSlot else {
+            throw NestError("Native administrator context cannot cross user/session slots.", code: 4)
+        }
+        slot = requestedSlot
+        let result: String
+        do {
+            if script == nil { script = try makeScript(source) }
+            result = try script!.execute(command: command)
+        } catch {
+            if script == nil || (error as? NativeAppleScriptFailure)?.authorizationStopped == true {
+                // A rollback may ask to thaw an already guarded tree. It must
+                // not open a second authorization dialog after Cancel/Denied.
+                stopped = true; script?.finish(); script = nil
+            }
+            let freeze = arguments.dropFirst().first == "freeze"
+            throw NestError((freeze ? "Native freeze/mapping validation failed; no checkpoint was authorized. " : "Native tmpfs control could not complete using operation-scoped macOS administrator authorization. ") + error.localizedDescription, code: freeze ? 78 : 2)
+        }
+        let fields = result.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\t")
+        guard fields.first == "OK" else { throw NestError("Invalid native control receipt; inspect the owned slot before retrying.", code: 6) }
+        return Array(fields.dropFirst())
+    }
+    func finish() {
+        lock.lock(); defer { lock.unlock() }
+        stopped = true; script?.finish(); script = nil
+    }
+    deinit { finish() }
+}
 
 /// The only expected byte authority is compiled into the Core image actually
 /// linked by this process. No manifest/path/environment supplies its value.
@@ -94,7 +217,7 @@ struct NativeHelperImage {
         try Paths.rejectSymlinks(provenance.path)
         let receipt = try JSONSerialization.jsonObject(with: Data(contentsOf: provenance)) as? [String: Any]
         // Mandatory on the real capture path, before any image can reach
-        // osascript/root staging. A self-signed replacement plus forged matching
+        // AppleScript/root staging. A self-signed replacement plus forged matching
         // receipt cannot change this process's compiled expected SHA256.
         try NativeHelperCompiledAuthority.current.require(pinnedDigest: digest, receipt: receipt)
         guard try codeHash(signedCode(executable)) == currentHash,
@@ -173,11 +296,8 @@ enum NativeHelperBootstrap {
         "$stage/helper" \(args)
         """
     }
-    static func administratorScript(image: NativeHelperImage, arguments: [String]) throws -> String {
-        let command = ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", "/bin/sh", "-c", try script(image: image, arguments: arguments)]
+    static func command(image: NativeHelperImage, arguments: [String]) throws -> String {
+        ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", "/bin/sh", "-c", try script(image: image, arguments: arguments)]
             .map(NativeTmpfsControl.shellQuote).joined(separator: " ")
-        let literal = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r")
-        return "do shell script \"" + literal + "\" with administrator privileges"
     }
 }

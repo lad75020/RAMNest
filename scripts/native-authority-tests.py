@@ -17,6 +17,20 @@ spec.loader.exec_module(authority)
 
 
 class NativeAuthorityTests(unittest.TestCase):
+    def test_operation_context_reaches_checkpoint_and_linked_release(self):
+        native = (ROOT / "Sources/RAMNestCore/Engine+NativeTmpfs.swift").read_text()
+        engine = (ROOT / "Sources/RAMNestCore/Engine.swift").read_text()
+        # These boundaries interleave unprivileged copies and durable journal
+        # writes. Losing the context on any edge recreates the reported prompts.
+        self.assertIn("captureNative(f, journal: &j, quiesce: true, authorization: authorization)", native)
+        self.assertIn("finalizeNative(ref, explicitRecovery: false, authorization: authorization)", native)
+        for temporary in ["true", "false"]:
+            self.assertIn("restoreLinkedOriginal(f, journal: &j, temporary: " + temporary + ", authorization: authorization)", native)
+        restore = engine.split("    func restoreLinkedOriginal(", 1)[1].split("    func finishLinkedRestore(", 1)[0]
+        self.assertEqual(restore.count("finishLinkedRestore(f, journal: &j, authorization: authorization)"), 3)
+        self.assertIn('nativeOperation("release", layout: layout, record: record, authorization: authorization)', engine)
+        self.assertNotIn('Control.run("/usr/bin/osascript"', (ROOT / "Sources/RAMNestCore/NativeTmpfs.swift").read_text())
+
     def setUp(self):
         scratch = ROOT / "artifacts/native-authority-static"
         scratch.mkdir(parents=True, exist_ok=True)
@@ -182,9 +196,9 @@ class NativeAuthorityTests(unittest.TestCase):
         self.assertLess(source.index("NativeHelperCompiledAuthority.current.require(pinnedDigest: digest, receipt: receipt)"),
                         source.index("return NativeHelperImage(source: helper"))
         self.assertNotIn("ProcessInfo.processInfo.environment", source)
-        dispatch = (ROOT / "Sources/RAMNestCore/NativeTmpfs.swift").read_text()
-        self.assertLess(dispatch.index("let image = try NativeHelperImage.capture(helper: helper)"),
-                        dispatch.index('Control.run("/usr/bin/osascript"'))
+        self.assertIn('capture: @escaping (URL) throws -> NativeHelperImage = { try NativeHelperImage.capture(helper: $0) }', source)
+        self.assertLess(source.index("let image = try capture(helper)"),
+                        source.index('result = try script!.execute(command: command)'))
         build = (ROOT / "scripts/build-native.sh").read_text()
         self.assertLess(build.index('/usr/bin/codesign --force --sign -'), build.rindex('python3 "$source_root/scripts/native-provenance.py"'))
         direct = (ROOT / "scripts/build.sh").read_text()
