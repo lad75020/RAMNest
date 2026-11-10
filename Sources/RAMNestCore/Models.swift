@@ -8,6 +8,7 @@ public struct NestError: Error, LocalizedError, Sendable {
         public static let unsafePath: Int32 = 4
         public static let retained: Int32 = 6
         public static let busy: Int32 = 7
+        public static let cancelled: Int32 = 8
         public static let usage: Int32 = 64
         public static let coherenceBlocked: Int32 = 78
     }

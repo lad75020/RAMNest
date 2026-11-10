@@ -10,6 +10,9 @@ import RAMNestCore
     @Published var draft: Folder?
     @Published var busy = false
     @Published var progress = ""
+    /// Step progress for mount/eject; nil while other work shows a spinner.
+    @Published private(set) var operation: OperationProgress.State?
+    private var activeOperation: OperationProgress?
     @Published var error: String?
     @Published var showCreate = false
     @Published var creationPath: URL?
@@ -99,7 +102,7 @@ import RAMNestCore
                 else {
                     for status in statuses where status.canMount && status.folder.options.mountAtLaunch {
                         guard engineGeneration == 0, !Task.isCancelled, !resetting, !movingStorage, storagePending == nil, self.engine === engine else { break }
-                        await perform("Mounting \(status.folder.name)…") { try engine.mount(status.id.uuidString) }
+                        await performTracked("Mounting \(status.folder.name)…", steps: Engine.progressSteps(mounting: true)) { try engine.mount(status.id.uuidString, progress: $0) }
                     }
                 }
             }
@@ -199,6 +202,28 @@ import RAMNestCore
         catch { self.error = error.localizedDescription }
         busy = false; progress = ""; await refresh()
     }
+    /// Runs a mount/eject with a determinate progress bar and a Cancel button.
+    /// The engine decides where Cancel is still safe; a cancel is not an error.
+    func performTracked(_ label: String, steps: Int, _ work: @escaping @Sendable (OperationProgress) throws -> Void) async {
+        guard !busy, !resetCommitted, !resetting else { return }
+        busy = true; progress = label
+        let tracker = OperationProgress(label, total: steps) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.syncOperation() }
+        }
+        activeOperation = tracker; operation = tracker.current
+        do { try await Task.detached(priority: .userInitiated) { try work(tracker) }.value }
+        catch where OperationProgress.isCancellation(error) {}
+        catch { self.error = error.localizedDescription }
+        activeOperation = nil; self.operation = nil
+        busy = false; progress = ""; await refresh()
+    }
+    // Reads the tracker's latest state, so out-of-order hops cannot regress it.
+    private func syncOperation() {
+        guard let activeOperation else { return }
+        let state = activeOperation.current
+        operation = state; progress = state.message
+    }
+    func cancelOperation() { activeOperation?.cancel() }
     func guarded(_ action: @escaping @MainActor () -> Void) {
         guard !busy, !resetCommitted, !resetting else { return }
         guard dirty else { action(); return }
@@ -235,13 +260,13 @@ import RAMNestCore
                         let processes = try await Task.detached { try engine.busyProcesses(s.id.uuidString) }.value
                         guard !self.busy, generation == self.engineGeneration else { return }
                         if !processes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            let alert = NSAlert(); alert.messageText = "Files are in use"; alert.informativeText = "Close the listed processes to finish their writes, or Ignore to attempt a normal eject. RAMNest will not terminate them.\n\n" + processes
-                            alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Ignore")
+                            let alert = NSAlert(); alert.messageText = "Files are in use"; alert.informativeText = "Quit these apps to finish their writes, or eject anyway. RAMNest won't close them.\n\n" + processes
+                            alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Eject Anyway")
                             if alert.runModal() != .alertSecondButtonReturn { return }
                         }
-                        await self.perform("Ejecting \(s.folder.name)…") { try engine.unmount(s.id.uuidString, ignoreBusy: true) }
+                        await self.performTracked("Ejecting \(s.folder.name)…", steps: Engine.progressSteps(mounting: false)) { try engine.unmount(s.id.uuidString, ignoreBusy: true, progress: $0) }
                     } catch { self.error = error.localizedDescription }
-                } else { await self.perform("Mounting \(s.folder.name)…") { try engine.mount(s.id.uuidString) } }
+                } else { await self.performTracked("Mounting \(s.folder.name)…", steps: Engine.progressSteps(mounting: true)) { try engine.mount(s.id.uuidString, progress: $0) } }
             }
         }
     }
@@ -351,14 +376,12 @@ import RAMNestCore
             }
         }
     }
-    func backendCaption(for status: FolderStatus) -> String {
-        if status.mounted {
-            return status.journal.backend.map { $0 == .tmpfs ? "Mounted with native macOS tmpfs" : "Legacy FUSE-T \($0.displayName) session · use original version to control" } ?? "Legacy session · backend not recorded"
-        }
-        if status.journal.phase != .idle {
-            return status.journal.backend.map { "Session engine: \($0.displayName)" } ?? "Session backend not recorded"
-        }
-        return "Next mount: native macOS tmpfs"
+    /// Only legacy or unrecorded sessions need a caption; native tmpfs is the default.
+    func backendCaption(for status: FolderStatus) -> String? {
+        guard status.mounted || status.journal.phase != .idle else { return nil }
+        guard let backend = status.journal.backend else { return "Legacy session · engine not recorded" }
+        if backend == .tmpfs { return nil }
+        return status.mounted ? "Legacy FUSE-T \(backend.displayName) session · use the original app version to control it" : "Session engine: \(backend.displayName)"
     }
     var resetButtonTitle: String { resetCommitted ? "Retry Restart…" : engine?.store.resetPending == true ? "Retry RESET…" : "RESET RAMNest…" }
     var canReset: Bool { engine != nil && !busy && !resetting && storagePending == nil }

@@ -243,7 +243,9 @@ public final class Engine: @unchecked Sendable {
             }
         }, beforeSiblingUnlink: session.beforeCleanupUnlink)
     }
-    public func mount(_ ref: String) throws { try mountNative(ref) }
+    public func mount(_ ref: String, progress: OperationProgress? = nil) throws { try mountNative(ref, progress: progress) }
+    /// Step counts for progress bars; `OperationProgress` advances one per step.
+    public static func progressSteps(mounting: Bool) -> Int { mounting ? mountSteps : unmountSteps }
     // Shared by the real mount coordinator and owned crash/lifecycle tests.
     func evacuateOriginal(_ f: Folder, journal j: inout Journal, expected: Manifest,
                           sourceBefore: VerifiedRenameReceipt.Observation? = nil) throws -> (DirectoryHandle,URL) {
@@ -496,11 +498,11 @@ public final class Engine: @unchecked Sendable {
         }
         return output
     }
-    public func unmount(_ ref: String, ignoreBusy: Bool = false) throws {
+    public func unmount(_ ref: String, ignoreBusy: Bool = false, progress: OperationProgress? = nil) throws {
         let f = try folder(ref), j = try store.journal(f.id)
         if j.phase == .idle { return }
         guard j.nativeTmpfs != nil else { throw NestError("A live historical session is unsupported. Finish it using its original version; this package contains no old storage engine.", code: NestError.Code.retained) }
-        try unmountNative(ref, ignoreBusy: ignoreBusy)
+        try unmountNative(ref, ignoreBusy: ignoreBusy, progress: progress)
     }
     public func finalize(_ ref: String) throws {
         if try store.journal(folder(ref).id).nativeTmpfs != nil { try finalizeNative(ref, explicitRecovery: false) }

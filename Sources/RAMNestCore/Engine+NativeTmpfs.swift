@@ -67,10 +67,12 @@ extension Engine {
             // Reconnection never thaws a guarded tree or changes checkpoints.
         }
     }
-    func mountNative(_ ref: String) throws {
+    static let mountSteps = 6
+    func mountNative(_ ref: String, progress: OperationProgress? = nil) throws {
         let authorization = NativeTmpfsAuthorization(helper: helper)
         defer { authorization.finish() }
         try volumeTransaction(ref) { current in
+            try progress?.step("Checking \(current.name)…", cancellable: true)
             var f = current, j = try store.journal(current.id)
             guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery retains the original, evidence and snapshots. Use explicit RESET before creating a new session.", code: NestError.Code.retained) }
             if j.nativeTmpfs != nil, (try? NativeTmpfsControl.observe(j)) != nil {
@@ -121,6 +123,9 @@ extension Engine {
             j.startupProtocol = nil; j.startupHelperPID = nil; j.startupRetired = nil
             try store.write(j, for: f.id)
             do {
+                // Cancellation before authorization takes the same idle rollback
+                // as a declined administrator prompt: nothing is reserved or moved.
+                try progress?.step("Saving a verified snapshot…", cancellable: true)
                 // Source snapshot is committed before either authorization or rename.
                 let before = try VerifiedRenameReceipt.observe(URL(fileURLWithPath: f.path), verification: j.fileVerification)
                 let revision = try Snapshot.capture(store: store, folder: f, source: URL(fileURLWithPath: f.path), previous: j.revision, verification: j.fileVerification)
@@ -131,10 +136,13 @@ extension Engine {
                 try store.write(j, for: f.id)
                 let (source, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
                 let sid = j.session!
+                try progress?.step("Waiting for administrator approval…", cancellable: true)
                 let reservation = try authorization.authorize(arguments: ["--native-v1", "reserve", String(getuid()), sid.uuidString])
                 j.nativeLink = try nativeSlot(f, session: sid, reply: reservation)
                 j.nativeTmpfs = NativeTmpfsRecord(session: sid, capacity: f.capacity)
                 try store.write(j, for: f.id)
+                // Point of no return: a native slot is reserved from here on.
+                try progress?.step("Creating the RAM disk…", cancellable: false)
                 // Keep originals in place during mount/population; failure is cheap.
                 let mounted = try nativeOperation("mount", layout: j.nativeLink!, record: j.nativeTmpfs!, nobrowse: f.options.nobrowse, authorization: authorization)
                 guard mounted.count == 3, let a = UInt32(mounted[0]), let b = UInt32(mounted[1]), UInt64(mounted[2]) != nil else {
@@ -144,6 +152,7 @@ extension Engine {
                 try store.write(j, for: f.id)
                 _ = try NativeTmpfsControl.observe(j, requireData: false, readonly: false)
                 try ensureNativePin(f, journal: &j)
+                try progress?.step("Copying files into RAM…", cancellable: false)
                 let copied = try Snapshot.copyTree(from: source, to: NativeTmpfsPaths.data(sid), manifest: expected,
                                                    publicationStaging: true, sourceContext: .managedRevision)
                 guard try copied.matchesCopy(of: expected) else { throw NestError("Native population copy mismatch; originals retained.", code: NestError.Code.retained) }
@@ -154,6 +163,7 @@ extension Engine {
                 // Read-only guards activation verification; it is not a save receipt.
                 guard try nativeOperation("readonly", layout: j.nativeLink!, record: j.nativeTmpfs!, authorization: authorization).isEmpty else { throw NestError("Invalid native read-only receipt.", code: NestError.Code.retained) }
                 _ = try NativeTmpfsControl.observe(j, readonly: true)
+                try progress?.step("Verifying and switching to RAM…", cancellable: false)
                 let (originalHandle, original) = try evacuateOriginal(f, journal: &j, expected: before.manifest, sourceBefore: before)
                 try verifyAndPublishPopulation(f, journal: &j, expected: copied, source: originalHandle, original: original)
                 try ensureNativePin(f, journal: &j)
@@ -161,6 +171,7 @@ extension Engine {
                 _ = try NativeTmpfsControl.observe(j, readonly: false)
                 try nativePeriod(f, journal: &j)
                 cleanSnapshots(f, &j)
+                progress?.finish()
             } catch {
                 j.lastError = error.localizedDescription; j.phase = .recoveryRequired
                 try store.write(j, for: f.id)
@@ -168,6 +179,7 @@ extension Engine {
                 // reply, nor remove a native slot without its recorded identity.
                 if j.nativeTmpfs == nil, j.evacuation == nil {
                     try Paths.checkedIdentity(f)
+                    if OperationProgress.isCancellation(error) { j.lastError = nil }
                     j.phase = .idle; try store.write(j, for: f.id)
                 }
                 throw error
@@ -222,9 +234,11 @@ extension Engine {
         return revision
     }
 
-    func unmountNative(_ ref: String, ignoreBusy: Bool) throws {
+    static let unmountSteps = 5
+    func unmountNative(_ ref: String, ignoreBusy: Bool, progress: OperationProgress? = nil) throws {
         let authorization = NativeTmpfsAuthorization(helper: helper)
         defer { authorization.finish() }
+        try progress?.step("Checking for open files…", cancellable: true)
         if !ignoreBusy {
             let busy = try busyProcesses(ref)
             guard busy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw NestError("Processes use this native volume. Close them or explicitly Ignore for a normal eject. Ignore cannot bypass the mandatory mapping/coherence guard.\n" + busy, code: NestError.Code.busy) }
@@ -232,6 +246,8 @@ extension Engine {
         try volumeTransaction(ref) { f in
             var j = try store.journal(f.id)
             if j.phase == .idle { return }
+            // Last safe stop: nothing is frozen, written or authorized yet.
+            try progress?.step("Preparing to eject…", cancellable: true)
             guard let layout = j.nativeLink, let record = j.nativeTmpfs else { throw NestError("Missing native mount authority.", code: NestError.Code.retained) }
             _ = try NativeTmpfsControl.observe(j, requireData: j.populationVerified)
             if j.phase == .ejecting {
@@ -246,6 +262,8 @@ extension Engine {
                 throw NestError("Native publication is pending; retain it for explicit recovery.", code: NestError.Code.retained)
             }
             if j.populationVerified { guard mountedIdentity(f, j) else { throw NestError("Managed native link changed; RAM retained.", code: NestError.Code.retained) } }
+            let saving = f.options.sync && j.populationVerified
+            try progress?.step(saving ? "Saving RAM contents…" : "Discarding RAM changes…", cancellable: false)
             try ensureNativePin(f, journal: &j)
             if f.options.sync && j.populationVerified {
                 // Mandatory, even when the caller selected Ignore Busy.
@@ -256,6 +274,7 @@ extension Engine {
                 _ = try NativeTmpfsControl.observe(j, requireData: j.populationVerified, readonly: true)
                 j.restoreRevision = j.initialRevision
             }
+            try progress?.step("Ejecting the RAM disk…", cancellable: false)
             j.phase = .ejecting; try store.write(j, for: f.id)
             // Closing this pin is bounded to the journal's same-user helper. No
             // other process is killed; ordinary umount still rejects other pins.
@@ -284,7 +303,9 @@ extension Engine {
                 throw failure
             }
         }
+        try progress?.step("Restoring your folder…", cancellable: false)
         try finalizeNative(ref, explicitRecovery: false, authorization: authorization)
+        progress?.finish()
     }
     func finalizeNative(_ ref: String, explicitRecovery: Bool, authorization supplied: NativeTmpfsAuthorization? = nil) throws {
         let authorization = supplied ?? NativeTmpfsAuthorization(helper: helper)
