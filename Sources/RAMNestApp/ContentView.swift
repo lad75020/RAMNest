@@ -180,7 +180,13 @@ struct AppSettingsView: View {
             Section {
                 Text(model.snapshotStoragePath.isEmpty ? "Storage unavailable" : model.snapshotStoragePath)
                     .font(.callout.monospaced()).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                Button("Move Snapshot Storage…") { model.chooseSnapshotStorage() }.disabled(!model.canMoveSnapshotStorage)
+                HStack {
+                    Button("Move Snapshot Storage…") { model.chooseSnapshotStorage() }.disabled(!model.canMoveSnapshotStorage)
+                    Button("Clean Snapshot Folder…", systemImage: "bubbles.and.sparkles", role: .destructive) { model.confirmCleanSnapshots() }
+                        .disabled(!model.canCleanSnapshots)
+                        .infoTip("Deletes snapshots of folders that aren't mounted and of folders removed from RAMNest. Original folders aren't touched.")
+                }
+                if let result = model.cleanSnapshotsResult { Text(result).font(.caption).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
                 if model.storageManager == nil { Text("Storage selection is unavailable for an explicit --store session.").font(.caption).foregroundStyle(.secondary) }
                 if let pending = model.storagePending {
                     Text(pending).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)

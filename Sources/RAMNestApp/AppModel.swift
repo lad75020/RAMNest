@@ -224,6 +224,42 @@ import RAMNestCore
         operation = state; progress = state.message
     }
     func cancelOperation() { activeOperation?.cancel() }
+
+    var canCleanSnapshots: Bool { engine != nil && !busy && !resetting && !resetCommitted && !movingStorage && storagePending == nil && !dirty }
+    /// Test seam: replaces the confirmation alert; nil shows the alert.
+    var cleanSnapshotsConfirmation: (@MainActor () -> Bool)?
+    @Published private(set) var cleanSnapshotsResult: String?
+    func confirmCleanSnapshots() {
+        guard canCleanSnapshots, let engine else { return }
+        let accepted: Bool
+        if let cleanSnapshotsConfirmation { accepted = cleanSnapshotsConfirmation() }
+        else {
+            let alert = NSAlert(); alert.alertStyle = .warning
+            alert.messageText = "Delete snapshots of folders that aren't mounted?"
+            alert.informativeText = "This deletes every saved snapshot of ejected folders and of folders you removed from RAMNest. Your original folders aren't touched. Mounted folders, and folders that need recovery, keep their snapshots. This can't be undone."
+            alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Delete Snapshots")
+            alert.buttons[0].keyEquivalent = "\r"; alert.buttons[1].keyEquivalent = ""
+            alert.buttons[1].hasDestructiveAction = true
+            accepted = alert.runModal() == .alertSecondButtonReturn
+        }
+        guard accepted else { return }
+        cleanSnapshotsResult = nil
+        Task {
+            let box = PurgeBox()
+            await perform("Deleting unused snapshots…") { box.report = try engine.purgeIdleSnapshots() }
+            if let report = box.report { cleanSnapshotsResult = Self.summary(report) }
+        }
+    }
+    nonisolated static func summary(_ r: SnapshotPurgeReport) -> String {
+        var parts: [String] = []
+        if r.removedSnapshots == 0 && r.removedUnlistedRecords == 0 { parts.append("No unused snapshots found.") }
+        else {
+            parts.append("Deleted \(r.removedSnapshots) snapshot\(r.removedSnapshots == 1 ? "" : "s").")
+            if r.removedUnlistedRecords > 0 { parts.append("Removed \(r.removedUnlistedRecords) record\(r.removedUnlistedRecords == 1 ? "" : "s") of folders no longer in RAMNest.") }
+        }
+        if !r.skipped.isEmpty { parts.append("Kept: " + r.skipped.joined(separator: " · ")) }
+        return parts.joined(separator: " ")
+    }
     func guarded(_ action: @escaping @MainActor () -> Void) {
         guard !busy, !resetCommitted, !resetting else { return }
         guard dirty else { action(); return }
@@ -514,3 +550,6 @@ enum MemoryReading {
         }
     }
 }
+
+/// Carries the purge report out of the detached operation (written once, read after it ends).
+final class PurgeBox: @unchecked Sendable { var report: SnapshotPurgeReport? }
