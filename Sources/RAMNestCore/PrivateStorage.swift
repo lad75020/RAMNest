@@ -23,10 +23,10 @@ struct StoredManifest: Codable {
             storageFormat = try c.decode(Int.self,forKey:.storageFormat)
             modeMapDigest = try c.decode(String.self,forKey:.modeMapDigest)
             guard storageFormat == 2, let digest = modeMapDigest, digest.utf8.count == 64,
-                  digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }), publicRoot != nil else { throw NestError("Unknown or malformed snapshot storage format.", code: 6) }
+                  digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }), publicRoot != nil else { throw NestError("Unknown or malformed snapshot storage format.", code: NestError.Code.retained) }
             _ = try StorageModes(logical)
         } else {
-            guard !c.contains(.modeMapDigest) else { throw NestError("Unversioned storage mode map.", code: 6) }
+            guard !c.contains(.modeMapDigest) else { throw NestError("Unversioned storage mode map.", code: NestError.Code.retained) }
             storageFormat = nil;modeMapDigest = nil
         }
     }
@@ -79,23 +79,23 @@ extension Snapshot {
                 st = try parent.entryStat(name)
                 let key = "\(st.st_dev):\(st.st_ino)"
                 if let mode = done[key] {
-                    guard record.kind == "file", mode == record.mode, st.st_mode & 0o7777 == mode else { throw NestError("Materialization hardlink/mode mismatch.", code: 6) }
+                    guard record.kind == Entry.Kind.file.rawValue, mode == record.mode, st.st_mode & 0o7777 == mode else { throw NestError("Materialization hardlink/mode mismatch.", code: NestError.Code.retained) }
                     receipt.identities.append(.init(path:record.path,device:Paths.deviceID(st.st_dev),inode:UInt64(st.st_ino),mode:mode,ctimeSeconds:Int64(st.st_ctimespec.tv_sec),ctimeNanos:Int64(st.st_ctimespec.tv_nsec)))
                     continue
                 }
-                fd = openat(parent.fd,name,O_RDONLY | O_CLOEXEC | (record.kind == "symlink" ? O_SYMLINK : O_NOFOLLOW))
+                fd = openat(parent.fd,name,O_RDONLY | O_CLOEXEC | (record.kind == Entry.Kind.symlink.rawValue ? O_SYMLINK : O_NOFOLLOW))
             }
-            guard fd >= 0 else { throw NestError("Cannot pin private materialization at \(diagnosticLabel(record.path)) (openat, errno \(errno)).", code: 6) }
+            guard fd >= 0 else { throw NestError("Cannot pin private materialization at \(diagnosticLabel(record.path)) (openat, errno \(errno)).", code: NestError.Code.retained) }
             defer { close(fd) }
             var pinned = stat()
             guard fstat(fd,&pinned) == 0, pinned.st_uid == getuid(), pinned.st_gid == getgid(),
                   record.path.isEmpty || (pinned.st_dev == st.st_dev && pinned.st_ino == st.st_ino),
-                  pinned.st_mode & 0o7777 == StorageModes.physical(record) else { throw NestError("Materialization identity/physical policy changed.", code: 6) }
-            guard fchmod(fd,mode_t(record.mode)) == 0 else { throw NestError("Cannot finalize private logical mode (fchmod, errno \(errno)).", code: 6) }
-            if record.kind == "symlink" { try containingDirectory?.sync() }
-            else { guard fsync(fd) == 0 else { throw NestError("Cannot sync final private logical mode (fsync, errno \(errno)).", code: 6) } }
+                  pinned.st_mode & 0o7777 == StorageModes.physical(record) else { throw NestError("Materialization identity/physical policy changed.", code: NestError.Code.retained) }
+            guard fchmod(fd,mode_t(record.mode)) == 0 else { throw NestError("Cannot finalize private logical mode (fchmod, errno \(errno)).", code: NestError.Code.retained) }
+            if record.kind == Entry.Kind.symlink.rawValue { try containingDirectory?.sync() }
+            else { guard fsync(fd) == 0 else { throw NestError("Cannot sync final private logical mode (fsync, errno \(errno)).", code: NestError.Code.retained) } }
             var final = stat()
-            guard fstat(fd,&final) == 0, final.st_dev == pinned.st_dev, final.st_ino == pinned.st_ino, final.st_mode & 0o7777 == record.mode else { throw NestError("Final logical mode/identity verification failed.", code: 6) }
+            guard fstat(fd,&final) == 0, final.st_dev == pinned.st_dev, final.st_ino == pinned.st_ino, final.st_mode & 0o7777 == record.mode else { throw NestError("Final logical mode/identity verification failed.", code: NestError.Code.retained) }
             done["\(final.st_dev):\(final.st_ino)"] = record.mode
             receipt.identities.append(.init(path:record.path,device:Paths.deviceID(final.st_dev),inode:UInt64(final.st_ino),mode:record.mode,ctimeSeconds:Int64(final.st_ctimespec.tv_sec),ctimeNanos:Int64(final.st_ctimespec.tv_nsec)))
         }
@@ -120,27 +120,27 @@ struct StorageModes {
         !path.contains("\0") && (path.isEmpty || path.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." && $0.utf8.count <= 255 })
     }
     init(_ manifest: Manifest) throws {
-        guard let root = manifest.publicRoot else { throw NestError("Private storage requires root metadata.", code: 6) }
+        guard let root = manifest.publicRoot else { throw NestError("Private storage requires root metadata.", code: NestError.Code.retained) }
         records = ([root] + manifest.entries).map { Record(path: $0.path, kind: $0.kind, mode: $0.mode) }.sorted { $0.path.utf8.lexicographicallyPrecedes($1.path.utf8) }
         try validate()
     }
     init(records: [Record]) throws { self.records = records.sorted { $0.path.utf8.lexicographicallyPrecedes($1.path.utf8) }; try validate() }
     func validate() throws {
-        guard records.count > 0, records.count <= Self.maximumRecords, records.first?.path == "", records.first?.kind == "directory" else { throw NestError("Invalid storage mode map root/count.", code: 6) }
+        guard records.count > 0, records.count <= Self.maximumRecords, records.first?.path == "", records.first?.kind == Entry.Kind.directory.rawValue else { throw NestError("Invalid storage mode map root/count.", code: NestError.Code.retained) }
         var seen: [String: String] = [:]
         var prior: String?
         var bytes = 12
         for r in records {
-            guard Self.validPath(r.path), ["directory", "file", "symlink"].contains(r.kind), r.mode <= 0o7777,
+            guard Self.validPath(r.path), [Entry.Kind.directory.rawValue, Entry.Kind.file.rawValue, Entry.Kind.symlink.rawValue].contains(r.kind), r.mode <= 0o7777,
                   seen.updateValue(r.kind, forKey: r.path) == nil,
-                  prior == nil || prior!.utf8.lexicographicallyPrecedes(r.path.utf8) else { throw NestError("Malformed, duplicate or unordered storage mode map.", code: 6) }
+                  prior == nil || prior!.utf8.lexicographicallyPrecedes(r.path.utf8) else { throw NestError("Malformed, duplicate or unordered storage mode map.", code: NestError.Code.retained) }
             if !r.path.isEmpty {
                 let parent = r.path.split(separator: "/").dropLast().joined(separator: "/")
-                guard seen[parent] == "directory" else { throw NestError("Storage mode map parent is missing or not a directory.", code: 6) }
+                guard seen[parent] == Entry.Kind.directory.rawValue else { throw NestError("Storage mode map parent is missing or not a directory.", code: NestError.Code.retained) }
             }
             prior = r.path
             let amount = r.path.utf8.count + 7
-            guard amount <= Self.maximumBytes - bytes else { throw NestError("Storage mode metadata byte bound exceeded.", code: 6) }
+            guard amount <= Self.maximumBytes - bytes else { throw NestError("Storage mode metadata byte bound exceeded.", code: NestError.Code.retained) }
             bytes += amount
         }
     }
@@ -148,29 +148,29 @@ struct StorageModes {
         var d = Self.magic
         func number(_ n: UInt32) { d.append(contentsOf: [UInt8((n >> 24) & 255), UInt8((n >> 16) & 255), UInt8((n >> 8) & 255), UInt8(n & 255)]) }
         number(UInt32(records.count))
-        for r in records { number(UInt32(r.path.utf8.count));d.append(contentsOf:r.path.utf8);d.append(r.kind == "directory" ? 1 : r.kind == "file" ? 2 : 3);d.append(UInt8(r.mode >> 8));d.append(UInt8(r.mode & 255)) }
+        for r in records { number(UInt32(r.path.utf8.count));d.append(contentsOf:r.path.utf8);d.append(r.kind == Entry.Kind.directory.rawValue ? 1 : r.kind == Entry.Kind.file.rawValue ? 2 : 3);d.append(UInt8(r.mode >> 8));d.append(UInt8(r.mode & 255)) }
         return d
     }
     init(data: Data) throws {
-        guard data.count <= Self.maximumBytes, data.starts(with: Self.magic) else { throw NestError("Unknown or malformed storage mode map.", code: 6) }
+        guard data.count <= Self.maximumBytes, data.starts(with: Self.magic) else { throw NestError("Unknown or malformed storage mode map.", code: NestError.Code.retained) }
         let bytes = [UInt8](data);var at = Self.magic.count
         func number() throws -> Int {
-            guard at + 4 <= bytes.count else { throw NestError("Truncated storage mode map.", code: 6) }
+            guard at + 4 <= bytes.count else { throw NestError("Truncated storage mode map.", code: NestError.Code.retained) }
             defer { at += 4 };return (0..<4).reduce(0) { ($0 << 8) | Int(bytes[at+$1]) }
         }
-        let count = try number();guard count > 0, count <= Self.maximumRecords, count <= (bytes.count-at)/7 else { throw NestError("Invalid storage mode count.", code: 6) }
+        let count = try number();guard count > 0, count <= Self.maximumRecords, count <= (bytes.count-at)/7 else { throw NestError("Invalid storage mode count.", code: NestError.Code.retained) }
         var result: [Record] = [];result.reserveCapacity(count)
         for _ in 0..<count {
             let size = try number()
-            guard size <= 1 << 20, at <= bytes.count - size - 3, let path = String(bytes:bytes[at..<at+size],encoding:.utf8) else { throw NestError("Invalid storage mode path.", code: 6) }
+            guard size <= 1 << 20, at <= bytes.count - size - 3, let path = String(bytes:bytes[at..<at+size],encoding:.utf8) else { throw NestError("Invalid storage mode path.", code: NestError.Code.retained) }
             at += size
-            let kind = bytes[at] == 1 ? "directory" : bytes[at] == 2 ? "file" : bytes[at] == 3 ? "symlink" : "invalid"
+            let kind = bytes[at] == 1 ? Entry.Kind.directory.rawValue : bytes[at] == 2 ? Entry.Kind.file.rawValue : bytes[at] == 3 ? Entry.Kind.symlink.rawValue : "invalid"
             result.append(Record(path:path,kind:kind,mode:UInt16(bytes[at+1]) << 8 | UInt16(bytes[at+2])));at += 3
         }
-        guard at == bytes.count else { throw NestError("Trailing storage mode metadata.", code: 6) }
+        guard at == bytes.count else { throw NestError("Trailing storage mode metadata.", code: NestError.Code.retained) }
         records = result;try validate()
     }
-    static func physical(_ record: Record) -> UInt16 { record.kind == "file" ? 0o600 : 0o700 }
+    static func physical(_ record: Record) -> UInt16 { record.kind == Entry.Kind.file.rawValue ? 0o600 : 0o700 }
     func projecting(_ observed: Manifest) throws -> Manifest {
         // The complete binary map has already passed format, digest, namespace
         // and manifest correspondence checks. Project only directory subtrees.
@@ -180,36 +180,36 @@ struct StorageModes {
             while !parts.isEmpty { if excluded.contains(parts.joined(separator:"/")) { return false };parts.removeLast() }
             return true
         }
-        guard observed.publicRoot != nil, included.count == observed.entries.count + 1 else { throw NestError("Private storage namespace/map mismatch.", code: 6) }
+        guard observed.publicRoot != nil, included.count == observed.entries.count + 1 else { throw NestError("Private storage namespace/map mismatch.", code: NestError.Code.retained) }
         let modes = Dictionary(uniqueKeysWithValues:included.map { ($0.path,$0) })
         var groups: [String:UInt16] = [:]
-        for e in observed.entries where e.kind == "file" {
+        for e in observed.entries where e.isRegularFile {
             let group = e.hardlink ?? e.path
-            guard let mode = modes[e.path]?.mode, groups[group] == nil || groups[group] == mode else { throw NestError("Inconsistent logical modes within a hardlink class.", code: 6) }
+            guard let mode = modes[e.path]?.mode, groups[group] == nil || groups[group] == mode else { throw NestError("Inconsistent logical modes within a hardlink class.", code: NestError.Code.retained) }
             groups[group] = mode
         }
         func entry(_ e: Entry) throws -> Entry {
-            guard let r = modes[e.path], r.kind == e.kind, e.mode == Self.physical(r) else { throw NestError("Private storage physical policy mismatch at \(Snapshot.diagnosticLabel(e.path.isEmpty ? "." : e.path)).", code: 6) }
+            guard let r = modes[e.path], r.kind == e.kind, e.mode == Self.physical(r) else { throw NestError("Private storage physical policy mismatch at \(Snapshot.diagnosticLabel(e.path.isEmpty ? "." : e.path)).", code: NestError.Code.retained) }
             var result = e;result.mode = r.mode;return result
         }
         return try Manifest(entries:observed.entries.map(entry),publicRoot:entry(observed.publicRoot!),fileVerification:observed.fileVerification)
     }
     static func read(_ url: URL) throws -> Data {
         let fd = open(url.path,O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else { throw NestError("Cannot open storage mode map (open, errno \(errno)).", code: 6) }
+        guard fd >= 0 else { throw NestError("Cannot open storage mode map (open, errno \(errno)).", code: NestError.Code.retained) }
         defer { close(fd) };var st = stat()
         guard fstat(fd,&st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_mode & 0o7777 == 0o600,
-              st.st_uid == getuid(), st.st_gid == getgid(), st.st_nlink == 1, st.st_size >= 0, st.st_size <= maximumBytes else { throw NestError("Invalid private storage mode map inode/policy.", code: 6) }
+              st.st_uid == getuid(), st.st_gid == getgid(), st.st_nlink == 1, st.st_size >= 0, st.st_size <= maximumBytes else { throw NestError("Invalid private storage mode map inode/policy.", code: NestError.Code.retained) }
         let data = try FileHandle(fileDescriptor:fd,closeOnDealloc:false).readToEnd() ?? Data()
         var after = stat()
-        guard fstat(fd,&after) == 0, st.st_size == after.st_size, st.st_ctimespec == after.st_ctimespec, data.count == Int(st.st_size) else { throw NestError("Storage mode map changed while reading.", code: 6) }
+        guard fstat(fd,&after) == 0, st.st_size == after.st_size, st.st_ctimespec == after.st_ctimespec, data.count == Int(st.st_size) else { throw NestError("Storage mode map changed while reading.", code: NestError.Code.retained) }
         return data
     }
     func write(_ url: URL) throws {
         let fd = open(url.path,O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,0o600)
-        guard fd >= 0 else { throw NestError("Cannot create private storage mode map.", code: 6) };defer { close(fd) }
+        guard fd >= 0 else { throw NestError("Cannot create private storage mode map.", code: NestError.Code.retained) };defer { close(fd) }
         try FileHandle(fileDescriptor:fd,closeOnDealloc:false).write(contentsOf:encoded)
-        guard fchmod(fd,0o600) == 0, fsync(fd) == 0 else { throw NestError("Cannot sync private storage mode map.", code: 6) }
+        guard fchmod(fd,0o600) == 0, fsync(fd) == 0 else { throw NestError("Cannot sync private storage mode map.", code: NestError.Code.retained) }
     }
 }
 
@@ -235,7 +235,7 @@ struct SnapshotCopyObservations: Codable {
         let volumes = volume.deletingLastPathComponent()
         guard data.lastPathComponent == "data", UUID(uuidString: revision.lastPathComponent) != nil,
               revisions.lastPathComponent == "revisions", UUID(uuidString: volume.lastPathComponent) != nil,
-              volumes.lastPathComponent == "volumes" else { throw NestError("Invalid revision observation path.", code: 6) }
+              volumes.lastPathComponent == "volumes" else { throw NestError("Invalid revision observation path.", code: NestError.Code.retained) }
         return (volumes.deletingLastPathComponent(), volume.lastPathComponent + "/" + revision.lastPathComponent)
     }
     static func read(_ root: URL) throws -> SnapshotCopyObservations? {
@@ -247,12 +247,12 @@ struct SnapshotCopyObservations: Codable {
         let value = try StorageRelocation.read(Self.self, in: directory, name: name)
         let after = try directory.entryStat(name)
         guard before.st_dev == after.st_dev, before.st_ino == after.st_ino, before.st_ctimespec == after.st_ctimespec,
-              before.st_size == after.st_size, before.st_mode == after.st_mode else { throw NestError("Relocation observations changed during read.", code: 6) }
+              before.st_size == after.st_size, before.st_mode == after.st_mode else { throw NestError("Relocation observations changed during read.", code: NestError.Code.retained) }
         guard value.version == 1, value.device == identity.device, value.inode == identity.inode,
-              value.revisions.count <= 100_000 else { throw NestError("Invalid relocated copy observations.", code: 6) }
+              value.revisions.count <= 100_000 else { throw NestError("Invalid relocated copy observations.", code: NestError.Code.retained) }
         for key in value.revisions.keys {
             let parts = key.split(separator: "/", omittingEmptySubsequences: false)
-            guard parts.count == 2, parts.allSatisfy({ UUID(uuidString: String($0)) != nil }) else { throw NestError("Malformed relocated revision key.", code: 6) }
+            guard parts.count == 2, parts.allSatisfy({ UUID(uuidString: String($0)) != nil }) else { throw NestError("Malformed relocated revision key.", code: NestError.Code.retained) }
         }
         return value
     }
@@ -264,7 +264,7 @@ struct SnapshotCopyObservations: Codable {
         guard Snapshot.digest(manifestBytes) == record.manifestDigest,
               metadata.modeMapDigest == record.modeMapDigest,
               record.basis.matchesExpected(try metadata.logical.excludingTrashDirectories()),
-              try record.observed.matchesCopy(of: record.basis) else { throw NestError("Relocated revision copy observation is not bound to its immutable manifest.", code: 6) }
+              try record.observed.matchesCopy(of: record.basis) else { throw NestError("Relocated revision copy observation is not bound to its immutable manifest.", code: NestError.Code.retained) }
         var result = metadata
         let entries = Dictionary(uniqueKeysWithValues: record.observed.entries.map { ($0.path, $0) })
         result.entries = metadata.entries.map { entries[$0.path] ?? $0 }; result.publicRoot = record.observed.publicRoot

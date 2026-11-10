@@ -12,7 +12,7 @@ import Darwin
         do {
             guard Bundle.main.bundleIdentifier == "sh.ramnest.app", Bundle.main.bundleURL.pathExtension == "app",
                   args.count == 2, ["get", "enable", "disable"].contains(args[1]) else {
-                throw NestError("Invalid app-owned login-item request.", code: 64)
+                throw NestError("Invalid app-owned login-item request.", code: NestError.Code.usage)
             }
             switch args[1] {
             case "enable": try SMAppService.mainApp.register()

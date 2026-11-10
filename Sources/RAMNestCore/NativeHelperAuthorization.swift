@@ -53,7 +53,7 @@ final class NativeAppleScriptContext: NativeAdministratorExecuting {
     }
     func execute(command: String) throws -> String {
         Self.lock.lock(); defer { Self.lock.unlock() }
-        guard let script else { throw NestError("Native administrator context is closed.", code: 2) }
+        guard let script else { throw NestError("Native administrator context is closed.", code: NestError.Code.helper) }
         let event = NSAppleEventDescriptor(eventClass: AEEventClass(kASAppleScriptSuite),
             eventID: AEEventID(kASSubroutineEvent), targetDescriptor: nil,
             returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
@@ -93,12 +93,12 @@ final class NativeTmpfsAuthorization {
     }
     func authorize(arguments: [String]) throws -> [String] {
         lock.lock(); defer { lock.unlock() }
-        guard !stopped else { throw NestError("Native administrator operation was cancelled or closed; retry the user operation explicitly.", code: 2) }
+        guard !stopped else { throw NestError("Native administrator operation was cancelled or closed; retry the user operation explicitly.", code: NestError.Code.helper) }
         let image = try capture(helper)
         let command = try NativeHelperBootstrap.command(image: image, arguments: arguments)
         let requestedSlot = Array(arguments.dropFirst(2).prefix(2))
         guard requestedSlot.count == 2, slot == nil || slot == requestedSlot else {
-            throw NestError("Native administrator context cannot cross user/session slots.", code: 4)
+            throw NestError("Native administrator context cannot cross user/session slots.", code: NestError.Code.unsafePath)
         }
         slot = requestedSlot
         let result: String
@@ -115,7 +115,7 @@ final class NativeTmpfsAuthorization {
             throw NestError((freeze ? "Native freeze/mapping validation failed; no checkpoint was authorized. " : "Native tmpfs control could not complete using operation-scoped macOS administrator authorization. ") + error.localizedDescription, code: freeze ? 78 : 2)
         }
         let fields = result.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\t")
-        guard fields.first == "OK" else { throw NestError("Invalid native control receipt; inspect the owned slot before retrying.", code: 6) }
+        guard fields.first == "OK" else { throw NestError("Invalid native control receipt; inspect the owned slot before retrying.", code: NestError.Code.retained) }
         return Array(fields.dropFirst())
     }
     func finish() {
@@ -141,7 +141,7 @@ public struct NativeHelperCompiledAuthority: Codable, Equatable, Sendable {
               ["Debug", "Release"].contains(configuration), pinnedDigest == sha256,
               receipt?["engine"] as? String == engine, receipt?["helperSHA256"] as? String == sha256,
               receipt?["configuration"] as? String == (configuration == "Debug" ? "Debug" : "RelWithDebInfo") else {
-            throw NestError("Native helper bytes/provenance do not match the authority compiled into this running RAMNest. Rebuild a coherent package; no administrator operation was started.", code: 4)
+            throw NestError("Native helper bytes/provenance do not match the authority compiled into this running RAMNest. Rebuild a coherent package; no administrator operation was started.", code: NestError.Code.unsafePath)
         }
     }
 }
@@ -157,12 +157,12 @@ struct NativeHelperImage {
     private static func signedCode(_ url: URL, nested: Bool = false) throws -> SecStaticCode {
         var code: SecStaticCode?
         guard SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess, let code else {
-            throw NestError("Cannot authenticate packaged native code.", code: 4)
+            throw NestError("Cannot authenticate packaged native code.", code: NestError.Code.unsafePath)
         }
         var flags = kSecCSStrictValidate | kSecCSCheckAllArchitectures
         if nested { flags |= kSecCSCheckNestedCode }
         guard SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: flags), nil) == errSecSuccess else {
-            throw NestError("Packaged native code signature/resource validation failed.", code: 4)
+            throw NestError("Packaged native code signature/resource validation failed.", code: NestError.Code.unsafePath)
         }
         return code
     }
@@ -170,7 +170,7 @@ struct NativeHelperImage {
         var info: CFDictionary?
         guard SecCodeCopySigningInformation(code, [], &info) == errSecSuccess,
               let hash = (info as? [String: Any])?[kSecCodeInfoUnique as String] as? Data else {
-            throw NestError("Missing packaged native code identity.", code: 4)
+            throw NestError("Missing packaged native code identity.", code: NestError.Code.unsafePath)
         }
         return hash.map { String(format: "%02x", $0) }.joined()
     }
@@ -178,31 +178,31 @@ struct NativeHelperImage {
         var running: SecCode?
         guard SecCodeCopySelf([], &running) == errSecSuccess, let running,
               SecCodeCheckValidity(running, SecCSFlags(rawValue: kSecCSStrictValidate), nil) == errSecSuccess else {
-            throw NestError("Running RAMNest code identity is not valid.", code: 4)
+            throw NestError("Running RAMNest code identity is not valid.", code: NestError.Code.unsafePath)
         }
         let app = helper.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let executable = BinaryLocation.executable
         guard app.pathExtension == "app", helper == app.appendingPathComponent("Contents/Helpers/ramnest-helper"),
               [app.appendingPathComponent("Contents/MacOS/RAMNest"), app.appendingPathComponent("Contents/Helpers/ramnest")].contains(executable),
               Bundle(url: app)?.bundleIdentifier == "sh.ramnest.app" else {
-            throw NestError("Administrator operations require the helper in the same signed RAMNest app as the running app/CLI.", code: 4)
+            throw NestError("Administrator operations require the helper in the same signed RAMNest app as the running app/CLI.", code: NestError.Code.unsafePath)
         }
         try Paths.rejectSymlinks(helper.path)
         let fd = open(helper.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-        guard fd >= 0 else { throw NestError("Cannot pin packaged native helper bytes.", code: 4) }
+        guard fd >= 0 else { throw NestError("Cannot pin packaged native helper bytes.", code: NestError.Code.unsafePath) }
         defer { close(fd) }
         var before = stat()
         guard fstat(fd, &before) == 0, before.st_mode & S_IFMT == S_IFREG, before.st_nlink == 1,
               before.st_uid == getuid() || before.st_uid == 0,
               before.st_mode & 0o022 == 0, before.st_size > 0, before.st_size <= 32 << 20 else {
-            throw NestError("Packaged native helper type/ownership/size is unsafe.", code: 4)
+            throw NestError("Packaged native helper type/ownership/size is unsafe.", code: NestError.Code.unsafePath)
         }
         func readPinned() throws -> Data {
-            guard lseek(fd, 0, SEEK_SET) == 0 else { throw NestError("Cannot seek pinned native image.", code: 4) }
+            guard lseek(fd, 0, SEEK_SET) == 0 else { throw NestError("Cannot seek pinned native image.", code: NestError.Code.unsafePath) }
             var result = Data(), buffer = [UInt8](repeating: 0, count: 65536)
             while result.count < before.st_size {
                 let n = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, min($0.count, Int(before.st_size) - result.count)) }
-                guard n > 0 else { throw NestError("Packaged native image changed during capture.", code: 4) }
+                guard n > 0 else { throw NestError("Packaged native image changed during capture.", code: NestError.Code.unsafePath) }
                 result.append(contentsOf: buffer.prefix(n))
             }
             return result
@@ -224,14 +224,14 @@ struct NativeHelperImage {
               try codeHash(signedCode(helper)) == hash,
               SecCodeCheckValidity(running, SecCSFlags(rawValue: kSecCSStrictValidate), nil) == errSecSuccess,
               Snapshot.digest(try readPinned()) == digest else {
-            throw NestError("Packaged native helper/provenance changed before authorization.", code: 4)
+            throw NestError("Packaged native helper/provenance changed before authorization.", code: NestError.Code.unsafePath)
         }
         var after = stat(), named = stat()
         guard fstat(fd, &after) == 0, lstat(helper.path, &named) == 0,
               after.st_dev == before.st_dev, after.st_ino == before.st_ino, after.st_size == before.st_size,
               after.st_mtimespec == before.st_mtimespec, after.st_ctimespec == before.st_ctimespec,
               named.st_dev == before.st_dev, named.st_ino == before.st_ino else {
-            throw NestError("Packaged native helper identity changed before authorization.", code: 4)
+            throw NestError("Packaged native helper identity changed before authorization.", code: NestError.Code.unsafePath)
         }
         return NativeHelperImage(source: helper, bytes: bytes.count, digest: digest)
     }
@@ -245,7 +245,7 @@ enum NativeHelperBootstrap {
     static func copyVerification(source: URL, bytes: Int, digest: String) throws -> String {
         guard source.isFileURL, source.path.hasPrefix("/"), !source.path.contains(where: { $0 == "\0" || $0.isNewline }),
               bytes > 0, bytes <= 32 << 20, digest.count == 64, digest.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
-            throw NestError("Invalid captured native image authority.", code: 4)
+            throw NestError("Invalid captured native image authority.", code: NestError.Code.unsafePath)
         }
         let source = NativeTmpfsControl.shellQuote(source.path)
         return """
@@ -262,7 +262,7 @@ enum NativeHelperBootstrap {
     }
     static func script(image: NativeHelperImage, arguments: [String]) throws -> String {
         guard arguments.first == "--native-v1", arguments.allSatisfy({ !$0.contains("\0") && !$0.contains(where: \.isNewline) }) else {
-            throw NestError("Invalid bounded native operation.", code: 4)
+            throw NestError("Invalid bounded native operation.", code: NestError.Code.unsafePath)
         }
         let copy = try copyVerification(source: image.source, bytes: image.bytes, digest: image.digest)
         let args = arguments.map(NativeTmpfsControl.shellQuote).joined(separator: " ")

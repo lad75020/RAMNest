@@ -11,7 +11,7 @@ extension Engine {
     private func nativeSlot(_ folder: Folder, session: UUID, reply: [String]) throws -> LinkedFolderLayout {
         guard reply.count == 4, let rd = UInt64(reply[0]), let ri = UInt64(reply[1]),
               let md = UInt64(reply[2]), let mi = UInt64(reply[3]), ri > 0, mi > 0 else {
-            throw NestError("Invalid native reservation receipt; originals unchanged. Retain the slot for inspection.", code: 6)
+            throw NestError("Invalid native reservation receipt; originals unchanged. Retain the slot for inspection.", code: NestError.Code.retained)
         }
         let selected = URL(fileURLWithPath: folder.path)
         let parent = try DirectoryHandle.open(selected.deletingLastPathComponent())
@@ -31,7 +31,7 @@ extension Engine {
         _ = try NativeTmpfsControl.observe(j, requireData: j.populationVerified)
         if let socket = j.socket, let status = try? Control.status(j, id: f.id), status.mounted,
            (try? Control.request(socket, "capabilities", timeout: 2)) == [NativeTmpfsControl.protocolVersion] { return }
-        guard let record = j.nativeTmpfs, let fs = record.filesystem else { throw NestError("Missing native pin identity.", code: 6) }
+        guard let record = j.nativeTmpfs, let fs = record.filesystem else { throw NestError("Missing native pin identity.", code: NestError.Code.retained) }
         let socket = try Paths.socketDirectory(for: store).appendingPathComponent("\(UUID().uuidString).sock").path
         // Never unlink/reuse a predecessor socket. A failed launch remains explicit.
         j.socket = socket; try store.write(j, for: f.id)
@@ -42,7 +42,7 @@ extension Engine {
                (try? Control.request(socket, "capabilities", timeout: 2)) == [NativeTmpfsControl.protocolVersion] { return }
             session.sleep(0.05)
         }
-        throw NestError("Native mount exists but its ordinary-user pin did not become ready. Retain the session and retry mount/recovery; do not create another mount.", code: 2)
+        throw NestError("Native mount exists but its ordinary-user pin did not become ready. Retain the session and retry mount/recovery; do not create another mount.", code: NestError.Code.helper)
     }
     func nativePeriod(_ f: Folder, journal: inout Journal, allowDisconnected: Bool = false) throws {
         // Periodic saves obey the same mandatory root mapping gate as Save.
@@ -53,15 +53,15 @@ extension Engine {
         try store.write(journal, for: f.id) // Retire all previously queued work before IPC.
         guard let socket = journal.socket, (try? Control.status(journal, id: f.id))?.mounted == true else {
             if allowDisconnected { return }
-            throw NestError("Native pin is unavailable.", code: 2)
+            throw NestError("Native pin is unavailable.", code: NestError.Code.helper)
         }
-        guard try Control.request(socket, "period\t\(minutes)\t\(ticket?.uuidString ?? "-")\t\(journal.fileVerification.rawValue)").isEmpty else { throw NestError("Invalid native period reply.", code: 6) }
+        guard try Control.request(socket, "period\t\(minutes)\t\(ticket?.uuidString ?? "-")\t\(journal.fileVerification.rawValue)").isEmpty else { throw NestError("Invalid native period reply.", code: NestError.Code.retained) }
     }
     public func reconnect(_ ref: String) throws {
         try volumeTransaction(ref) { f in
             var j = try store.journal(f.id)
             guard j.nativeTmpfs != nil, j.populationVerified, j.phase == .mounted, mountedIdentity(f, j) else {
-                throw NestError("Only an exact surviving verified native session can reconnect.", code: 6)
+                throw NestError("Only an exact surviving verified native session can reconnect.", code: NestError.Code.retained)
             }
             try ensureNativePin(f, journal: &j); try nativePeriod(f, journal: &j)
             // Reconnection never thaws a guarded tree or changes checkpoints.
@@ -72,28 +72,28 @@ extension Engine {
         defer { authorization.finish() }
         try volumeTransaction(ref) { current in
             var f = current, j = try store.journal(current.id)
-            guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery retains the original, evidence and snapshots. Use explicit RESET before creating a new session.", code: 6) }
+            guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery retains the original, evidence and snapshots. Use explicit RESET before creating a new session.", code: NestError.Code.retained) }
             if j.nativeTmpfs != nil, (try? NativeTmpfsControl.observe(j)) != nil {
                 guard j.populationVerified, j.phase == .mounted, mountedIdentity(f, j) else {
-                    throw NestError("Native mount remains guarded or has an incomplete transaction. Retain it for explicit recovery.", code: 6)
+                    throw NestError("Native mount remains guarded or has an incomplete transaction. Retain it for explicit recovery.", code: NestError.Code.retained)
                 }
                 try ensureNativePin(f, journal: &j)
                 if try NativeTmpfsControl.observe(j).readOnly {
                     j.quiescedRevision = nil; j.quiescedSession = nil; j.nativeTmpfs?.quiescence = nil
                     j.nativeTmpfs?.managedUnmount = false; try store.write(j, for: f.id)
                     let reply = try nativeOperation("thaw", layout: j.nativeLink!, record: j.nativeTmpfs!, authorization: authorization)
-                    guard reply.isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
+                    guard reply.isEmpty else { throw NestError("Invalid native thaw receipt.", code: NestError.Code.retained) }
                     _ = try NativeTmpfsControl.observe(j, readonly: false)
                 }
                 try nativePeriod(f, journal: &j); return
             }
-            guard j.phase == .idle else { throw NestError("Unclean session requires explicit recovery. Native RAMNest does not adopt legacy or unknown mounts.", code: 6) }
+            guard j.phase == .idle else { throw NestError("Unclean session requires explicit recovery. Native RAMNest does not adopt legacy or unknown mounts.", code: NestError.Code.retained) }
             if let prior = j.managedLink {
-                guard prior.stage == .restored, prior.mountReleased else { throw NestError("Previous layout is not fully retired.", code: 6) }
+                guard prior.stage == .restored, prior.mountReleased else { throw NestError("Previous layout is not fully retired.", code: NestError.Code.retained) }
             }
             guard FileManager.default.isExecutableFile(atPath: helper.path),
                   try Control.run(helper.path, ["--capabilities"]).trimmingCharacters(in: .whitespacesAndNewlines) == NativeTmpfsControl.protocolVersion else {
-                throw NestError("Use the packaged native tmpfs helper; no FUSE fallback is available.", code: 2)
+                throw NestError("Use the packaged native tmpfs helper; no FUSE fallback is available.", code: NestError.Code.helper)
             }
             SiblingCleanup.rememberCompleted(f, &j)
             // Clear historical/live fields together. Every durable intermediate
@@ -106,7 +106,7 @@ extension Engine {
             _ = try Paths.validate(URL(fileURLWithPath: f.path), store: store, folders: config.folders, excluding: f.id)
             try store.locked {
                 var latest = try store.load()
-                guard let i = latest.folders.firstIndex(where: { $0.id == f.id }) else { throw NestError("Folder removed.", code: 6) }
+                guard let i = latest.folders.firstIndex(where: { $0.id == f.id }) else { throw NestError("Folder removed.", code: NestError.Code.retained) }
                 _ = try Paths.validate(URL(fileURLWithPath: f.path), store: store, folders: latest.folders, excluding: f.id)
                 latest.folders[i] = f; try store.save(latest)
             }
@@ -125,7 +125,7 @@ extension Engine {
                 let before = try VerifiedRenameReceipt.observe(URL(fileURLWithPath: f.path), verification: j.fileVerification)
                 let revision = try Snapshot.capture(store: store, folder: f, source: URL(fileURLWithPath: f.path), previous: j.revision, verification: j.fileVerification)
                 guard try VerifiedRenameReceipt.observe(URL(fileURLWithPath: f.path), matching: before.manifest) == before else {
-                    throw NestError("Original changed during capture; no source moved.", code: 6)
+                    throw NestError("Original changed during capture; no source moved.", code: NestError.Code.retained)
                 }
                 j.initialSourceManifest = before.manifest; j.initialRevision = revision; j.priorRevision = j.revision; j.revision = revision
                 try store.write(j, for: f.id)
@@ -138,7 +138,7 @@ extension Engine {
                 // Keep originals in place during mount/population; failure is cheap.
                 let mounted = try nativeOperation("mount", layout: j.nativeLink!, record: j.nativeTmpfs!, nobrowse: f.options.nobrowse, authorization: authorization)
                 guard mounted.count == 3, let a = UInt32(mounted[0]), let b = UInt32(mounted[1]), UInt64(mounted[2]) != nil else {
-                    throw NestError("Invalid native mount receipt. An uncertain mount is retained; no source moved.", code: 6)
+                    throw NestError("Invalid native mount receipt. An uncertain mount is retained; no source moved.", code: NestError.Code.retained)
                 }
                 j.nativeTmpfs!.filesystem = NativeFilesystemID(first: a, second: b); j.phase = .mounting
                 try store.write(j, for: f.id)
@@ -146,18 +146,18 @@ extension Engine {
                 try ensureNativePin(f, journal: &j)
                 let copied = try Snapshot.copyTree(from: source, to: NativeTmpfsPaths.data(sid), manifest: expected,
                                                    publicationStaging: true, sourceContext: .managedRevision)
-                guard try copied.matchesCopy(of: expected) else { throw NestError("Native population copy mismatch; originals retained.", code: 6) }
+                guard try copied.matchesCopy(of: expected) else { throw NestError("Native population copy mismatch; originals retained.", code: NestError.Code.retained) }
                 let data = try DirectoryHandle.open(NativeTmpfsPaths.data(sid))
                 j.nativeTmpfs!.data = try .init(data.identity()); j.mountedDevice = try data.identity().device
                 try store.write(j, for: f.id)
                 // This unpublished tree has no client mappings created by RAMNest.
                 // Read-only guards activation verification; it is not a save receipt.
-                guard try nativeOperation("readonly", layout: j.nativeLink!, record: j.nativeTmpfs!, authorization: authorization).isEmpty else { throw NestError("Invalid native read-only receipt.", code: 6) }
+                guard try nativeOperation("readonly", layout: j.nativeLink!, record: j.nativeTmpfs!, authorization: authorization).isEmpty else { throw NestError("Invalid native read-only receipt.", code: NestError.Code.retained) }
                 _ = try NativeTmpfsControl.observe(j, readonly: true)
                 let (originalHandle, original) = try evacuateOriginal(f, journal: &j, expected: before.manifest, sourceBefore: before)
                 try verifyAndPublishPopulation(f, journal: &j, expected: copied, source: originalHandle, original: original)
                 try ensureNativePin(f, journal: &j)
-                guard try nativeOperation("thaw", layout: j.nativeLink!, record: j.nativeTmpfs!, authorization: authorization).isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
+                guard try nativeOperation("thaw", layout: j.nativeLink!, record: j.nativeTmpfs!, authorization: authorization).isEmpty else { throw NestError("Invalid native thaw receipt.", code: NestError.Code.retained) }
                 _ = try NativeTmpfsControl.observe(j, readonly: false)
                 try nativePeriod(f, journal: &j)
                 cleanSnapshots(f, &j)
@@ -182,7 +182,7 @@ extension Engine {
         defer { if supplied == nil { authorization.finish() } }
         try periodic?.validate(folder: f, journal: j)
         guard j.populationVerified, mountedIdentity(f, j), let layout = j.nativeLink, let record = j.nativeTmpfs else {
-            throw NestError("Live native RAM is unavailable; a disk checkpoint cannot be saved as current RAM.", code: 6)
+            throw NestError("Live native RAM is unavailable; a disk checkpoint cannot be saved as current RAM.", code: NestError.Code.retained)
         }
         var next = j
         defer { j = next }
@@ -196,7 +196,7 @@ extension Engine {
             try validatePeriodic() // Before any administrator prompt.
             receipt = try nativeOperation("freeze", layout: layout, record: record, authorization: authorization)
         }, verify: { _ = try NativeTmpfsControl.observe(next, readonly: true) }, validateMappings: {
-            guard let fs = record.filesystem else { throw NestError("Missing native fsid.", code: 6) }
+            guard let fs = record.filesystem else { throw NestError("Missing native fsid.", code: NestError.Code.retained) }
             try NativeSnapshotSafety.validateReceipt(receipt, filesystem: fs)
         }, copy: {
             let captured = try Snapshot.captureVerified(store: store, folder: f, source: NativeTmpfsPaths.data(record.session),
@@ -215,7 +215,7 @@ extension Engine {
             if thawFailed || (try? NativeTmpfsControl.observe(next)) == nil { next.phase = .recoveryRequired }
             try store.write(next, for: f.id)
         }, stillBoundReadonly: { (try? NativeTmpfsControl.observe(next, readonly: true)) != nil }, thaw: {
-            guard try nativeOperation("thaw", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
+            guard try nativeOperation("thaw", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native thaw receipt.", code: NestError.Code.retained) }
             _ = try NativeTmpfsControl.observe(next, readonly: false)
         })
         if let evidence { didCapture?(evidence) }
@@ -227,12 +227,12 @@ extension Engine {
         defer { authorization.finish() }
         if !ignoreBusy {
             let busy = try busyProcesses(ref)
-            guard busy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw NestError("Processes use this native volume. Close them or explicitly Ignore for a normal eject. Ignore cannot bypass the mandatory mapping/coherence guard.\n" + busy, code: 7) }
+            guard busy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw NestError("Processes use this native volume. Close them or explicitly Ignore for a normal eject. Ignore cannot bypass the mandatory mapping/coherence guard.\n" + busy, code: NestError.Code.busy) }
         }
         try volumeTransaction(ref) { f in
             var j = try store.journal(f.id)
             if j.phase == .idle { return }
-            guard let layout = j.nativeLink, let record = j.nativeTmpfs else { throw NestError("Missing native mount authority.", code: 6) }
+            guard let layout = j.nativeLink, let record = j.nativeTmpfs else { throw NestError("Missing native mount authority.", code: NestError.Code.retained) }
             _ = try NativeTmpfsControl.observe(j, requireData: j.populationVerified)
             if j.phase == .ejecting {
                 // A coordinator may have crashed before its normal unmount.
@@ -243,25 +243,25 @@ extension Engine {
             }
             guard j.phase == .mounted || j.phase == .recoveryRequired ||
                   (!j.populationVerified && [.preparing, .mounting, .evacuated].contains(j.phase)) else {
-                throw NestError("Native publication is pending; retain it for explicit recovery.", code: 6)
+                throw NestError("Native publication is pending; retain it for explicit recovery.", code: NestError.Code.retained)
             }
-            if j.populationVerified { guard mountedIdentity(f, j) else { throw NestError("Managed native link changed; RAM retained.", code: 6) } }
+            if j.populationVerified { guard mountedIdentity(f, j) else { throw NestError("Managed native link changed; RAM retained.", code: NestError.Code.retained) } }
             try ensureNativePin(f, journal: &j)
             if f.options.sync && j.populationVerified {
                 // Mandatory, even when the caller selected Ignore Busy.
                 _ = try captureNative(f, journal: &j, quiesce: true, authorization: authorization); j.restoreRevision = j.revision
             } else {
                 // Explicit temporary discard needs no current-RAM checkpoint.
-                guard try nativeOperation("readonly", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native read-only receipt.", code: 6) }
+                guard try nativeOperation("readonly", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native read-only receipt.", code: NestError.Code.retained) }
                 _ = try NativeTmpfsControl.observe(j, requireData: j.populationVerified, readonly: true)
                 j.restoreRevision = j.initialRevision
             }
             j.phase = .ejecting; try store.write(j, for: f.id)
             // Closing this pin is bounded to the journal's same-user helper. No
             // other process is killed; ordinary umount still rejects other pins.
-            if let socket = j.socket { guard try Control.request(socket, "retire").isEmpty else { throw NestError("Native pin did not acknowledge retirement.", code: 6) } }
+            if let socket = j.socket { guard try Control.request(socket, "retire").isEmpty else { throw NestError("Native pin did not acknowledge retirement.", code: NestError.Code.retained) } }
             do {
-                guard try nativeOperation("unmount", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native unmount receipt.", code: 6) }
+                guard try nativeOperation("unmount", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native unmount receipt.", code: NestError.Code.retained) }
                 try NativeTmpfsControl.assertAbsent(j)
                 j.nativeTmpfs!.managedUnmount = true; try store.write(j, for: f.id)
             } catch {
@@ -275,7 +275,7 @@ extension Engine {
                     try store.write(j, for: f.id)
                     try ensureNativePin(f, journal: &j)
                     if j.populationVerified && observed.readOnly {
-                        guard try nativeOperation("thaw", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
+                        guard try nativeOperation("thaw", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native thaw receipt.", code: NestError.Code.retained) }
                         _ = try NativeTmpfsControl.observe(j, readonly: false)
                     }
                 } else {
@@ -291,8 +291,8 @@ extension Engine {
         defer { if supplied == nil { authorization.finish() } }
         try volumeTransaction(ref) { f in
             var j = try store.journal(f.id)
-            guard j.nativeTmpfs != nil else { throw NestError("Not a native session.", code: 6) }
-            guard j.reviewedRecovery == nil else { throw NestError("Use a fresh legacy recovery review; ordinary Recover cannot consume an acknowledgement.", code: 6) }
+            guard j.nativeTmpfs != nil else { throw NestError("Not a native session.", code: NestError.Code.retained) }
+            guard j.reviewedRecovery == nil else { throw NestError("Use a fresh legacy recovery review; ordinary Recover cannot consume an acknowledgement.", code: NestError.Code.retained) }
             try NativeTmpfsControl.assertAbsent(j)
             if j.phase == .idle { try finishLinkedRestore(f, journal: &j, authorization: authorization); cleanSnapshots(try refreshedFolder(f), &j); return }
             let continuingRestore = j.phase == .restoring || j.phase == .pendingRestore
@@ -300,7 +300,7 @@ extension Engine {
                 j.nativeTmpfs!.lossDisclosure = "The native tmpfs mount disappeared outside a completed managed eject. Any unsaved contents are lost. Explicit recovery restores only the latest committed disk checkpoint; it cannot export the vanished RAM tree."
                 j.lastError = j.nativeTmpfs!.lossDisclosure
                 j.phase = .recoveryRequired; try store.write(j, for: f.id)
-                guard explicitRecovery else { throw NestError(j.lastError!, code: 6) }
+                guard explicitRecovery else { throw NestError(j.lastError!, code: NestError.Code.retained) }
             }
             if let socket = j.socket { _ = try? Control.request(socket, "retire", timeout: 2) }
             // No helper export after unmount. Only a verified committed revision

@@ -62,7 +62,7 @@ import RAMNestCore
         // change the global selection; tests opt in with an injected manager.
         storageManager = injectedManager ?? (repository == nil && explicit == nil ? SnapshotStorageManager() : nil)
         do {
-            if repository == nil, args.last == "--store" { throw NestError("--store requires a directory.", code: 64) }
+            if repository == nil, args.last == "--store" { throw NestError("--store requires a directory.", code: NestError.Code.usage) }
             let store = try repository ?? (explicit.map { try Store(root: $0) } ?? storageManager!.open())
             engine = Engine(store: store); snapshotStoragePath = store.root.path
             if store.resetPending {
@@ -427,7 +427,7 @@ import RAMNestCore
             for s in current where s.connected && s.mounted {
                 progress = "Saving and ejecting \(s.folder.name)…"
                 do { try await Task.detached { try engine.unmount(s.id.uuidString) }.value }
-                catch let e as NestError where e.code == 7 {
+                catch let e as NestError where e.code == NestError.Code.busy {
                     let alert = NSAlert(); alert.messageText = "\(s.folder.name) is in use"; alert.informativeText = e.message; alert.addButton(withTitle: "Stay"); alert.addButton(withTitle: "Ignore and Eject")
                     guard alert.runModal() == .alertSecondButtonReturn else { return false }
                     try await Task.detached { try engine.unmount(s.id.uuidString, ignoreBusy: true) }.value

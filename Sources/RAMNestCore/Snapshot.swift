@@ -59,7 +59,7 @@ struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
         let tree = try Snapshot.inspectTree(url, matching: matching, verification: verification, operations: operations)
         let manifest = tree.manifest
         let names = try root.names()
-        guard names.count < StorageModes.maximumRecords else { throw NestError("Rename namespace bound exceeded; retained.", code: 6) }
+        guard names.count < StorageModes.maximumRecords else { throw NestError("Rename namespace bound exceeded; retained.", code: NestError.Code.retained) }
         let tops = Set(manifest.entries.map { String($0.path.split(separator: "/")[0]) })
         var opaque: [Entry] = []
         for name in names where !tops.contains(name) {
@@ -95,7 +95,7 @@ struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
         try validate()
     }
     static func failure(_ path: String, _ reason: String) -> NestError {
-        NestError("Verified rename at \(Snapshot.diagnosticLabel(path.isEmpty ? "." : path)): \(reason). Originals retained.", code: 6)
+        NestError.retained("Verified rename at \(Snapshot.diagnosticLabel(path.isEmpty ? "." : path)): \(reason). Originals retained.")
     }
     func validate() throws {
         func valid(_ path: String) -> Bool {
@@ -104,7 +104,7 @@ struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
         }
         guard [1, 2].contains(version), (version == 2) == (publicationSwap != nil), destinationInode > 0, before.nodes.count <= StorageModes.maximumRecords,
               before.nodes.first?.path == "", Set(before.nodes.map(\.path)).count == before.nodes.count,
-              before.manifest.publicRoot?.path == "", before.manifest.publicRoot?.kind == "directory",
+              before.manifest.publicRoot?.path == "", before.manifest.publicRoot?.isDirectory == true,
               before.manifest.entries.count + before.opaque.count + 1 == before.nodes.count,
               before.nodes.allSatisfy({ valid($0.path) && $0.inode > 0 && $0.links > 0 && $0.size >= 0 &&
                   (0..<1_000_000_000).contains($0.mtimeNanos) && (0..<1_000_000_000).contains($0.ctimeNanos) }),
@@ -117,7 +117,7 @@ struct VerifiedRenameReceipt: Codable, Equatable, Sendable {
         _ = try before.manifest.copyFidelityView()
         try validatePublicationSwap()
         if let after {
-            guard after.manifest.publicRoot?.path == "", after.manifest.publicRoot?.kind == "directory" else { throw Self.failure(".", "missing raw completed root") }
+            guard after.manifest.publicRoot?.path == "", after.manifest.publicRoot?.isDirectory == true else { throw Self.failure(".", "missing raw completed root") }
             _ = try after.manifest.copyFidelityView()
             try compare(after)
         }
@@ -309,7 +309,7 @@ extension VerifiedRenameReceipt {
             let count = readlinkat(parent.fd, name, &target, target.count - 1)
             guard count > 0, count < target.count - 1 else { throw VerifiedRenameReceipt.failure(".", "cannot read swap link") }
             let destination = String(decoding: target.prefix(count).map { UInt8(bitPattern: $0) }, as: UTF8.self)
-            var entry = Entry(path: "", kind: "symlink", size: prior.size, mode: prior.mode & 0o7777,
+            var entry = Entry(path: "", kind: Entry.Kind.symlink.rawValue, size: prior.size, mode: prior.mode & 0o7777,
                 mtimeSeconds: prior.mtimeSeconds, mtimeNanos: prior.mtimeNanos, checksum: destination,
                 attributes: try Snapshot.attributes(url), flags: prior.flags, attributeBytes: 0)
             try Snapshot.accountAttributes(url, entry: &entry)
@@ -498,20 +498,20 @@ struct ReviewedPublicationEvidence: Codable, Equatable, Sendable {
             _ = try raw.manifest.copyFidelityView()
             let rootNode = raw.nodes[0]
             for (node, entry) in zip(raw.nodes, [root] + raw.manifest.entries) {
-                let kind = entry.kind == "directory" ? S_IFDIR : entry.kind == "file" ? S_IFREG : S_IFLNK
+                let kind = entry.isDirectory ? S_IFDIR : entry.isRegularFile ? S_IFREG : S_IFLNK
                 guard node.inode > 0, node.links > 0, node.size >= 0,
                       node.device == rootNode.device, node.owner == rootNode.owner, node.group == rootNode.group,
                       node.mode & UInt16(S_IFMT) == UInt16(kind), node.mode & 0o7777 == entry.mode,
-                      node.flags & ~UInt32(entry.kind == "file" ? UF_COMPRESSED : 0) == entry.flags,
+                      node.flags & ~UInt32(entry.isRegularFile ? UF_COMPRESSED : 0) == entry.flags,
                       (0..<1_000_000_000).contains(node.mtimeNanos), (0..<1_000_000_000).contains(node.ctimeNanos),
-                      entry.kind == "directory" || node.size == entry.size,
-                      entry.kind != "file" || (node.mtimeSeconds == entry.mtimeSeconds && node.mtimeNanos == entry.mtimeNanos) else { throw Self.invalid() }
+                      entry.isDirectory || node.size == entry.size,
+                      !entry.isRegularFile || (node.mtimeSeconds == entry.mtimeSeconds && node.mtimeNanos == entry.mtimeNanos) else { throw Self.invalid() }
             }
             let controls = raw.manifest.entries.filter { $0.path != "data" && !$0.path.hasPrefix("data/") }
             let names = Set(controls.map(\.path))
             guard names == ["manifest.json"] || names == ["manifest.json", "modes.bin"],
-                  controls.allSatisfy({ $0.kind == "file" && $0.mode == 0o600 && $0.hardlink == nil && $0.size > 0 && $0.size <= 64 << 20 }),
-                  let dataRoot = raw.manifest.entries.first(where: { $0.path == "data" }), dataRoot.kind == "directory" else { throw Self.invalid() }
+                  controls.allSatisfy({ $0.isRegularFile && $0.mode == 0o600 && $0.hardlink == nil && $0.size > 0 && $0.size <= 64 << 20 }),
+                  let dataRoot = raw.manifest.entries.first(where: { $0.path == "data" }), dataRoot.isDirectory else { throw Self.invalid() }
             // The wrapper/control-file hashes are diagnostic raw readback, not
             // authentication of original manifest.json bytes (which are not
             // embedded here and may predate relocation/legacy compatibility).
@@ -530,7 +530,7 @@ struct ReviewedPublicationEvidence: Codable, Equatable, Sendable {
             let observed = try names.contains("modes.bin") ? StorageModes(materialized).projecting(physical) : physical
             guard observed.matchesExpected(materialized) else { throw Self.invalid() }
         }
-        private static func invalid() -> NestError { NestError("Reviewed snapshot raw/logical/materialized evidence is inconsistent; retained.", code: 6) }
+        private static func invalid() -> NestError { NestError("Reviewed snapshot raw/logical/materialized evidence is inconsistent; retained.", code: NestError.Code.retained) }
     }
     let folder: Folder
     let originalJournal: Data
@@ -550,7 +550,7 @@ struct ReviewedPublicationEvidence: Codable, Equatable, Sendable {
     func originalState(fixtureRoot: URL?) throws -> Journal {
         guard originalJournal.count <= 64 << 20,
               let object = try JSONSerialization.jsonObject(with: originalJournal) as? [String: Any],
-              object["reviewedRecovery"] == nil else { throw NestError("Invalid original reviewed-recovery record; retained.", code: 6) }
+              object["reviewedRecovery"] == nil else { throw NestError("Invalid original reviewed-recovery record; retained.", code: NestError.Code.retained) }
         let decoder = JSONDecoder()
         if let fixtureRoot { decoder.userInfo[LinkedFolderLayout.decoderRootKey] = fixtureRoot }
         return try decoder.decode(Journal.self, from: originalJournal)
@@ -580,7 +580,7 @@ struct ReviewedPublicationEvidence: Codable, Equatable, Sendable {
               try receipt.before.manifest.matchesCopy(of: latest.materialized),
               try evacuation.before.manifest.matchesCopy(of: initial.materialized),
               initial.id != latest.id || initial == latest else {
-            throw NestError("Reviewed recovery evidence does not bind the original transaction and committed snapshots; retained.", code: 6)
+            throw NestError("Reviewed recovery evidence does not bind the original transaction and committed snapshots; retained.", code: NestError.Code.retained)
         }
         try receipt.bound(to: folder, journal: base, operation: .publication)
         try receipt.validateReviewedPublication(published, macl: publishedMACL, displaced: displaced)
@@ -627,10 +627,10 @@ struct ReviewedRecoveryAcknowledgement: Codable, Equatable, Sendable {
         guard version == 1, !acceptances.isEmpty, acceptances.count <= 128,
               acceptances.allSatisfy({ $0.acceptsMissingHistoricRecord && $0.date.timeIntervalSince1970.isFinite }),
               Set(acceptances.map(\.token)).count == acceptances.count else {
-            throw NestError("Invalid explicit reviewed recovery acceptance; retained.", code: 6)
+            throw NestError("Invalid explicit reviewed recovery acceptance; retained.", code: NestError.Code.retained)
         }
         guard completedAt.map({ $0.timeIntervalSince1970.isFinite && $0 >= acceptances.last!.date }) ?? true else {
-            throw NestError("Invalid reviewed recovery completion date; retained.", code: 6)
+            throw NestError("Invalid reviewed recovery completion date; retained.", code: NestError.Code.retained)
         }
         try evidence.validate(fixtureRoot: decoder.userInfo[LinkedFolderLayout.decoderRootKey] as? URL)
     }
@@ -645,7 +645,7 @@ struct ReviewedRecoveryAcknowledgement: Codable, Equatable, Sendable {
             base.quiescedRevision = nil; base.quiescedSession = nil
             base.cleanupWarning = retentionNotice
         }
-        guard actual == base else { throw NestError("Reviewed recovery journal diverged from its acknowledged transaction; retained.", code: 6) }
+        guard actual == base else { throw NestError("Reviewed recovery journal diverged from its acknowledged transaction; retained.", code: NestError.Code.retained) }
     }
     var retentionNotice: String {
         "Reviewed recovery completed; historical pre-swap link metadata remains unavailable. Backups and evidence retained. Original: \(evidence.layout.originalDataURL.path). Displaced link: \(evidence.stagePath).data. Snapshots: initial \(evidence.initial.id), latest \(evidence.latest.id). Automatic cleanup and remount are paused; explicit RESET can delete managed snapshots/records but preserves these external recovery folders."
@@ -662,7 +662,7 @@ private enum ReviewedEvidenceFields {
     }
     static func require(_ decoder: Decoder, required: Set<String>, allowed: Set<String>) throws {
         let c = try decoder.container(keyedBy: Key.self), keys = Set(c.allKeys.map(\.stringValue))
-        guard required.isSubset(of: keys), keys.isSubset(of: allowed) else { throw NestError("Unknown or missing reviewed recovery evidence fields; retained.", code: 6) }
+        guard required.isSubset(of: keys), keys.isSubset(of: allowed) else { throw NestError("Unknown or missing reviewed recovery evidence fields; retained.", code: NestError.Code.retained) }
     }
 }
 extension ReviewedPublicationEvidence {
@@ -702,15 +702,22 @@ extension Snapshot {
     // Excluded roots are admitted by no-follow stat only. Do not open for
     // reading, list/get xattrs, chmod, or descend into this directory.
     static func renameDirectoryMetadata(_ url: URL, path: String, info: stat) throws -> Entry {
-        Entry(path: path, kind: "directory", size: 0, mode: UInt16(info.st_mode & 0o7777),
+        Entry(path: path, kind: Entry.Kind.directory.rawValue, size: 0, mode: UInt16(info.st_mode & 0o7777),
               mtimeSeconds: 0, mtimeNanos: 0, checksum: "", attributes: [:],
               hardlink: nil, flags: info.st_flags, attributeBytes: 0)
     }
 }
 
 public struct Entry: Codable, Equatable, Sendable {
+    public enum Kind: String, CaseIterable, Sendable { case directory, file, symlink }
     public var path: String
+    // Keep the historical String API and wire format. Unknown values still
+    // round-trip and are rejected only by the existing validation boundaries.
     public var kind: String
+    public var knownKind: Kind? { Kind(rawValue: kind) }
+    public var isDirectory: Bool { kind == Kind.directory.rawValue }
+    public var isRegularFile: Bool { kind == Kind.file.rawValue }
+    public var isSymlink: Bool { kind == Kind.symlink.rawValue }
     public var size: Int64
     public var mode: UInt16
     public var mtimeSeconds: Int64
@@ -757,11 +764,11 @@ public struct Manifest: Codable, Equatable, Sendable {
         if fileVerification != .sha256 { try c.encode(fileVerification, forKey: .fileVerification) }
     }
     func validateVerification() throws {
-        for entry in entries where entry.kind == "file" {
+        for entry in entries where entry.isRegularFile {
             let digest = entry.checksum.hasPrefix("sparse64-v1:") ? String(entry.checksum.dropFirst(12)) : entry.checksum
             let validSHA = digest.utf8.count == 64 && digest.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
             guard fileVerification == .sha256 ? validSHA : entry.checksum.isEmpty else {
-                throw NestError("File checksum contradicts snapshot verification policy; retained.", code: 6)
+                throw NestError("File checksum contradicts snapshot verification policy; retained.", code: NestError.Code.retained)
             }
         }
     }
@@ -779,7 +786,7 @@ public struct Manifest: Codable, Equatable, Sendable {
         var selected = entries.filter { topNames.contains(String($0.path.split(separator: "/")[0])) }
         var anchors: [String: String] = [:]
         let walkOrder = selected.indices.sorted { selected[$0].path.split(separator: "/").lexicographicallyPrecedes(selected[$1].path.split(separator: "/")) }
-        for i in walkOrder where selected[i].kind == "file" {
+        for i in walkOrder where selected[i].isRegularFile {
             let group = selected[i].hardlink ?? selected[i].path
             selected[i].hardlink = anchors[group]
             if anchors[group] == nil { anchors[group] = selected[i].path }
@@ -796,7 +803,7 @@ public struct Manifest: Codable, Equatable, Sendable {
             var e = value
             guard let cost = e.provenanceBytes,
                   (e.attributes[Snapshot.provenanceName] == nil ? cost == 0 : (cost >= UInt64(Snapshot.provenanceName.utf8.count) && cost <= UInt64(1024 * 1024 + Snapshot.provenanceName.utf8.count))),
-                  cost <= e.attributeBytes else { throw NestError("Missing or invalid observed provenance accounting.", code: 6) }
+                  cost <= e.attributeBytes else { throw NestError("Missing or invalid observed provenance accounting.", code: NestError.Code.retained) }
             e.attributes.removeValue(forKey: Snapshot.provenanceName)
             e.attributeBytes -= cost; e.provenanceBytes = 0
             return e
@@ -810,17 +817,17 @@ public struct Manifest: Codable, Equatable, Sendable {
     }
     static func metadataBudget(capacity: UInt64) -> UInt64 { max(65536, capacity / 4) }
     public func preflight(capacity: UInt64) throws {
-        guard entries.lazy.filter({ $0.hardlink == nil }).count < 100000 else { throw NestError("Snapshot admission node limit is 100000 including the root. No files were moved.", code: 6) }
+        guard entries.lazy.filter({ $0.hardlink == nil }).count < 100000 else { throw NestError("Snapshot admission node limit is 100000 including the root. No files were moved.", code: NestError.Code.retained) }
         let logicalRequired = allocatedEstimate, metadataRequired = metadataEstimate
         let metadataAllowed = Self.metadataBudget(capacity: capacity)
         guard logicalRequired > capacity || metadataRequired > metadataAllowed else { return }
-        let files = entries.lazy.filter { $0.kind == "file" }.count
+        let files = entries.lazy.filter { $0.isRegularFile }.count
         let attributes = entries.reduce(0) { $0 + $1.attributes.count }
         let detail = "\(entries.count) entries, \(files) regular files, \(attributes) extended attributes"
         if logicalRequired > capacity {
-            throw NestError("Source exceeds logical capacity: requires \(logicalRequired) bytes; allowed \(capacity) bytes (\(detail)). Conservative snapshot admission rounds files to 64 KiB; live kernel usage is measured separately. Increase capacity before mounting; no files were moved.", code: 6)
+            throw NestError("Source exceeds logical capacity: requires \(logicalRequired) bytes; allowed \(capacity) bytes (\(detail)). Conservative snapshot admission rounds files to 64 KiB; live kernel usage is measured separately. Increase capacity before mounting; no files were moved.", code: NestError.Code.retained)
         }
-        throw NestError("Source exceeds metadata budget: estimated required \(metadataRequired) bytes; allowed \(metadataAllowed) bytes at capacity \(capacity) bytes (\(detail)). Metadata budget is max(64 KiB, capacity / 4). Increase capacity or reduce entry/attribute count before mounting; no files were moved.", code: 6)
+        throw NestError("Source exceeds metadata budget: estimated required \(metadataRequired) bytes; allowed \(metadataAllowed) bytes at capacity \(capacity) bytes (\(detail)). Metadata budget is max(64 KiB, capacity / 4). Increase capacity or reduce entry/attribute count before mounting; no files were moved.", code: NestError.Code.retained)
     }
     public var allocatedEstimate: UInt64 {
         var total: UInt64 = publicRoot?.attributeBytes ?? 0
@@ -828,12 +835,12 @@ public struct Manifest: Codable, Equatable, Sendable {
             guard entry.size >= 0 else { return UInt64.max }
             if entry.hardlink != nil { continue }
             var amount = entry.attributeBytes
-            if entry.kind == "file" && entry.hardlink == nil {
+            if entry.isRegularFile && entry.hardlink == nil {
                 let size = UInt64(entry.size)
                 amount = entry.allocatedBytes ?? ((size + 65535) / 65536) * 65536
                 let extra = amount.addingReportingOverflow(entry.attributeBytes)
                 if extra.overflow { return UInt64.max }; amount = extra.partialValue
-            } else if entry.kind == "symlink" {
+            } else if entry.isSymlink {
                 let extra = amount.addingReportingOverflow(UInt64(entry.size))
                 if extra.overflow { return UInt64.max }; amount = extra.partialValue
             }
@@ -850,7 +857,7 @@ enum SnapshotExclusion {
         name == ".Trashes" && mode & S_IFMT == S_IFDIR
     }
     static func directory(_ path: String, kind: String) -> Bool {
-        path.split(separator:"/").last == ".Trashes" && kind == "directory"
+        path.split(separator:"/").last == ".Trashes" && kind == Entry.Kind.directory.rawValue
     }
 }
 extension Manifest {
@@ -859,14 +866,14 @@ extension Manifest {
     func excludingTrashDirectories() throws -> Manifest {
         var kinds: [String:String] = [:]
         for e in entries {
-            guard !e.path.isEmpty, StorageModes.validPath(e.path), ["directory","file","symlink"].contains(e.kind),
-                  e.mode <= 0o7777, kinds.updateValue(e.kind,forKey:e.path) == nil else { throw NestError("Malformed snapshot namespace.",code:6) }
+            guard !e.path.isEmpty, StorageModes.validPath(e.path), [Entry.Kind.directory.rawValue,Entry.Kind.file.rawValue,Entry.Kind.symlink.rawValue].contains(e.kind),
+                  e.mode <= 0o7777, kinds.updateValue(e.kind,forKey:e.path) == nil else { throw NestError("Malformed snapshot namespace.",code: NestError.Code.retained) }
         }
         var excluded = Set<String>()
         for e in entries {
             let parent = e.path.split(separator:"/").dropLast().joined(separator:"/")
-            guard parent.isEmpty || kinds[parent] == "directory" else { throw NestError("Invalid snapshot namespace parent.",code:6) }
-            if let link = e.hardlink { guard e.kind == "file", kinds[link] == "file", link != e.path else { throw NestError("Invalid snapshot hardlink anchor.",code:6) } }
+            guard parent.isEmpty || kinds[parent] == Entry.Kind.directory.rawValue else { throw NestError("Invalid snapshot namespace parent.",code: NestError.Code.retained) }
+            if let link = e.hardlink { guard e.isRegularFile, kinds[link] == Entry.Kind.file.rawValue, link != e.path else { throw NestError("Invalid snapshot hardlink anchor.",code: NestError.Code.retained) } }
             if SnapshotExclusion.directory(e.path,kind:e.kind) { excluded.insert(e.path) }
         }
         func ignored(_ path: String) -> Bool {
@@ -877,7 +884,7 @@ extension Manifest {
         var result = Manifest(entries:entries.filter { !ignored($0.path) },publicRoot:publicRoot,fileVerification:fileVerification)
         var anchors: [String:String] = [:]
         let order = result.entries.indices.sorted { result.entries[$0].path.split(separator:"/").lexicographicallyPrecedes(result.entries[$1].path.split(separator:"/")) }
-        for i in order where result.entries[i].kind == "file" {
+        for i in order where result.entries[i].isRegularFile {
             let group = result.entries[i].hardlink ?? result.entries[i].path
             result.entries[i].hardlink = anchors[group]
             if anchors[group] == nil { anchors[group] = result.entries[i].path }
@@ -906,16 +913,16 @@ public enum Snapshot {
         }
         fileprivate func projecting(_ manifest: Manifest) -> Self { Self(path: path, manifest: manifest, nodes: nodes) }
         func validate(at url: URL) throws {
-            guard url.standardizedFileURL.path == path else { throw NestError("Snapshot evidence path changed; retained.", code: 6) }
+            guard url.standardizedFileURL.path == path else { throw NestError("Snapshot evidence path changed; retained.", code: NestError.Code.retained) }
             let root = try DirectoryHandle.open(url), cursor = DirectoryCursor(root)
             for node in nodes {
                 let st: stat
                 if node.path.isEmpty {
-                    var info = stat(); guard fstat(root.fd, &info) == 0 else { throw NestError("Cannot stat evidence root.", code: 6) }; st = info
+                    var info = stat(); guard fstat(root.fd, &info) == 0 else { throw NestError("Cannot stat evidence root.", code: NestError.Code.retained) }; st = info
                 } else {
                     let (parent, name) = try cursor.parent(of: node.path); st = try parent.entryStat(name)
                 }
-                guard VerifiedRenameReceipt.Node(node.path, st) == node else { throw NestError("Snapshot evidence identity/metadata changed; retained.", code: 6) }
+                guard VerifiedRenameReceipt.Node(node.path, st) == node else { throw NestError("Snapshot evidence identity/metadata changed; retained.", code: NestError.Code.retained) }
             }
             // Directory ctimes detect even transient namespace changes. Exact
             // names additionally reject additions/removals, without opening or
@@ -930,9 +937,9 @@ public enum Snapshot {
                 let directory: DirectoryHandle
                 if node.path.isEmpty { directory = root }
                 else { let (parent, name) = try cursor.parent(of: node.path); directory = try parent.child(name) }
-                guard try directory.names() == (children[node.path] ?? []).sorted() else { throw NestError("Snapshot evidence namespace changed; retained.", code: 6) }
+                guard try directory.names() == (children[node.path] ?? []).sorted() else { throw NestError("Snapshot evidence namespace changed; retained.", code: NestError.Code.retained) }
             }
-            guard try root.identity() == DirectoryHandle.open(url).identity() else { throw NestError("Snapshot evidence root replaced; retained.", code: 6) }
+            guard try root.identity() == DirectoryHandle.open(url).identity() else { throw NestError("Snapshot evidence root replaced; retained.", code: NestError.Code.retained) }
         }
     }
     struct RevisionEvidence {
@@ -943,31 +950,31 @@ public enum Snapshot {
         fileprivate init(revision: String, folder: UUID, tree: TreeEvidence) throws {
             self.revision = revision; self.folder = folder; self.tree = tree
             let container = try DirectoryHandle.open(URL(fileURLWithPath: tree.path).deletingLastPathComponent())
-            var st = stat(); guard fstat(container.fd, &st) == 0 else { throw NestError("Cannot bind revision evidence.", code: 6) }
+            var st = stat(); guard fstat(container.fd, &st) == 0 else { throw NestError("Cannot bind revision evidence.", code: NestError.Code.retained) }
             control = try [VerifiedRenameReceipt.Node("", st)] + container.names().filter { $0 != "data" }.map {
                 VerifiedRenameReceipt.Node($0, try container.entryStat($0))
             }
         }
         func validate(store: Store, id: UUID, revision: String) throws -> (URL, Manifest) {
             let url = try Snapshot.dataURL(store: store, id: id, revision: revision)
-            guard id == folder, revision == self.revision else { throw NestError("Revision evidence binding changed; retained.", code: 6) }
+            guard id == folder, revision == self.revision else { throw NestError("Revision evidence binding changed; retained.", code: NestError.Code.retained) }
             return try validate(at: url)
         }
         fileprivate func validate(at url: URL) throws -> (URL, Manifest) {
-            guard url.standardizedFileURL.path == tree.path else { throw NestError("Revision evidence path changed; retained.", code: 6) }
+            guard url.standardizedFileURL.path == tree.path else { throw NestError("Revision evidence path changed; retained.", code: NestError.Code.retained) }
             let container = try DirectoryHandle.open(url.deletingLastPathComponent())
             func stableControl() throws {
-                var st = stat(); guard fstat(container.fd, &st) == 0 else { throw NestError("Cannot stat revision evidence.", code: 6) }
+                var st = stat(); guard fstat(container.fd, &st) == 0 else { throw NestError("Cannot stat revision evidence.", code: NestError.Code.retained) }
                 guard VerifiedRenameReceipt.Node("", st) == control.first,
-                      try container.names() == (["data"] + control.dropFirst().map(\.path)).sorted() else { throw NestError("Revision evidence container changed; retained.", code: 6) }
+                      try container.names() == (["data"] + control.dropFirst().map(\.path)).sorted() else { throw NestError("Revision evidence container changed; retained.", code: NestError.Code.retained) }
                 for node in control.dropFirst() {
-                    guard VerifiedRenameReceipt.Node(node.path, try container.entryStat(node.path)) == node else { throw NestError("Revision control metadata changed; retained.", code: 6) }
+                    guard VerifiedRenameReceipt.Node(node.path, try container.entryStat(node.path)) == node else { throw NestError("Revision control metadata changed; retained.", code: NestError.Code.retained) }
                 }
             }
             try stableControl()
             guard let metadata = try Snapshot.storedMetadata(url),
                   try metadata.logical.excludingTrashDirectories() == tree.manifest,
-                  try container.names() == (metadata.storageFormat == 2 ? ["data", "manifest.json", "modes.bin"] : ["data", "manifest.json"]) else { throw NestError("Revision evidence metadata changed; retained.", code: 6) }
+                  try container.names() == (metadata.storageFormat == 2 ? ["data", "manifest.json", "modes.bin"] : ["data", "manifest.json"]) else { throw NestError("Revision evidence metadata changed; retained.", code: NestError.Code.retained) }
             _ = try Snapshot.checkedModes(url, metadata)
             try tree.validate(at: url)
             try stableControl()
@@ -1000,7 +1007,7 @@ public enum Snapshot {
         var names = [CChar](repeating: 0, count: count)
         let listed = listing(&names, count)
         if listed < 0 { throw readFailure("Cannot list extended attributes", errno, url, syscall: "listxattr") }
-        guard listed == count else { throw NestError("Attributes changed during snapshot.", code: 6) }
+        guard listed == count else { throw NestError("Attributes changed during snapshot.", code: NestError.Code.retained) }
         var result: [String: String] = [:]; var index = 0
         while index < count {
             let name = names.withUnsafeBufferPointer { String(cString: $0.baseAddress!.advanced(by: index)) }; index += name.utf8.count + 1
@@ -1011,40 +1018,40 @@ public enum Snapshot {
             if name == "com.apple.decmpfs" { continue }
             let size = getxattr(url.path, name, nil, 0, 0, XATTR_NOFOLLOW)
             if size < 0 { throw readFailure("Cannot read extended attribute size", errno, url, syscall: "getxattr") }
-            guard size <= 1024 * 1024 else { throw NestError("Unsupported attribute size.", code: 6) }
+            guard size <= 1024 * 1024 else { throw NestError("Unsupported attribute size.", code: NestError.Code.retained) }
             var data = Data(count: size)
             let got = data.withUnsafeMutableBytes { getxattr(url.path, name, $0.baseAddress, size, 0, XATTR_NOFOLLOW) }
             if got < 0 { throw readFailure("Cannot read extended attribute", errno, url, syscall: "getxattr") }
-            guard got == size else { throw NestError("Attribute changed during snapshot.", code: 6) }
+            guard got == size else { throw NestError("Attribute changed during snapshot.", code: NestError.Code.retained) }
             result[name] = digest(data)
         }
         return result
     }
     static func supportedSecurity(_ url: URL, _ st: stat) throws {
         guard st.st_uid == getuid(), st.st_gid == getgid() else {
-            throw NestError("Unsupported ownership at \(url.lastPathComponent). RAMNest requires the current uid and primary gid; no files were moved.", code: 4)
+            throw NestError("Unsupported ownership at \(url.lastPathComponent). RAMNest requires the current uid and primary gid; no files were moved.", code: NestError.Code.unsafePath)
         }
         errno = 0
         if let acl = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) {
             defer { acl_free(UnsafeMutableRawPointer(acl)) }
             var entry: acl_entry_t?
             let result = acl_get_entry(acl, Int32(ACL_FIRST_ENTRY.rawValue), &entry)
-            guard result != 0, errno == EINVAL else { throw NestError("ACL-bearing entries are unsupported: \(url.lastPathComponent). No files were moved.", code: 4) }
+            guard result != 0, errno == EINVAL else { throw NestError("ACL-bearing entries are unsupported: \(url.lastPathComponent). No files were moved.", code: NestError.Code.unsafePath) }
         } else if errno != ENOENT && errno != ENOTSUP {
             throw readFailure("Cannot inspect ACL", errno, url)
         }
     }
     static func manifestFileBytes(_ container: DirectoryHandle) throws -> Data {
         let fd = openat(container.fd, "manifest.json", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else { throw NestError("Cannot pin immutable manifest.", code: 6) }
+        guard fd >= 0 else { throw NestError("Cannot pin immutable manifest.", code: NestError.Code.retained) }
         defer { close(fd) }
         var before = stat()
         guard fstat(fd, &before) == 0, before.st_mode & S_IFMT == S_IFREG, before.st_uid == getuid(),
-              before.st_nlink == 1, before.st_size > 0, before.st_size <= 64 << 20 else { throw NestError("Invalid immutable manifest inode.", code: 6) }
+              before.st_nlink == 1, before.st_size > 0, before.st_size <= 64 << 20 else { throw NestError("Invalid immutable manifest inode.", code: NestError.Code.retained) }
         let bytes = try FileHandle(fileDescriptor: fd, closeOnDealloc: false).read(upToCount: (64 << 20) + 1) ?? Data()
         var after = stat()
         guard fstat(fd, &after) == 0, before.st_ctimespec == after.st_ctimespec, before.st_size == after.st_size,
-              bytes.count == Int(before.st_size) else { throw NestError("Immutable manifest changed while reading.", code: 6) }
+              bytes.count == Int(before.st_size) else { throw NestError("Immutable manifest changed while reading.", code: NestError.Code.retained) }
         return bytes
     }
     static func storedMetadata(_ data: URL) throws -> StoredManifest? {
@@ -1053,7 +1060,7 @@ public enum Snapshot {
         let metadata = try container.readJSON(StoredManifest.self,"manifest.json")
         if metadata.storageFormat == 2 {
             let st = try container.entryStat("manifest.json")
-            guard st.st_mode & 0o7777 == 0o600, st.st_uid == getuid(), st.st_gid == getgid(), st.st_nlink == 1 else { throw NestError("Invalid private manifest inode/physical policy.", code: 6) }
+            guard st.st_mode & 0o7777 == 0o600, st.st_uid == getuid(), st.st_gid == getgid(), st.st_nlink == 1 else { throw NestError("Invalid private manifest inode/physical policy.", code: NestError.Code.retained) }
         }
         return try SnapshotCopyObservations.applying(to: metadata, data: data)
     }
@@ -1062,11 +1069,11 @@ public enum Snapshot {
         let container = try DirectoryHandle.open(data.deletingLastPathComponent())
         var st = stat()
         guard fstat(container.fd,&st) == 0, st.st_mode & 0o7777 == 0o700, st.st_uid == getuid(), st.st_gid == getgid(),
-              try container.names() == ["data","manifest.json","modes.bin"] else { throw NestError("Invalid format-2 private container policy/namespace.", code: 6) }
+              try container.names() == ["data","manifest.json","modes.bin"] else { throw NestError("Invalid format-2 private container policy/namespace.", code: NestError.Code.retained) }
         let bytes = try StorageModes.read(data.deletingLastPathComponent().appendingPathComponent("modes.bin"))
-        guard digest(bytes) == metadata.modeMapDigest else { throw NestError("Snapshot logical mode map digest mismatch.", code: 6) }
+        guard digest(bytes) == metadata.modeMapDigest else { throw NestError("Snapshot logical mode map digest mismatch.", code: NestError.Code.retained) }
         let modes = try StorageModes(data:bytes)
-        guard modes.records == (try StorageModes(metadata.logical)).records else { throw NestError("Snapshot logical modes disagree with authenticated mode map.", code: 6) }
+        guard modes.records == (try StorageModes(metadata.logical)).records else { throw NestError("Snapshot logical modes disagree with authenticated mode map.", code: NestError.Code.retained) }
         return modes
     }
     public static func manifest(_ root: URL, maximumLogical: UInt64? = nil, matching expected: Manifest? = nil, phase: String = "manifest", context: SourceContext = .original, verification: FileVerification? = nil) throws -> Manifest {
@@ -1076,7 +1083,7 @@ public enum Snapshot {
         let metadata = context == .managedRevision ? try storedMetadata(root) : nil
         let policy = verification ?? expected?.fileVerification ?? metadata?.fileVerification ?? .sha256
         guard expected.map({ $0.fileVerification == policy }) ?? true,
-              metadata.map({ $0.fileVerification == policy }) ?? true else { throw NestError("Snapshot verification policy mismatch; retained.", code: 6) }
+              metadata.map({ $0.fileVerification == policy }) ?? true else { throw NestError("Snapshot verification policy mismatch; retained.", code: NestError.Code.retained) }
         let modes = try metadata.flatMap { try checkedModes(root,$0) }
         let observed = try scanTree(root,maximumLogical:maximumLogical,matching:expected,phase:phase,containedHardlinks:modes != nil,verification:policy,operations:operations)
         // Observation remains distinct from authentication. Callers can inspect
@@ -1088,49 +1095,49 @@ public enum Snapshot {
     }
     private static func scanTree(_ root: URL, maximumLogical: UInt64? = nil, matching expected: Manifest? = nil, phase: String = "manifest", containedHardlinks: Bool = false, verification: FileVerification? = nil, operations: CopyOperations = CopyOperations()) throws -> TreeEvidence {
         let policy = verification ?? expected?.fileVerification ?? .sha256
-        guard expected.map({ $0.fileVerification == policy }) ?? true else { throw NestError("Snapshot verification policy mismatch; retained.", code: 6) }
+        guard expected.map({ $0.fileVerification == policy }) ?? true else { throw NestError("Snapshot verification policy mismatch; retained.", code: NestError.Code.retained) }
         try expected?.validateVerification()
         try Paths.rejectSymlinks(root.path)
-        var rootStat = stat(); guard lstat(root.path, &rootStat) == 0 else { throw NestError("Snapshot root is missing.", code: 6) }
+        var rootStat = stat(); guard lstat(root.path, &rootStat) == 0 else { throw NestError("Snapshot root is missing.", code: NestError.Code.retained) }
         try supportedSecurity(root, rootStat)
         let started = ProcessInfo.processInfo.systemUptime
         var bytesRead: UInt64 = 0, sha256Bytes: UInt64 = 0, aliasesReused = 0
         var expectedByPath: [String: Entry] = [:]
         for entry in expected?.entries ?? [] {
-            guard expectedByPath.updateValue(entry, forKey: entry.path) == nil else { throw NestError("Duplicate path in snapshot manifest.", code: 6) }
+            guard expectedByPath.updateValue(entry, forKey: entry.path) == nil else { throw NestError("Duplicate path in snapshot manifest.", code: NestError.Code.retained) }
         }
         var digestCache: [String: (stat, SparseContent.Result)] = [:]
         var entries: [Entry] = []; var links: [String: String] = [:]
         var identities: [(URL,stat)] = [], linkCounts: [String:Int] = [:], expectedLinks: [String:Int] = [:]
         var pending = try children(root,path:".").sorted { $0.lastPathComponent > $1.lastPathComponent }.map { ($0, $0.lastPathComponent) }
         while let (child, path) = pending.popLast() {
-                var st = stat(); guard lstat(child.path, &st) == 0 else { throw NestError("Source changed at \(diagnosticLabel(path)).",code:6) }
+                var st = stat(); guard lstat(child.path, &st) == 0 else { throw NestError("Source changed at \(diagnosticLabel(path)).",code: NestError.Code.retained) }
                 if SnapshotExclusion.directory(child.lastPathComponent,st.st_mode) { identities.append((child,st));continue }
-                guard st.st_dev == rootStat.st_dev else { throw NestError("Source changed or contains a nested mount: \(path)", code: 6) }
+                guard st.st_dev == rootStat.st_dev else { throw NestError("Source changed or contains a nested mount: \(path)", code: NestError.Code.retained) }
                 try supportedSecurity(child, st)
                 let type = st.st_mode & S_IFMT
                 // Regular reads and hashes use kernel-decoded logical bytes.
                 // Copy logical bytes without claiming an APFS decmpfs representation.
                 let logicalFlags = type == S_IFREG ? st.st_flags & ~UInt32(UF_COMPRESSED) : st.st_flags
                 var entry = Entry(path: path, kind: "", size: 0, mode: UInt16(st.st_mode & 0o7777), mtimeSeconds: 0, mtimeNanos: 0, checksum: "", attributes: try relativeAttributes(child,path), hardlink: nil, flags: logicalFlags, attributeBytes: 0)
-                guard logicalFlags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else { throw NestError("Unsupported file flags on \(path). Clear immutable/append/system flags before conversion.", code: 4) }
+                guard logicalFlags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else { throw NestError("Unsupported file flags on \(path). Clear immutable/append/system flags before conversion.", code: NestError.Code.unsafePath) }
                 try accountAttributes(child, entry: &entry)
-                if type == S_IFDIR { entry.kind = "directory" }
+                if type == S_IFDIR { entry.kind = Entry.Kind.directory.rawValue }
                 else if type == S_IFLNK {
-                    guard st.st_nlink == 1 else { throw NestError("Hardlinked symbolic links cannot be preserved; no files were moved.", code: 4) }
-                    entry.kind = "symlink"
+                    guard st.st_nlink == 1 else { throw NestError("Hardlinked symbolic links cannot be preserved; no files were moved.", code: NestError.Code.unsafePath) }
+                    entry.kind = Entry.Kind.symlink.rawValue
                     let target = try FileManager.default.destinationOfSymbolicLink(atPath: child.path)
                     entry.size = Int64(target.utf8.count); entry.checksum = digest(Data(target.utf8))
                 } else if type == S_IFREG {
-                    guard st.st_size >= 0 else { throw NestError("Invalid negative file size.", code: 6) }
-                    entry.kind = "file"; entry.size = st.st_size; entry.mtimeSeconds = Int64(st.st_mtimespec.tv_sec); entry.mtimeNanos = Int64(st.st_mtimespec.tv_nsec)
+                    guard st.st_size >= 0 else { throw NestError("Invalid negative file size.", code: NestError.Code.retained) }
+                    entry.kind = Entry.Kind.file.rawValue; entry.size = st.st_size; entry.mtimeSeconds = Int64(st.st_mtimespec.tv_sec); entry.mtimeNanos = Int64(st.st_mtimespec.tv_nsec)
                     let key = "\(st.st_dev):\(st.st_ino)"
                     linkCounts[key,default:0] += 1;expectedLinks[key] = Int(st.st_nlink)
                     if st.st_nlink > 1 { entry.hardlink = links[key]; if links[key] == nil { links[key] = path } }
                     let fd = open(child.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
                     guard fd >= 0 else { throw readFailure("Cannot read snapshot at \(diagnosticLabel(path)) (open)",errno,syscall:"open") }
                     let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-                    var before = stat(); guard fstat(fd, &before) == 0, before.st_ino == st.st_ino, before.st_dev == st.st_dev, before.st_size == st.st_size, before.st_mtimespec == st.st_mtimespec, before.st_ctimespec == st.st_ctimespec else { throw NestError("Source identity/metadata changed.", code: 6) }
+                    var before = stat(); guard fstat(fd, &before) == 0, before.st_ino == st.st_ino, before.st_dev == st.st_dev, before.st_size == st.st_size, before.st_mtimespec == st.st_mtimespec, before.st_ctimespec == st.st_ctimespec else { throw NestError("Source identity/metadata changed.", code: NestError.Code.retained) }
                     let result: SparseContent.Result
                     if let (cached, digest) = digestCache[key], cached.st_size == before.st_size,
                        cached.st_mtimespec == before.st_mtimespec, cached.st_ctimespec == before.st_ctimespec {
@@ -1141,16 +1148,16 @@ public enum Snapshot {
                         bytesRead += result.bytesRead
                         sha256Bytes += result.sha256Bytes
                     }
-                    var after = stat(); guard fstat(fd, &after) == 0, before.st_size == after.st_size, before.st_mtimespec == after.st_mtimespec, before.st_ctimespec == after.st_ctimespec else { throw NestError("Source is being written. Close writers and retry.", code: 6) }
+                    var after = stat(); guard fstat(fd, &after) == 0, before.st_size == after.st_size, before.st_mtimespec == after.st_mtimespec, before.st_ctimespec == after.st_ctimespec else { throw NestError("Source is being written. Close writers and retry.", code: NestError.Code.retained) }
                     digestCache[key] = (after, result)
                     entry.checksum = result.checksum
                     entry.allocatedBytes = result.allocated
                     _ = handle // retain the descriptor through final identity validation
 
-                } else { throw NestError("Special files (socket/device/FIFO) cannot be put in RAMNest: \(path)", code: 4) }
+                } else { throw NestError("Special files (socket/device/FIFO) cannot be put in RAMNest: \(path)", code: NestError.Code.unsafePath) }
                 entries.append(entry)
                 identities.append((child,st))
-                guard entries.count < StorageModes.maximumRecords, pending.count < StorageModes.maximumRecords else { throw NestError("Snapshot namespace bound exceeded.", code: 6) }
+                guard entries.count < StorageModes.maximumRecords, pending.count < StorageModes.maximumRecords else { throw NestError("Snapshot namespace bound exceeded.", code: NestError.Code.retained) }
                 if type == S_IFDIR {
                     let descendants = try children(child,path:path).sorted { $0.lastPathComponent > $1.lastPathComponent }
                     pending += descendants.map { ($0, path + "/" + $0.lastPathComponent) }
@@ -1162,10 +1169,10 @@ public enum Snapshot {
             let fd = open(trace, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0o600)
             if fd >= 0 { _ = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }; close(fd) }
         }
-        var rootEntry = Entry(path: "", kind: "directory", size: 0, mode: UInt16(rootStat.st_mode & 0o7777), mtimeSeconds: 0, mtimeNanos: 0, checksum: "", attributes: try relativeAttributes(root,"."), hardlink: nil, flags: rootStat.st_flags, attributeBytes: 0)
+        var rootEntry = Entry(path: "", kind: Entry.Kind.directory.rawValue, size: 0, mode: UInt16(rootStat.st_mode & 0o7777), mtimeSeconds: 0, mtimeNanos: 0, checksum: "", attributes: try relativeAttributes(root,"."), hardlink: nil, flags: rootStat.st_flags, attributeBytes: 0)
         try accountAttributes(root, entry: &rootEntry)
-        guard rootEntry.flags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else { throw NestError("Unsupported root flags.", code: 4) }
-        if containedHardlinks { guard linkCounts == expectedLinks else { throw NestError("Private snapshot has a cross-boundary hardlink.", code: 6) } }
+        guard rootEntry.flags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else { throw NestError("Unsupported root flags.", code: NestError.Code.unsafePath) }
+        if containedHardlinks { guard linkCounts == expectedLinks else { throw NestError("Private snapshot has a cross-boundary hardlink.", code: NestError.Code.retained) } }
         let nodes = [VerifiedRenameReceipt.Node("", rootStat)] + identities.map { url, st in
             VerifiedRenameReceipt.Node(String(url.path.dropFirst(root.path.count + 1)), st)
         }
@@ -1187,7 +1194,7 @@ public enum Snapshot {
             guard size >= 0, size <= 1024 * 1024 else { throw readFailure("Cannot measure extended attribute", errno, url) }
             let amount = UInt64(size) + UInt64(name.utf8.count)
             let sum = entry.attributeBytes.addingReportingOverflow(amount)
-            guard !sum.overflow else { throw NestError("Attribute accounting overflow.", code: 6) }
+            guard !sum.overflow else { throw NestError("Attribute accounting overflow.", code: NestError.Code.retained) }
             entry.attributeBytes = sum.partialValue
             if name == provenanceName { entry.provenanceBytes = amount }
         }
@@ -1242,7 +1249,7 @@ public enum Snapshot {
         let name = "com.apple.quarantine"
         guard let expected = entry.attributes[name] else { return }
         func failure(_ reason: String) -> NestError {
-            NestError("Cannot preserve snapshot metadata at \(diagnosticLabel(entry.path)) (xattr \(name); \(reason)). No source files were removed.", code: 6)
+            NestError("Cannot preserve snapshot metadata at \(diagnosticLabel(entry.path)) (xattr \(name); \(reason)). No source files were removed.", code: NestError.Code.retained)
         }
         func read(_ descriptor: Int32) throws -> Data? {
             let size = fgetxattr(descriptor, name, nil, 0, 0, 0)
@@ -1275,26 +1282,26 @@ public enum Snapshot {
     }
     private static func verifyRootCopySource(_ fd: Int32, expected: Entry) throws {
         var before = stat()
-        guard fstat(fd, &before) == 0, before.st_flags == expected.flags else { throw NestError("Public root source flags changed.", code: 6) }
+        guard fstat(fd, &before) == 0, before.st_flags == expected.flags else { throw NestError("Public root source flags changed.", code: NestError.Code.retained) }
         let count = flistxattr(fd, nil, 0, 0)
-        guard count >= 0, count <= 1 << 20 else { throw NestError("Cannot enumerate public root source attributes.", code: 6) }
+        guard count >= 0, count <= 1 << 20 else { throw NestError("Cannot enumerate public root source attributes.", code: NestError.Code.retained) }
         var names = [CChar](repeating: 0, count: max(1, count))
-        guard flistxattr(fd, &names, count, 0) == count else { throw NestError("Public root source attributes changed.", code: 6) }
+        guard flistxattr(fd, &names, count, 0) == count else { throw NestError("Public root source attributes changed.", code: NestError.Code.retained) }
         var hashes: [String: String] = [:], total: UInt64 = 0
         for key in names.prefix(count).split(separator: 0) {
             let name = String(decoding: key.map { UInt8(bitPattern: $0) }, as: UTF8.self)
             if name == "com.apple.decmpfs" { continue }
             let size = fgetxattr(fd, name, nil, 0, 0, 0)
-            guard size >= 0, size <= 1 << 20 else { throw NestError("Cannot read public root source attribute.", code: 6) }
+            guard size >= 0, size <= 1 << 20 else { throw NestError("Cannot read public root source attribute.", code: NestError.Code.retained) }
             var bytes = Data(count: size)
-            guard bytes.withUnsafeMutableBytes({ fgetxattr(fd, name, $0.baseAddress, size, 0, 0) }) == size else { throw NestError("Public root source attribute changed.", code: 6) }
+            guard bytes.withUnsafeMutableBytes({ fgetxattr(fd, name, $0.baseAddress, size, 0, 0) }) == size else { throw NestError("Public root source attribute changed.", code: NestError.Code.retained) }
             hashes[name] = digest(bytes)
             let sum = total.addingReportingOverflow(UInt64(name.utf8.count) + UInt64(size))
-            guard !sum.overflow else { throw NestError("Public root attribute accounting overflow.", code: 6) }; total = sum.partialValue
+            guard !sum.overflow else { throw NestError("Public root attribute accounting overflow.", code: NestError.Code.retained) }; total = sum.partialValue
         }
         var after = stat()
         guard fstat(fd, &after) == 0, before.st_ctimespec == after.st_ctimespec,
-              before.st_mode == after.st_mode, hashes == expected.attributes, total == expected.attributeBytes else { throw NestError("Public root raw source metadata changed. No source files were removed.", code: 6) }
+              before.st_mode == after.st_mode, hashes == expected.attributes, total == expected.attributeBytes else { throw NestError("Public root raw source metadata changed. No source files were removed.", code: NestError.Code.retained) }
     }
     // Both copy and recovery finish public-root metadata from already-verified,
     // no-follow directory descriptors. Darwin's quarantine copy API can rewrite
@@ -1304,26 +1311,26 @@ public enum Snapshot {
         guard let rootEntry = manifest.publicRoot else { return }
         try verifyRootCopySource(source.fd, expected: rootEntry)
         guard fcopyfile(source.fd, destination.fd, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR)) == 0 else {
-            throw NestError("Cannot preserve public root metadata.", code: 6)
+            throw NestError("Cannot preserve public root metadata.", code: NestError.Code.retained)
         }
         try preserveQuarantine(from: source.fd, to: destination.fd, entry: rootEntry)
         try verifyRootCopySource(source.fd, expected: rootEntry)
-        guard fchmod(destination.fd,mode_t(rootEntry.mode)) == 0 else { throw NestError("Cannot finalize public root mode.", code: 6) }
+        guard fchmod(destination.fd,mode_t(rootEntry.mode)) == 0 else { throw NestError("Cannot finalize public root mode.", code: NestError.Code.retained) }
         try destination.sync()
     }
     static func preparePublicRoot(from source: DirectoryHandle, to destination: DirectoryHandle, selected: URL, manifest: Manifest) throws -> Entry {
-        guard let root = manifest.publicRoot else { throw NestError("Missing public root metadata.", code: 6) }
+        guard let root = manifest.publicRoot else { throw NestError("Missing public root metadata.", code: NestError.Code.retained) }
         try verifyRootCopySource(source.fd, expected: root)
-        guard fcopyfile(source.fd,destination.fd,nil,copyfile_flags_t(COPYFILE_XATTR)) == 0 else { throw NestError("Cannot copy public root attributes.", code: 6) }
+        guard fcopyfile(source.fd,destination.fd,nil,copyfile_flags_t(COPYFILE_XATTR)) == 0 else { throw NestError("Cannot copy public root attributes.", code: NestError.Code.retained) }
         try preserveQuarantine(from:source.fd,to:destination.fd,entry:root)
         try verifyRootCopySource(source.fd, expected: root)
-        guard fchflags(destination.fd,root.flags) == 0 else { throw NestError("Public root flag restoration failed.", code: 6) }
+        guard fchflags(destination.fd,root.flags) == 0 else { throw NestError("Public root flag restoration failed.", code: NestError.Code.retained) }
         var st = stat()
-        guard fstat(destination.fd, &st) == 0, st.st_flags == root.flags else { throw NestError("Public root flag readback failed.", code: 6) }
+        guard fstat(destination.fd, &st) == 0, st.st_flags == root.flags else { throw NestError("Public root flag readback failed.", code: NestError.Code.retained) }
         var observed = root
         observed.attributes = try relativeAttributes(selected, ".")
         try accountAttributes(selected, entry: &observed)
-        guard try Manifest(entries: [], publicRoot: observed).matchesCopy(of: Manifest(entries: [], publicRoot: root)) else { throw NestError("Public root attribute readback failed.", code: 6) }
+        guard try Manifest(entries: [], publicRoot: observed).matchesCopy(of: Manifest(entries: [], publicRoot: root)) else { throw NestError("Public root attribute readback failed.", code: NestError.Code.retained) }
         try destination.sync()
         return observed
     }
@@ -1333,7 +1340,7 @@ public enum Snapshot {
     static func materializationManifest(_ source: URL, expected: Manifest, context: SourceContext) throws -> Manifest {
         if expected.publicRoot?.provenanceBytes != nil, expected.entries.allSatisfy({ $0.provenanceBytes != nil }) { return expected }
         let observed = try manifest(source,matching:expected,phase:"materialization-source",context:context)
-        guard observed.matchesExpected(expected) else { throw NestError("Materialization source changed \(mismatchDetail(observed, expected)). No source files were removed.", code: 6) }
+        guard observed.matchesExpected(expected) else { throw NestError("Materialization source changed \(mismatchDetail(observed, expected)). No source files were removed.", code: NestError.Code.retained) }
         return observed
     }
 
@@ -1346,7 +1353,7 @@ public enum Snapshot {
             return copied
         }
         let parent = try DirectoryHandle.open(destination.deletingLastPathComponent())
-        guard try !parent.exists(destination.lastPathComponent) else { throw NestError("Export destination already exists.", code: 6) }
+        guard try !parent.exists(destination.lastPathComponent) else { throw NestError("Export destination already exists.", code: NestError.Code.retained) }
         let name = ".ramnest-materialize-" + UUID().uuidString
         let container = try parent.createDirectory(name)
         let staging = destination.deletingLastPathComponent().appendingPathComponent(name).appendingPathComponent("data")
@@ -1362,17 +1369,17 @@ public enum Snapshot {
         try container.renameNoReplace("data",to:parent,as:privateName)
         try container.sync();try parent.sync()
         let privateURL = destination.deletingLastPathComponent().appendingPathComponent(privateName)
-        guard try parent.child(privateName).identity() == pinned else { throw NestError("Publication materialization identity changed.", code: 6) }
+        guard try parent.child(privateName).identity() == pinned else { throw NestError("Publication materialization identity changed.", code: NestError.Code.retained) }
         var receipt = try finalizeModes(privateURL,manifest:copied,destination:destination.lastPathComponent)
         receipt.privateName = privateName
         try Store.atomicJSON(receipt,staging.deletingLastPathComponent().appendingPathComponent("publication.json"))
         try container.sync()
-        guard try DirectoryHandle.open(destination.deletingLastPathComponent()).identity() == parent.identity() else { throw NestError("Publication parent identity changed; materialization and receipt retained.", code: 6) }
+        guard try DirectoryHandle.open(destination.deletingLastPathComponent()).identity() == parent.identity() else { throw NestError("Publication parent identity changed; materialization and receipt retained.", code: NestError.Code.retained) }
         try parent.renameNoReplace(privateName,to:parent,as:destination.lastPathComponent)
         try container.sync();try parent.sync()
         let published = try parent.entryStat(destination.lastPathComponent)
         guard Paths.deviceID(published.st_dev) == pinned.device, published.st_ino == pinned.inode,
-              try DirectoryHandle.open(destination.deletingLastPathComponent()).identity() == parent.identity() else { throw NestError("Published materialization identity changed; receipt retained.", code: 6) }
+              try DirectoryHandle.open(destination.deletingLastPathComponent()).identity() == parent.identity() else { throw NestError("Published materialization identity changed; receipt retained.", code: NestError.Code.retained) }
         receipt.phase = "published"
         try Store.atomicJSON(receipt,staging.deletingLastPathComponent().appendingPathComponent("publication.json"))
         return copied
@@ -1392,7 +1399,7 @@ public enum Snapshot {
         let admission = try sourceEvidence ?? inspectTree(source, matching: manifest, phase: "copy-source-before", context: sourceContext, operations: operations)
         try admission.validate(at: source)
         let before = admission.manifest
-        guard before.matchesExpected(manifest) else { throw NestError("Copy source changed \(mismatchDetail(before,manifest)). No source files were removed.", code: 6) }
+        guard before.matchesExpected(manifest) else { throw NestError("Copy source changed \(mismatchDetail(before,manifest)). No source files were removed.", code: NestError.Code.retained) }
         let sourceRoot = try DirectoryHandle.open(source)
         let previousRoot = try previous.map { try DirectoryHandle.open($0) }
         let previousTree = try previous.flatMap { url -> TreeEvidence? in
@@ -1404,7 +1411,7 @@ public enum Snapshot {
             if previousContext == .managedRevision, try storedMetadata(url)?.fileVerification != manifest.fileVerification { return nil }
             let tree = try inspectTree(url,context:previousContext,verification:manifest.fileVerification,operations:operations)
             if previousContext == .managedRevision {
-                guard let metadata = try storedMetadata(url), try tree.manifest.matchesExpected(metadata.logical.excludingTrashDirectories()) else { throw NestError("Prior snapshot is damaged; retained.", code: 6) }
+                guard let metadata = try storedMetadata(url), try tree.manifest.matchesExpected(metadata.logical.excludingTrashDirectories()) else { throw NestError("Prior snapshot is damaged; retained.", code: NestError.Code.retained) }
             }
             return tree
         }
@@ -1415,121 +1422,145 @@ public enum Snapshot {
         let destinationParent = try DirectoryHandle.open(destination.deletingLastPathComponent())
         let destinationRoot = try destinationParent.createDirectory(destination.lastPathComponent)
         let sourceCursor = DirectoryCursor(sourceRoot), destinationCursor = DirectoryCursor(destinationRoot)
-        let previousCursor = previousRoot.map(DirectoryCursor.init)
+        let cloneSource: CloneSource?
+        if let previousRoot, let previousManifest {
+            cloneSource = CloneSource(cursor: DirectoryCursor(previousRoot), manifest: previousManifest, nodes: previousNodes, entries: previousEntries)
+        } else { cloneSource = nil }
         for entry in manifest.entries.sorted(by: { a, b in
-            let ap = a.kind == "directory" ? 0 : a.hardlink == nil ? 1 : 2
-            let bp = b.kind == "directory" ? 0 : b.hardlink == nil ? 1 : 2
+            let ap = a.isDirectory ? 0 : a.hardlink == nil ? 1 : 2
+            let bp = b.isDirectory ? 0 : b.hardlink == nil ? 1 : 2
             return ap == bp ? a.path < b.path : ap < bp
         }) {
             let (srcParent, srcName) = try sourceCursor.parent(of: entry.path)
             let (dstParent, dstName) = try destinationCursor.parent(of: entry.path)
-            if entry.kind == "directory" { _ = try dstParent.createDirectory(dstName); continue }
+            if entry.isDirectory { _ = try dstParent.createDirectory(dstName); continue }
             if let first = entry.hardlink {
                 let (firstParent, firstName) = try destinationCursor.parent(of: first)
-                guard linkat(firstParent.fd, firstName, dstParent.fd, dstName, 0) == 0 else { throw NestError("Hardlink copy failed.", code: 6) }
+                guard linkat(firstParent.fd, firstName, dstParent.fd, dstName, 0) == 0 else { throw NestError("Hardlink copy failed.", code: NestError.Code.retained) }
                 continue
             }
-            if entry.kind == "symlink" {
-                var target = [CChar](repeating: 0, count: 4097)
-                let size = readlinkat(srcParent.fd, srcName, &target, 4096)
-                guard size >= 0, size < 4096 else { throw NestError("Cannot copy symlink.", code: 6) }
-                target[size] = 0
-                guard target.withUnsafeBufferPointer({ symlinkat($0.baseAddress!, dstParent.fd, dstName) }) == 0 else { throw NestError("Symlink copy failed.", code: 6) }
-                let src = openat(srcParent.fd, srcName, O_RDONLY | O_SYMLINK | O_CLOEXEC)
-                let dst = openat(dstParent.fd, dstName, O_RDONLY | O_SYMLINK | O_CLOEXEC)
-                guard src >= 0, dst >= 0 else { if src >= 0 { close(src) }; if dst >= 0 { close(dst) }; throw NestError("Cannot preserve symlink metadata.", code: 6) }
-                defer { close(src); close(dst) }
-                let copied = fcopyfile(src, dst, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR))
-                guard copied == 0 else { throw NestError("Symlink metadata copy failed.", code: 6) }
-                guard fchmod(dst,0o700) == 0 else { throw NestError("Cannot set private symlink storage policy.", code: 6) }
-                try preserveQuarantine(from: src, to: dst, entry: entry)
+            if entry.isSymlink {
+                try copySymlink(entry, srcParent: srcParent, srcName: srcName, dstParent: dstParent, dstName: dstName)
             } else {
-                let current = openat(srcParent.fd, srcName, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-                guard current >= 0 else { throw NestError("Cannot read current source metadata.", code: 6) }
-                defer { close(current) }
-                var currentStat = stat()
-                guard fstat(current, &currentStat) == 0, currentStat.st_mode & S_IFMT == S_IFREG,
-                      VerifiedRenameReceipt.Node(entry.path, currentStat) == sourceNodes[entry.path] else { throw NestError("Current copy source identity changed.", code: 6) }
-                var clonedStat: stat?
-                // Incremental selection is separate from integrity. A policy
-                // change never reinterprets the prior immutable revision.
-                if let previousCursor, previousManifest?.fileVerification == manifest.fileVerification,
-                   let old = previousEntries[entry.path], old.kind == "file", old.size == entry.size,
-                   (manifest.fileVerification == .sha256 ? old.checksum == entry.checksum :
-                       (comparison == .sizeAndModTime && old.mtimeSeconds == entry.mtimeSeconds && old.mtimeNanos == entry.mtimeNanos)),
-                   let (oldParent, oldName) = try? previousCursor.parent(of: entry.path) {
-                    let prior = openat(oldParent.fd, oldName, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-                    guard prior >= 0 else { throw NestError("Cannot pin prior clone source.", code: 6) }
-                    defer { close(prior) }
-                    var st = stat(), target = stat()
-                    guard fstat(prior, &st) == 0, st.st_mode & S_IFMT == S_IFREG,
-                          let node = previousNodes[entry.path],
-                          VerifiedRenameReceipt.Node(entry.path, st) == node,
-                          fstat(dstParent.fd, &target) == 0 else { throw NestError("Prior clone source identity changed.", code: 6) }
-                    if st.st_dev == target.st_dev, st.st_flags & UInt32(UF_COMPRESSED) == 0 {
-                        let result = try operations.clone(prior, dstParent.fd, dstName), failure = errno
-                        // fclonefileat binds the source descriptor, never a path
-                        // re-open. A failed syscall must leave no target before
-                        // fallback; partial/unrecognized targets fail closed.
-                        if result == 0 {
-                            let created = try dstParent.entryStat(dstName)
-                            guard created.st_mode & S_IFMT == S_IFREG, created.st_nlink == 1, created.st_uid == getuid(),
-                                  !(created.st_dev == st.st_dev && created.st_ino == st.st_ino),
-                                  !(created.st_dev == currentStat.st_dev && created.st_ino == currentStat.st_ino) else {
-                                throw NestError("Invalid cloned target; retained.", code: 6)
-                            }
-                            clonedStat = created
-                            try operations.afterClone?(dstParent.fd, dstName)
-                        }
-                        else {
-                            guard try !dstParent.exists(dstName) else { throw NestError("Failed clone left a target; retained.", code: 6) }
-                            guard [ENOTSUP, EXDEV, ENOSYS, EINVAL].contains(failure) else { throw NestError("Snapshot clone failed (errno \(failure)).", code: 6) }
-                        }
-                    }
-                    var after = stat()
-                    guard fstat(prior, &after) == 0, VerifiedRenameReceipt.Node(entry.path, after) == node,
-                          VerifiedRenameReceipt.Node(entry.path, try oldParent.entryStat(oldName)) == node else { throw NestError("Prior clone source changed.", code: 6) }
-                }
-                let dst: Int32
-                if let clonedStat { dst = try openClonedTarget(dstParent, name: dstName, expected: clonedStat) }
-                else { dst = openat(dstParent.fd, dstName, O_RDWR | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC | O_CREAT | O_EXCL, 0o600) }
-                guard dst >= 0 else { throw NestError("Cannot open snapshot file.", code: 6) }
-                defer { close(dst) }
-                if clonedStat != nil { try resetCloneMetadata(dst) }
-                else { try SparseContent.copy(current, to: dst, size: entry.size) }
-                guard fcopyfile(current, dst, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR)) == 0 else { throw NestError("Cannot copy current metadata.", code: 6) }
-                guard fchmod(dst,0o600) == 0 else { throw NestError("Cannot set private file storage policy.", code: 6) }
-                try preserveQuarantine(from: current, to: dst, entry: entry)
-                guard fsync(dst) == 0 else { throw NestError("Snapshot file copy/sync failed: \(entry.path)", code: 6) }
+                try copyRegularFile(entry, srcParent: srcParent, srcName: srcName, dstParent: dstParent, dstName: dstName,
+                    sourceNode: sourceNodes[entry.path], previous: cloneSource, verification: manifest.fileVerification,
+                    comparison: comparison, operations: operations)
             }
         }
-        for entry in manifest.entries.reversed() where entry.kind == "directory" {
+        for entry in manifest.entries.reversed() where entry.isDirectory {
             let (srcParent, name) = try sourceCursor.parent(of: entry.path)
             let (dstParent, _) = try destinationCursor.parent(of: entry.path)
             let src = try srcParent.child(name), dst = try dstParent.child(name)
-            guard fcopyfile(src.fd, dst.fd, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR)) == 0 else { throw NestError("Directory metadata copy failed.", code: 6) }
-            guard fchmod(dst.fd,0o700) == 0 else { throw NestError("Cannot set private directory storage policy.", code: 6) }
+            guard fcopyfile(src.fd, dst.fd, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR)) == 0 else { throw NestError("Directory metadata copy failed.", code: NestError.Code.retained) }
+            guard fchmod(dst.fd,0o700) == 0 else { throw NestError("Cannot set private directory storage policy.", code: NestError.Code.retained) }
             try preserveQuarantine(from: src.fd, to: dst.fd, entry: entry)
             try dst.sync()
         }
         try restorePublicRootMetadata(from: sourceRoot, to: destinationRoot, manifest: manifest)
-        guard fchmod(destinationRoot.fd,0o700) == 0 else { throw NestError("Cannot set private root storage policy.", code: 6) }
+        guard fchmod(destinationRoot.fd,0o700) == 0 else { throw NestError("Cannot set private root storage policy.", code: NestError.Code.retained) }
         try destinationRoot.sync(); try destinationParent.sync()
         let readback = try scanTree(destination, matching: manifest, phase: "copy-readback",containedHardlinks:true,operations:operations)
         let actual = try StorageModes(manifest).projecting(readback.manifest)
-        guard try actual.matchesCopy(of: before) else { throw NestError("Snapshot verification failed \(mismatchDetail(actual, manifest)). No source files were removed.", code: 6) }
+        guard try actual.matchesCopy(of: before) else { throw NestError("Snapshot verification failed \(mismatchDetail(actual, manifest)). No source files were removed.", code: NestError.Code.retained) }
         try Store.syncDirectory(destination)
         let after = try observe("copy-source-after")
-        guard after == before else { throw NestError("Source changed during copy \(mismatchDetail(after,manifest)). No source files were removed.", code: 6) }
+        guard after == before else { throw NestError("Source changed during copy \(mismatchDetail(after,manifest)). No source files were removed.", code: NestError.Code.retained) }
         try admission.validate(at: source)
         try readback.validate(at: destination)
         return readback.projecting(actual)
     }
+    private struct CloneSource {
+        let cursor: DirectoryCursor
+        let manifest: Manifest
+        let nodes: [String: VerifiedRenameReceipt.Node]
+        let entries: [String: Entry]
+    }
+
+    private static func copySymlink(_ entry: Entry, srcParent: DirectoryHandle, srcName: String, dstParent: DirectoryHandle, dstName: String) throws {
+        var target = [CChar](repeating: 0, count: 4097)
+        let size = readlinkat(srcParent.fd, srcName, &target, 4096)
+        guard size >= 0, size < 4096 else { throw NestError("Cannot copy symlink.", code: NestError.Code.retained) }
+        target[size] = 0
+        guard target.withUnsafeBufferPointer({ symlinkat($0.baseAddress!, dstParent.fd, dstName) }) == 0 else { throw NestError("Symlink copy failed.", code: NestError.Code.retained) }
+        let src = openat(srcParent.fd, srcName, O_RDONLY | O_SYMLINK | O_CLOEXEC)
+        let dst = openat(dstParent.fd, dstName, O_RDONLY | O_SYMLINK | O_CLOEXEC)
+        guard src >= 0, dst >= 0 else { if src >= 0 { close(src) }; if dst >= 0 { close(dst) }; throw NestError("Cannot preserve symlink metadata.", code: NestError.Code.retained) }
+        defer { close(src); close(dst) }
+        let copied = fcopyfile(src, dst, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR))
+        guard copied == 0 else { throw NestError("Symlink metadata copy failed.", code: NestError.Code.retained) }
+        guard fchmod(dst,0o700) == 0 else { throw NestError("Cannot set private symlink storage policy.", code: NestError.Code.retained) }
+        try preserveQuarantine(from: src, to: dst, entry: entry)
+    }
+
+    private static func copyRegularFile(_ entry: Entry, srcParent: DirectoryHandle, srcName: String, dstParent: DirectoryHandle, dstName: String, sourceNode: VerifiedRenameReceipt.Node?, previous: CloneSource?, verification: FileVerification, comparison: Comparison, operations: CopyOperations) throws {
+        let current = openat(srcParent.fd, srcName, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard current >= 0 else { throw NestError("Cannot read current source metadata.", code: NestError.Code.retained) }
+        defer { close(current) }
+        var currentStat = stat()
+        guard fstat(current, &currentStat) == 0, currentStat.st_mode & S_IFMT == S_IFREG,
+              VerifiedRenameReceipt.Node(entry.path, currentStat) == sourceNode else { throw NestError("Current copy source identity changed.", code: NestError.Code.retained) }
+        let clonedStat = try tryCloneFromPrevious(entry, currentStat: currentStat, dstParent: dstParent, dstName: dstName,
+            previous: previous, verification: verification, comparison: comparison, operations: operations)
+        let dst: Int32
+        if let clonedStat { dst = try openClonedTarget(dstParent, name: dstName, expected: clonedStat) }
+        else { dst = openat(dstParent.fd, dstName, O_RDWR | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC | O_CREAT | O_EXCL, 0o600) }
+        guard dst >= 0 else { throw NestError("Cannot open snapshot file.", code: NestError.Code.retained) }
+        defer { close(dst) }
+        if clonedStat != nil { try resetCloneMetadata(dst) }
+        else { try SparseContent.copy(current, to: dst, size: entry.size) }
+        guard fcopyfile(current, dst, nil, copyfile_flags_t(COPYFILE_STAT | COPYFILE_XATTR)) == 0 else { throw NestError("Cannot copy current metadata.", code: NestError.Code.retained) }
+        guard fchmod(dst,0o600) == 0 else { throw NestError("Cannot set private file storage policy.", code: NestError.Code.retained) }
+        try preserveQuarantine(from: current, to: dst, entry: entry)
+        guard fsync(dst) == 0 else { throw NestError("Snapshot file copy/sync failed: \(entry.path)", code: NestError.Code.retained) }
+    }
+
+    private static func tryCloneFromPrevious(_ entry: Entry, currentStat: stat, dstParent: DirectoryHandle, dstName: String, previous: CloneSource?, verification: FileVerification, comparison: Comparison, operations: CopyOperations) throws -> stat? {
+        var clonedStat: stat?
+        // Incremental selection is separate from integrity; policies remain immutable.
+        guard let previous, previous.manifest.fileVerification == verification,
+           let old = previous.entries[entry.path], old.isRegularFile, old.size == entry.size,
+           (verification == .sha256 ? old.checksum == entry.checksum :
+               (comparison == .sizeAndModTime && old.mtimeSeconds == entry.mtimeSeconds && old.mtimeNanos == entry.mtimeNanos)),
+           let (oldParent, oldName) = try? previous.cursor.parent(of: entry.path) else { return nil }
+        let prior = openat(oldParent.fd, oldName, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard prior >= 0 else { throw NestError("Cannot pin prior clone source.", code: NestError.Code.retained) }
+        defer { close(prior) }
+        var st = stat(), target = stat()
+        guard fstat(prior, &st) == 0, st.st_mode & S_IFMT == S_IFREG,
+              let node = previous.nodes[entry.path],
+              VerifiedRenameReceipt.Node(entry.path, st) == node,
+              fstat(dstParent.fd, &target) == 0 else { throw NestError("Prior clone source identity changed.", code: NestError.Code.retained) }
+        if st.st_dev == target.st_dev, st.st_flags & UInt32(UF_COMPRESSED) == 0 {
+            let result = try operations.clone(prior, dstParent.fd, dstName), failure = errno
+            // fclonefileat binds the source descriptor, never a path
+            // re-open. A failed syscall must leave no target before
+            // fallback; partial/unrecognized targets fail closed.
+            if result == 0 {
+                let created = try dstParent.entryStat(dstName)
+                guard created.st_mode & S_IFMT == S_IFREG, created.st_nlink == 1, created.st_uid == getuid(),
+                      !(created.st_dev == st.st_dev && created.st_ino == st.st_ino),
+                      !(created.st_dev == currentStat.st_dev && created.st_ino == currentStat.st_ino) else {
+                    throw NestError("Invalid cloned target; retained.", code: NestError.Code.retained)
+                }
+                clonedStat = created
+                try operations.afterClone?(dstParent.fd, dstName)
+            }
+            else {
+                guard try !dstParent.exists(dstName) else { throw NestError("Failed clone left a target; retained.", code: NestError.Code.retained) }
+                guard [ENOTSUP, EXDEV, ENOSYS, EINVAL].contains(failure) else { throw NestError("Snapshot clone failed (errno \(failure)).", code: NestError.Code.retained) }
+            }
+        }
+        var after = stat()
+        guard fstat(prior, &after) == 0, VerifiedRenameReceipt.Node(entry.path, after) == node,
+              VerifiedRenameReceipt.Node(entry.path, try oldParent.entryStat(oldName)) == node else { throw NestError("Prior clone source changed.", code: NestError.Code.retained) }
+        return clonedStat
+    }
+
     private static func openClonedTarget(_ parent: DirectoryHandle, name: String, expected: stat) throws -> Int32 {
         // A clone inherits its prior's read-only mode/flags. Pin it without
         // requiring write permission; never chmod a pathname or either source.
         let pinned = openat(parent.fd, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-        guard pinned >= 0 else { throw NestError("Cannot pin cloned target.", code: 6) }
+        guard pinned >= 0 else { throw NestError("Cannot pin cloned target.", code: NestError.Code.retained) }
         defer { close(pinned) }
         let expectedNode = VerifiedRenameReceipt.Node(name, expected)
         func checkedStat() throws -> stat {
@@ -1537,23 +1568,23 @@ public enum Snapshot {
             guard fstat(pinned, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_nlink == 1, st.st_uid == getuid(),
                   st.st_dev == expected.st_dev, st.st_ino == expected.st_ino,
                   VerifiedRenameReceipt.Node(name, try parent.entryStat(name)) == VerifiedRenameReceipt.Node(name, st) else {
-                throw NestError("Cloned target identity changed.", code: 6)
+                throw NestError("Cloned target identity changed.", code: NestError.Code.retained)
             }
             return st
         }
-        guard VerifiedRenameReceipt.Node(name, try checkedStat()) == expectedNode else { throw NestError("Cloned target metadata changed.", code: 6) }
-        guard fchflags(pinned, 0) == 0 else { throw NestError("Cannot prepare cloned file flags.", code: 6) }
+        guard VerifiedRenameReceipt.Node(name, try checkedStat()) == expectedNode else { throw NestError("Cloned target metadata changed.", code: NestError.Code.retained) }
+        guard fchflags(pinned, 0) == 0 else { throw NestError("Cannot prepare cloned file flags.", code: NestError.Code.retained) }
         _ = try checkedStat()
-        guard fchmod(pinned, 0o600) == 0 else { throw NestError("Cannot prepare cloned file mode.", code: 6) }
+        guard fchmod(pinned, 0o600) == 0 else { throw NestError("Cannot prepare cloned file mode.", code: NestError.Code.retained) }
         let normalized = try checkedStat()
-        guard normalized.st_flags == 0, normalized.st_mode & 0o7777 == 0o600 else { throw NestError("Cloned file policy readback failed.", code: 6) }
+        guard normalized.st_flags == 0, normalized.st_mode & 0o7777 == 0o600 else { throw NestError("Cloned file policy readback failed.", code: NestError.Code.retained) }
         let writable = openat(parent.fd, name, O_RDWR | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-        guard writable >= 0 else { throw NestError("Cannot reopen cloned target.", code: 6) }
+        guard writable >= 0 else { throw NestError("Cannot reopen cloned target.", code: NestError.Code.retained) }
         do {
             var reopened = stat()
             let node = VerifiedRenameReceipt.Node(name, normalized)
             guard fstat(writable, &reopened) == 0, VerifiedRenameReceipt.Node(name, reopened) == node,
-                  VerifiedRenameReceipt.Node(name, try checkedStat()) == node else { throw NestError("Reopened clone identity changed.", code: 6) }
+                  VerifiedRenameReceipt.Node(name, try checkedStat()) == node else { throw NestError("Reopened clone identity changed.", code: NestError.Code.retained) }
             return writable
         } catch { close(writable); throw error }
     }
@@ -1562,17 +1593,17 @@ public enum Snapshot {
         // metadata before copying CURRENT metadata; leave provenance to the OS
         // copy policy, and never remove storage/compression representation.
         let count = flistxattr(fd, nil, 0, 0)
-        guard count >= 0, count <= 1 << 20 else { throw NestError("Cannot enumerate cloned attributes.", code: 6) }
+        guard count >= 0, count <= 1 << 20 else { throw NestError("Cannot enumerate cloned attributes.", code: NestError.Code.retained) }
         var names = [CChar](repeating: 0, count: max(1, count))
-        guard flistxattr(fd, &names, count, 0) == count else { throw NestError("Cloned attributes changed.", code: 6) }
+        guard flistxattr(fd, &names, count, 0) == count else { throw NestError("Cloned attributes changed.", code: NestError.Code.retained) }
         for key in names.prefix(count).split(separator: 0) {
             let name = String(decoding: key.map { UInt8(bitPattern: $0) }, as: UTF8.self)
             if name == provenanceName || name == "com.apple.decmpfs" { continue }
-            guard fremovexattr(fd, name, 0) == 0 else { throw NestError("Cannot clear inherited clone attribute.", code: 6) }
+            guard fremovexattr(fd, name, 0) == 0 else { throw NestError("Cannot clear inherited clone attribute.", code: NestError.Code.retained) }
         }
     }
     public static func dataURL(store: Store, id: UUID, revision: String) throws -> URL {
-        guard UUID(uuidString: revision) != nil else { throw NestError("Invalid snapshot revision.", code: 6) }
+        guard UUID(uuidString: revision) != nil else { throw NestError("Invalid snapshot revision.", code: NestError.Code.retained) }
         return try store.volume(id).appendingPathComponent("revisions/\(revision)/data")
     }
     public static func verified(store: Store, id: UUID, revision: String, verification: FileVerification? = nil) throws -> (URL, Manifest) {
@@ -1582,24 +1613,24 @@ public enum Snapshot {
     static func verifiedEvidence(store: Store, id: UUID, revision: String, verification: FileVerification? = nil, operations: CopyOperations = CopyOperations()) throws -> RevisionEvidence {
         let data = try dataURL(store: store, id: id, revision: revision)
         let revisions = try DirectoryHandle.open(data.deletingLastPathComponent().deletingLastPathComponent())
-        guard try revisions.exists(revision) else { throw NestError("Snapshot revision \(revision) is not retained on disk. RAMNest keeps the latest verified snapshot, with temporary transaction anchors while needed.", code: 6) }
+        guard try revisions.exists(revision) else { throw NestError("Snapshot revision \(revision) is not retained on disk. RAMNest keeps the latest verified snapshot, with temporary transaction anchors while needed.", code: NestError.Code.retained) }
         let container = try revisions.child(revision)
         let metadataBefore = try container.entryStat("manifest.json")
         let containerIdentity = try container.identity()
-        guard let metadata = try storedMetadata(data) else { throw NestError("Missing snapshot metadata.", code: 6) }
+        guard let metadata = try storedMetadata(data) else { throw NestError("Missing snapshot metadata.", code: NestError.Code.retained) }
         try container.requireOwnedDirectory(device:revisions.identity().device,privateMode:true)
-        guard try container.names() == (metadata.storageFormat == 2 ? ["data", "manifest.json", "modes.bin"] : ["data", "manifest.json"]) else { throw NestError("Unexpected snapshot container namespace.", code: 6) }
+        guard try container.names() == (metadata.storageFormat == 2 ? ["data", "manifest.json", "modes.bin"] : ["data", "manifest.json"]) else { throw NestError("Unexpected snapshot container namespace.", code: NestError.Code.retained) }
         // Keep the full stored record/map immutable; only the returned view is filtered.
         _ = try checkedModes(data,metadata)
         let expected = try metadata.logical.excludingTrashDirectories()
-        guard verification.map({ $0 == expected.fileVerification }) ?? true else { throw NestError("Revision file verification policy disagrees with session authority; retained.", code: 6) }
+        guard verification.map({ $0 == expected.fileVerification }) ?? true else { throw NestError("Revision file verification policy disagrees with session authority; retained.", code: NestError.Code.retained) }
         let tree = try inspectTree(data, matching: expected, phase: "revision-integrity",context:.managedRevision,operations:operations)
         let actual = tree.manifest
-        guard actual.matchesExpected(expected) else { throw NestError("Snapshot is damaged \(mismatchDetail(actual, expected)). Preserve recovery data and investigate before continuing.", code: 6) }
+        guard actual.matchesExpected(expected) else { throw NestError("Snapshot is damaged \(mismatchDetail(actual, expected)). Preserve recovery data and investigate before continuing.", code: NestError.Code.retained) }
         let metadataAfter = try container.entryStat("manifest.json")
         guard metadataBefore.st_dev == metadataAfter.st_dev, metadataBefore.st_ino == metadataAfter.st_ino,
               metadataBefore.st_ctimespec == metadataAfter.st_ctimespec, metadataBefore.st_size == metadataAfter.st_size,
-              try revisions.child(revision).identity() == containerIdentity else { throw NestError("Snapshot metadata/container changed during verification.", code: 6) }
+              try revisions.child(revision).identity() == containerIdentity else { throw NestError("Snapshot metadata/container changed during verification.", code: NestError.Code.retained) }
         let evidence = try RevisionEvidence(revision: revision, folder: id, tree: tree.projecting(expected))
         _ = try evidence.validate(store: store, id: id, revision: revision)
         return evidence
@@ -1613,7 +1644,7 @@ public enum Snapshot {
         let initial = sourceEvidence.manifest
         if let stored {
             let expected = try stored.logical.excludingTrashDirectories()
-            guard initial.matchesExpected(expected) else { throw NestError("Cannot capture a damaged committed source \(mismatchDetail(initial,expected)).", code: 6) }
+            guard initial.matchesExpected(expected) else { throw NestError("Cannot capture a damaged committed source \(mismatchDetail(initial,expected)).", code: NestError.Code.retained) }
         }
         try initial.preflight(capacity: folder.capacity)
         let revision = UUID().uuidString
@@ -1650,9 +1681,9 @@ public enum Snapshot {
             let (parent,name) = try cursor.parent(of:path), st = try parent.entryStat(name)
             if SnapshotExclusion.directory(name,st.st_mode) { result.append(path);continue }
             if st.st_mode & S_IFMT == S_IFDIR {
-                guard Paths.deviceID(st.st_dev) == device else { throw NestError("Nested mount in excluded-directory inventory; retained.",code:6) }
+                guard Paths.deviceID(st.st_dev) == device else { throw NestError("Nested mount in excluded-directory inventory; retained.",code: NestError.Code.retained) }
                 let child = try parent.child(name)
-                guard try child.identity() == (device,UInt64(st.st_ino)) else { throw NestError("Excluded-directory inventory changed; retained.",code:6) }
+                guard try child.identity() == (device,UInt64(st.st_ino)) else { throw NestError("Excluded-directory inventory changed; retained.",code: NestError.Code.retained) }
                 pending += try child.names().map { path + "/" + $0 }
             }
         }
@@ -1695,10 +1726,10 @@ enum SnapshotRetention {
             let revisions = try volume.child("revisions")
             try revisions.requireOwnedDirectory(device: volume.identity().device, privateMode: true)
             let path = store.root.path
-            guard !Paths.mounts().contains(where: { $0.path == path || $0.path.hasPrefix(path + "/") }) else { throw NestError("Nested mount in snapshot storage; cleanup skipped.", code: 6) }
+            guard !Paths.mounts().contains(where: { $0.path == path || $0.path.hasPrefix(path + "/") }) else { throw NestError("Nested mount in snapshot storage; cleanup skipped.", code: NestError.Code.retained) }
             var durable = try volume.readJSON(Journal.self, "journal.json", decoder: store.journalDecoder)
             var expected = journal; expected.updated = durable.updated
-            guard durable == expected else { throw NestError("Committed journal changed; cleanup skipped.", code: 6) }
+            guard durable == expected else { throw NestError("Committed journal changed; cleanup skipped.", code: NestError.Code.retained) }
             SiblingCleanup.rememberCompleted(folder, &durable)
             let completedSource = durable.restoreRevision ?? (folder.options.sync ? latest : nil)
             var keep = Set([latest])
@@ -1710,7 +1741,7 @@ enum SnapshotRetention {
             var identities: [String: (container: (device: UInt64, inode: UInt64), data: (device: UInt64, inode: UInt64))] = [:]
             var retainedEvidence: [Snapshot.RevisionEvidence] = []
             for revision in keep {
-                guard UUID(uuidString: revision)?.uuidString == revision else { throw NestError("Invalid committed revision; cleanup skipped.", code: 6) }
+                guard UUID(uuidString: revision)?.uuidString == revision else { throw NestError("Invalid committed revision; cleanup skipped.", code: NestError.Code.retained) }
                 let handle = try revisions.child(revision)
                 try handle.requireOwnedDirectory(device: revisions.identity().device, privateMode: true)
                 let data = try handle.child("data")
@@ -1733,10 +1764,10 @@ enum SnapshotRetention {
             try store.write(durable, for: folder.id)
             journal = durable
             let current = try store.managedVolume(folder.id).child("revisions")
-            guard try current.identity() == revisions.identity() else { throw NestError("Snapshot storage identity changed; cleanup skipped.", code: 6) }
+            guard try current.identity() == revisions.identity() else { throw NestError("Snapshot storage identity changed; cleanup skipped.", code: NestError.Code.retained) }
             for (revision, identity) in identities {
                 let handle = try revisions.child(revision)
-                guard try handle.identity() == identity.container, try handle.child("data").identity() == identity.data else { throw NestError("Retained snapshot identity changed; cleanup skipped.", code: 6) }
+                guard try handle.identity() == identity.container, try handle.child("data").identity() == identity.data else { throw NestError("Retained snapshot identity changed; cleanup skipped.", code: NestError.Code.retained) }
             }
             for evidence in retainedEvidence {
                 _ = try evidence.validate(store: store, id: folder.id, revision: evidence.revision)
@@ -1749,7 +1780,7 @@ enum SnapshotRetention {
             for candidate in pending {
                 if siblingPins.contains(candidate) { remaining.append(candidate); continue }
                 do {
-                    guard UUID(uuidString: candidate)?.uuidString == candidate else { throw NestError("Unrecognized revision reference retained.", code: 6) }
+                    guard UUID(uuidString: candidate)?.uuidString == candidate else { throw NestError("Unrecognized revision reference retained.", code: NestError.Code.retained) }
                     if try revisions.exists(candidate) {
                         // Reuse only this exact candidate's authenticated,
                         // operation-local evidence. A stale token must retain
@@ -1763,7 +1794,7 @@ enum SnapshotRetention {
                         }
                         try validateSource()
                         let current = try store.managedVolume(folder.id).child("revisions")
-                        guard try current.identity() == revisions.identity() else { throw NestError("Snapshot storage changed; cleanup skipped.", code: 6) }
+                        guard try current.identity() == revisions.identity() else { throw NestError("Snapshot storage changed; cleanup skipped.", code: NestError.Code.retained) }
                         for evidence in retainedEvidence {
                             _ = try evidence.validate(store: store, id: folder.id, revision: evidence.revision)
                         }

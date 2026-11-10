@@ -10,6 +10,56 @@ import Testing
 struct RAMNestTestSuite {}
 
 extension RAMNestTestSuite {
+    struct RefactorValueTests {
+        @Test func `NestError keeps public exit values default and custom codes`() {
+            let codes: [Int32] = [NestError.Code.error, NestError.Code.helper, NestError.Code.unsafePath,
+                NestError.Code.retained, NestError.Code.busy, NestError.Code.usage, NestError.Code.coherenceBlocked]
+            #expect(codes == [1, 2, 4, 6, 7, 64, 78])
+            #expect(NestError("default").code == 1)
+            #expect(NestError("custom", code: 42).code == 42)
+            let retained = NestError.retained("keep recovery evidence"), usage = NestError.usage("invalid option")
+            #expect(retained.code == 6 && retained.message == "keep recovery evidence")
+            #expect(retained.errorDescription == retained.message)
+            #expect(usage.code == 64 && usage.message == "invalid option")
+            #expect(usage.errorDescription == usage.message)
+        }
+
+        @Test(arguments: ["directory", "file", "symlink", "future-kind", ""])
+        func `Entry kind retains String Codable and unknown admission behavior`(kind: String) throws {
+            let wire: [String: Any] = ["path": "payload", "kind": kind, "size": 0, "mode": 384,
+                "mtimeSeconds": 0, "mtimeNanos": 0, "checksum": "", "attributes": [String: String](),
+                "flags": 0, "attributeBytes": 0]
+            let bytes = try JSONSerialization.data(withJSONObject: wire)
+            let entry = try JSONDecoder().decode(Entry.self, from: bytes)
+            #expect(entry.kind == kind && entry.knownKind == Entry.Kind(rawValue: kind))
+            #expect(entry.isDirectory == (kind == "directory"))
+            #expect(entry.isRegularFile == (kind == "file"))
+            #expect(entry.isSymlink == (kind == "symlink"))
+            let encoded = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(entry)) as? [String: Any])
+            #expect(NSDictionary(dictionary: encoded).isEqual(to: wire))
+            if entry.knownKind == nil {
+                let manifest = Manifest(entries: [entry])
+                let decoded = try JSONDecoder().decode(Manifest.self, from: JSONEncoder().encode(manifest))
+                #expect(decoded.entries[0] == entry)
+                #expect(throws: (any Error).self) { try decoded.excludingTrashDirectories() }
+            }
+        }
+
+        @Test(arguments: [UInt16(S_IFDIR), UInt16(S_IFREG), UInt16(S_IFLNK), UInt16(0)])
+        func `Relocation item predicates preserve numeric kind wire values`(kind: UInt16) throws {
+            let item = StorageRelocation.Item(path: "entry", device: 1, inode: 2, kind: kind, mode: 0o600,
+                uid: 0, gid: 0, flags: 0, size: 0, modifiedSeconds: 0, modifiedNanos: 0,
+                attributes: [:], acl: "", digest: kind == UInt16(S_IFREG) ? String(repeating: "0", count: 64) : nil, link: nil)
+            #expect(item.isDirectory == (kind == UInt16(S_IFDIR)))
+            #expect(item.isSymlink == (kind == UInt16(S_IFLNK)))
+            let bytes = try JSONEncoder().encode(item)
+            #expect(try JSONDecoder().decode(StorageRelocation.Item.self, from: bytes) == item)
+            let wire = try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+            #expect((wire["kind"] as? NSNumber)?.uint16Value == kind)
+            #expect(wire["isDirectory"] == nil && wire["isSymlink"] == nil)
+        }
+    }
+
     // Location tests inject every path. They never read or write real AppSupport.
     struct SnapshotStorageLocationTests {
         private func fixture() throws -> URL {

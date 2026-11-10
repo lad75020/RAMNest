@@ -30,7 +30,7 @@ enum PopulationReadiness {
                        timeout: TimeInterval = 3, interval: TimeInterval = 0.15,
                        maximumAttempts: Int = 21) throws {
         guard timeout.isFinite, timeout >= 0, interval.isFinite, interval > 0, maximumAttempts > 0 else {
-            throw NestError("Invalid population readiness bounds; RAM writes remain guarded.", code: 6)
+            throw NestError("Invalid population readiness bounds; RAM writes remain guarded.", code: NestError.Code.retained)
         }
         let deadline = uptime() + timeout
         var attempts = 0
@@ -53,7 +53,7 @@ enum PopulationReadiness {
             guard attempt + 1 < maximumAttempts, deadline - uptime() >= interval else { break }
             sleep(interval)
         }
-        throw NestError("Mounted population did not become ready after \(attempts) strict verification attempts: \(lastFailure). RAM writes remain guarded; initial snapshot and original files retained for explicit recovery.", code: 6)
+        throw NestError("Mounted population did not become ready after \(attempts) strict verification attempts: \(lastFailure). RAM writes remain guarded; initial snapshot and original files retained for explicit recovery.", code: NestError.Code.retained)
     }
     private static func transient(_ error: Error, depth: Int = 0) -> Bool {
         guard depth < 8 else { return false }
@@ -135,7 +135,7 @@ public final class Engine: @unchecked Sendable {
         try session.beforeVolumeLock?(initial.id)
         return try store.volumeLocked(initial.id) {
             let current = try store.locked { try store.resolve(initial.id.uuidString, config: store.load()) }
-            guard current.id == initial.id, current.path == initial.path else { throw NestError("Folder configuration changed.", code: 6) }
+            guard current.id == initial.id, current.path == initial.path else { throw NestError("Folder configuration changed.", code: NestError.Code.retained) }
             if current.device != initial.device || current.inode != initial.inode {
                 // A helper can finish restoration while this coordinator waits
                 // for the volume lock. Accept only its durable old-to-new root
@@ -148,7 +148,7 @@ public final class Engine: @unchecked Sendable {
                       layout.restoration == .checkpoint,
                       layout.source.device == initial.device, layout.source.inode == initial.inode,
                       layout.restored?.device == current.device, layout.restored?.inode == current.inode else {
-                    throw NestError("Folder configuration changed.", code: 6)
+                    throw NestError("Folder configuration changed.", code: NestError.Code.retained)
                 }
                 _ = try LinkedFolders.parent(layout, folder: current, root: session.linkedMountRoot)
                 _ = try LinkedFolders.root(layout)
@@ -171,7 +171,7 @@ public final class Engine: @unchecked Sendable {
             return try store.locked {
                 var config = try store.load()
                 let current = try Paths.validate(url, store: store, folders: config.folders)
-                guard current.st_dev == st.st_dev, current.st_ino == st.st_ino else { throw NestError("Selected folder changed during admission.", code: 4) }
+                guard current.st_dev == st.st_dev, current.st_ino == st.st_ino else { throw NestError("Selected folder changed during admission.", code: NestError.Code.unsafePath) }
                 try validateName(label, excluding: nil, config: config)
                 let f = Folder(name: label, path: url.path, capacity: capacity, device: Paths.deviceID(st.st_dev), inode: UInt64(st.st_ino), bookmark: bookmark, options: options)
                 config.folders.append(f); try store.save(config); try store.write(Journal(), for: f.id); return f
@@ -179,7 +179,7 @@ public final class Engine: @unchecked Sendable {
         }
     }
     private func validateName(_ name: String, excluding: UUID?, config: Configuration) throws {
-        guard !name.isEmpty, name.utf8.count <= 255, !name.contains("\n"), !name.contains("\t"), !name.contains("\0"), !config.folders.contains(where: { $0.id != excluding && $0.name.caseInsensitiveCompare(name) == .orderedSame }) else { throw NestError("Names must be nonempty and unique, ignoring case.", code: 64) }
+        guard !name.isEmpty, name.utf8.count <= 255, !name.contains("\n"), !name.contains("\t"), !name.contains("\0"), !config.folders.contains(where: { $0.id != excluding && $0.name.caseInsensitiveCompare(name) == .orderedSame }) else { throw NestError("Names must be nonempty and unique, ignoring case.", code: NestError.Code.usage) }
     }
     public func update(_ edited: Folder) throws {
         try volumeTransaction(edited.id.uuidString) { _ in
@@ -187,11 +187,11 @@ public final class Engine: @unchecked Sendable {
             let old = config.folders[i]
             guard edited.path == old.path, edited.device == old.device, edited.inode == old.inode, edited.capacity == old.capacity else { throw NestError("Use resize or locate; path identity cannot be edited.") }
             try validateName(edited.name, excluding: edited.id, config: config)
-            guard FolderOptions.intervals.contains(edited.options.intervalMinutes) else { throw NestError("Unsupported periodic interval.", code: 64) }
+            guard FolderOptions.intervals.contains(edited.options.intervalMinutes) else { throw NestError("Unsupported periodic interval.", code: NestError.Code.usage) }
             var j = try store.journal(edited.id)
-            guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery records and backups are retained. Use explicit RESET before editing or remounting this record.", code: 6) }
-            guard j.nativeTmpfs != nil || j.phase == .idle else { throw NestError("Use the original version to change a live legacy session.", code: 6) }
-            guard j.phase == .idle || j.phase == .mounted else { throw NestError("Finish recovery or the current operation before editing options.", code: 6) }
+            guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery records and backups are retained. Use explicit RESET before editing or remounting this record.", code: NestError.Code.retained) }
+            guard j.nativeTmpfs != nil || j.phase == .idle else { throw NestError("Use the original version to change a live legacy session.", code: NestError.Code.retained) }
+            guard j.phase == .idle || j.phase == .mounted else { throw NestError("Finish recovery or the current operation before editing options.", code: NestError.Code.retained) }
             try store.locked {
                 var latest = try store.load()
                 guard let current = latest.folders.firstIndex(where: { $0.id == edited.id }) else { throw NestError("Folder was removed.") }
@@ -208,7 +208,7 @@ public final class Engine: @unchecked Sendable {
         try store.locked {
             var config = try store.load(); config.fileVerification = policy; try store.save(config)
             let saved = try store.load().fileVerification
-            guard saved == policy else { throw NestError("File verification preference could not be verified.", code: 6) }
+            guard saved == policy else { throw NestError("File verification preference could not be verified.", code: NestError.Code.retained) }
             return saved
         }
     }
@@ -223,7 +223,7 @@ public final class Engine: @unchecked Sendable {
     }
     private func requireLive(_ folder: Folder, _ j: Journal) throws -> NativePinStatus {
         let observed = try NativeTmpfsControl.observe(j)
-        guard mountedIdentity(folder, j) else { throw NestError("Managed native link changed; retained.", code: 6) }
+        guard mountedIdentity(folder, j) else { throw NestError("Managed native link changed; retained.", code: NestError.Code.retained) }
         return NativePinStatus(id: folder.id, pid: (try? Control.status(j, id: folder.id).pid) ?? 0,
             mounted: true, used: observed.used, capacity: observed.capacity, active: !observed.readOnly && j.populationVerified)
     }
@@ -236,9 +236,9 @@ public final class Engine: @unchecked Sendable {
             else {
                 if let layout = pinned.managedLink {
                     _ = try LinkedFolders.parent(layout, folder: folder, root: self.session.linkedMountRoot)
-                    guard layout.stage == .restored, layout.mountReleased else { throw NestError("linked-folder restore cleanup is not committed.", code: 6) }
+                    guard layout.stage == .restored, layout.mountReleased else { throw NestError("linked-folder restore cleanup is not committed.", code: NestError.Code.retained) }
                 }
-                guard !Paths.mounts().contains(where: { $0.path == folder.path || $0.path.hasPrefix(folder.path + "/") }) else { throw NestError("Selected mount identity changed; cleanup skipped.", code: 6) }
+                guard !Paths.mounts().contains(where: { $0.path == folder.path || $0.path.hasPrefix(folder.path + "/") }) else { throw NestError("Selected mount identity changed; cleanup skipped.", code: NestError.Code.retained) }
                 try Paths.checkedIdentity(folder)
             }
         }, beforeSiblingUnlink: session.beforeCleanupUnlink)
@@ -248,7 +248,7 @@ public final class Engine: @unchecked Sendable {
     func evacuateOriginal(_ f: Folder, journal j: inout Journal, expected: Manifest,
                           sourceBefore: VerifiedRenameReceipt.Observation? = nil) throws -> (DirectoryHandle,URL) {
         if j.managedLink != nil { return try evacuateLinkedOriginal(f, journal: &j, expected: expected, sourceBefore: sourceBefore) }
-        throw NestError("New sessions require a journal-bound linked native layout.", code: 6)
+        throw NestError("New sessions require a journal-bound linked native layout.", code: NestError.Code.retained)
     }
     private func renameSync(_ fd: Int32, label: String) throws {
         let result = session.renameSync?(fd) ?? fsync(fd)
@@ -315,9 +315,9 @@ public final class Engine: @unchecked Sendable {
                 try layout.source.verify(source)
                 let parent = try LinkedFolders.parent(layout, folder: f, root: session.linkedMountRoot)
                 try layout.source.verify(LinkedFolders.holding(layout, parent: parent).child("data"))
-                guard original == layout.originalDataURL else { throw NestError("linked-folder original data path changed; retained.", code: 6) }
+                guard original == layout.originalDataURL else { throw NestError("linked-folder original data path changed; retained.", code: NestError.Code.retained) }
                 try layout.source.verify(DirectoryHandle.open(original))
-            } else { throw NestError("Population requires a linked native layout.", code: 6) }
+            } else { throw NestError("Population requires a linked native layout.", code: NestError.Code.retained) }
             _ = try originalObservation(f, journal: j, at: original, fallback: expected)
             if j.managedLink != nil { try publishOriginalLink(f, journal: &j) }
             j.populationVerified = true; j.phase = .mounted; try store.write(j, for: f.id)
@@ -328,10 +328,10 @@ public final class Engine: @unchecked Sendable {
     }
     func rollbackInitial(_ f: Folder, journal j: inout Journal) throws {
         guard j.startupProtocol == nil || j.startupProtocol == LegacyJournalFormat.startupVersion else {
-            throw NestError("Unknown guarded startup journal; originals retained.", code: 6)
+            throw NestError("Unknown guarded startup journal; originals retained.", code: NestError.Code.retained)
         }
         guard j.populationVerified || j.startupProtocol == nil || j.startupRetired == true else {
-            throw NestError("Guarded startup retirement is unproven. Original files and snapshot retained.", code: 6)
+            throw NestError("Guarded startup retirement is unproven. Original files and snapshot retained.", code: NestError.Code.retained)
         }
         if j.managedLink != nil { try restoreLinkedOriginal(f, journal: &j, temporary: true); return }
         try Paths.checkedIdentity(f)
@@ -344,86 +344,14 @@ public final class Engine: @unchecked Sendable {
         let selectedHandle = try DirectoryHandle.open(URL(fileURLWithPath: f.path)); try selectedHandle.verify(f)
         let selectedURL = URL(fileURLWithPath: f.path)
         if j.originalRename == nil, j.publicationRename == nil {
-            // Older journals have no verified-rename contract (and may have no
-            // session). Preserve their no-replace, strict raw recovery path.
-            // Do not mint a session or grant a new provenance exception.
-            if let holding = j.evacuation {
-                let original = try DirectoryHandle.open(URL(fileURLWithPath: holding))
-                let identity = try original.identity()
-                if let device = j.evacuationDevice, let inode = j.evacuationInode {
-                    guard identity.device == device, identity.inode == inode else { throw VerifiedRenameReceipt.failure(".", "legacy holding identity changed") }
-                }
-                let heldNames = Set(try original.names()), selectedNames = Set(try selectedHandle.names())
-                guard try Snapshot.manifest(URL(fileURLWithPath: holding), matching: expected)
-                    .contentsMatchExpected(expected.selecting(topNames: heldNames)),
-                      try Snapshot.manifest(selectedURL, matching: expected)
-                    .contentsMatchExpected(expected.selecting(topNames: selectedNames)) else {
-                    throw VerifiedRenameReceipt.failure(".", "legacy rollback raw contents changed")
-                }
-                for name in j.evacuatedEntries where try original.exists(name) {
-                    try Paths.checkedIdentity(f)
-                    try original.renameNoReplace(name, to: selectedHandle, as: name)
-                }
-                try original.sync(); try selectedHandle.sync()
-            }
+            // Older journals retain strict raw recovery without minting authority.
+            try rollbackLegacyHolding(f, journal: j, expected: expected, selectedHandle: selectedHandle, selectedURL: selectedURL)
         } else if let receipt = j.publicationRename {
-            try receipt.bound(to: f, journal: j, operation: .rollback)
-            _ = try receipt.verify(at: selectedURL)
+            try verifyRollbackPublication(f, journal: j, receipt: receipt, selectedURL: selectedURL)
         } else if let holding = j.evacuation {
-            let holdingURL = URL(fileURLWithPath: holding)
-            let original = try DirectoryHandle.open(holdingURL)
-            let identity = try original.identity()
-            guard identity.device == j.evacuationDevice, identity.inode == j.evacuationInode else { throw VerifiedRenameReceipt.failure(".", "original holding identity changed") }
-            let selectedRaw = try Snapshot.manifest(selectedURL, matching: expected)
-            if let root = j.originalRename?.before.nodes.first {
-                var st = stat()
-                guard fstat(selectedHandle.fd, &st) == 0, st.st_uid == root.owner, st.st_gid == root.group else { throw VerifiedRenameReceipt.failure(".", "rollback selected root owner changed") }
-            }
-            // A rejected intent with no actual rename can be rolled back only
-            // when the complete raw original is still present, unchanged.
-            if try original.names().isEmpty, selectedRaw == expected {
-                if let intent = j.originalRename, intent.after != nil, !intent.names.isEmpty { throw VerifiedRenameReceipt.failure(".", "completed evacuation holding unexpectedly empty") }
-                if let intent = j.originalRename {
-                    guard try VerifiedRenameReceipt.observe(selectedURL, matching: expected) == intent.before else { throw VerifiedRenameReceipt.failure(".", "unmoved source identity changed") }
-                }
-            } else {
-                let originalRaw = try originalObservation(f, journal: j, at: holdingURL, fallback: expected, allowStrictIncomplete: true)
-                if let name = try selectedHandle.names().first { throw VerifiedRenameReceipt.failure(name, "rollback destination conflict") }
-                guard selectedRaw.publicRoot == expected.publicRoot else { throw VerifiedRenameReceipt.failure(".", "rollback selected root metadata changed") }
-                if j.originalRename?.after == nil {
-                    // An unacknowledged intent can prove a strictly unchanged
-                    // raw tree, but cannot acquire the provenance waiver.
-                    let raw = try VerifiedRenameReceipt.observe(holdingURL, matching: originalRaw)
-                    guard raw.manifest == originalRaw, try original.names() == j.evacuatedEntries else { throw VerifiedRenameReceipt.failure(".", "strict rollback source changed") }
-                    let nodes = Dictionary(uniqueKeysWithValues: raw.nodes.map { ($0.path, $0) })
-                    for name in j.evacuatedEntries {
-                        try Paths.checkedIdentity(f)
-                        try verifiedEntryMove(name, from: original, to: selectedHandle, node: nodes[name])
-                    }
-                    try original.sync(); try selectedHandle.sync()
-                    guard try original.names().isEmpty,
-                          try Snapshot.manifest(selectedURL, matching: originalRaw).contentsMatchExpected(originalRaw) else { throw VerifiedRenameReceipt.failure(".", "strict reverse rename raw metadata changed") }
-                } else {
-                    var receipt = try VerifiedRenameReceipt(operation: .rollback, folder: f, journal: j, source: holdingURL,
-                        destination: selectedHandle, matching: j.originalRename?.after?.manifest ?? expected)
-                    guard receipt.before.manifest == originalRaw,
-                          receipt.before == j.originalRename?.after else { throw VerifiedRenameReceipt.failure(".", "rollback source changed before rename intent") }
-                    j.publicationRename = receipt; try store.write(j, for: f.id)
-                    let renameNodes = Dictionary(uniqueKeysWithValues: receipt.before.nodes.map { ($0.path, $0) })
-                    for name in receipt.names {
-                        try Paths.checkedIdentity(f)
-                        guard try DirectoryHandle.open(holdingURL).identity() == original.identity() else { throw VerifiedRenameReceipt.failure(".", "rollback holding path replaced") }
-                        try verifiedEntryMove(name, from: original, to: selectedHandle, node: renameNodes[name])
-                    }
-                    try renameSync(original.fd, label: "rollback holding"); try renameSync(selectedHandle.fd, label: "rollback source")
-                    try Paths.checkedIdentity(f)
-                    try receipt.complete(at: selectedURL)
-                    guard try original.names().isEmpty else { throw VerifiedRenameReceipt.failure(".", "rollback holding gained entries") }
-                    j.publicationRename = receipt; try store.write(j, for: f.id)
-                }
-            }
+            try rollbackEvacuation(f, journal: &j, holding: holding, expected: expected, selectedHandle: selectedHandle, selectedURL: selectedURL)
         } else {
-            guard try Snapshot.manifest(selectedURL, matching: expected) == expected else { throw VerifiedRenameReceipt.failure(".", "rollback raw source changed") }
+            try verifyRollbackRawSource(selectedURL, expected: expected)
         }
         let restored: Manifest
         if let receipt = j.publicationRename { restored = try receipt.verify(at: selectedURL) }
@@ -442,12 +370,104 @@ public final class Engine: @unchecked Sendable {
         try store.write(j, for: f.id)
         cleanSnapshots(f, &j)
     }
+
+    private func rollbackLegacyHolding(_ f: Folder, journal j: Journal, expected: Manifest, selectedHandle: DirectoryHandle, selectedURL: URL) throws {
+        guard let holding = j.evacuation else { return }
+        let original = try DirectoryHandle.open(URL(fileURLWithPath: holding))
+        let identity = try original.identity()
+        if let device = j.evacuationDevice, let inode = j.evacuationInode {
+            guard identity.device == device, identity.inode == inode else { throw VerifiedRenameReceipt.failure(".", "legacy holding identity changed") }
+        }
+        let heldNames = Set(try original.names()), selectedNames = Set(try selectedHandle.names())
+        guard try Snapshot.manifest(URL(fileURLWithPath: holding), matching: expected)
+            .contentsMatchExpected(expected.selecting(topNames: heldNames)),
+              try Snapshot.manifest(selectedURL, matching: expected)
+            .contentsMatchExpected(expected.selecting(topNames: selectedNames)) else {
+            throw VerifiedRenameReceipt.failure(".", "legacy rollback raw contents changed")
+        }
+        for name in j.evacuatedEntries where try original.exists(name) {
+            try Paths.checkedIdentity(f)
+            try original.renameNoReplace(name, to: selectedHandle, as: name)
+        }
+        try original.sync(); try selectedHandle.sync()
+    }
+    private func verifyRollbackPublication(_ f: Folder, journal j: Journal, receipt: VerifiedRenameReceipt, selectedURL: URL) throws {
+        try receipt.bound(to: f, journal: j, operation: .rollback)
+        _ = try receipt.verify(at: selectedURL)
+    }
+    private func rollbackEvacuation(_ f: Folder, journal j: inout Journal, holding: String, expected: Manifest, selectedHandle: DirectoryHandle, selectedURL: URL) throws {
+        let holdingURL = URL(fileURLWithPath: holding)
+        let original = try DirectoryHandle.open(holdingURL)
+        let identity = try original.identity()
+        guard identity.device == j.evacuationDevice, identity.inode == j.evacuationInode else { throw VerifiedRenameReceipt.failure(".", "original holding identity changed") }
+        let selectedRaw = try Snapshot.manifest(selectedURL, matching: expected)
+        if let root = j.originalRename?.before.nodes.first {
+            var st = stat()
+            guard fstat(selectedHandle.fd, &st) == 0, st.st_uid == root.owner, st.st_gid == root.group else { throw VerifiedRenameReceipt.failure(".", "rollback selected root owner changed") }
+        }
+        // A rejected intent with no actual rename can be rolled back only
+        // when the complete raw original is still present, unchanged.
+        if try original.names().isEmpty, selectedRaw == expected {
+            try verifyUnmovedRollback(journal: j, selectedURL: selectedURL, expected: expected)
+        } else {
+            let originalRaw = try originalObservation(f, journal: j, at: holdingURL, fallback: expected, allowStrictIncomplete: true)
+            if let name = try selectedHandle.names().first { throw VerifiedRenameReceipt.failure(name, "rollback destination conflict") }
+            guard selectedRaw.publicRoot == expected.publicRoot else { throw VerifiedRenameReceipt.failure(".", "rollback selected root metadata changed") }
+            if j.originalRename?.after == nil {
+                try rollbackStrictEvacuation(f, journal: j, holdingURL: holdingURL, original: original, originalRaw: originalRaw, selectedHandle: selectedHandle, selectedURL: selectedURL)
+            } else {
+                try rollbackCompletedEvacuation(f, journal: &j, holdingURL: holdingURL, original: original, originalRaw: originalRaw, expected: expected, selectedHandle: selectedHandle, selectedURL: selectedURL)
+            }
+        }
+    }
+    private func verifyUnmovedRollback(journal j: Journal, selectedURL: URL, expected: Manifest) throws {
+        if let intent = j.originalRename, intent.after != nil, !intent.names.isEmpty { throw VerifiedRenameReceipt.failure(".", "completed evacuation holding unexpectedly empty") }
+        if let intent = j.originalRename {
+            guard try VerifiedRenameReceipt.observe(selectedURL, matching: expected) == intent.before else { throw VerifiedRenameReceipt.failure(".", "unmoved source identity changed") }
+        }
+    }
+    private func rollbackStrictEvacuation(_ f: Folder, journal j: Journal, holdingURL: URL, original: DirectoryHandle, originalRaw: Manifest, selectedHandle: DirectoryHandle, selectedURL: URL) throws {
+        // An unacknowledged intent can prove a strictly unchanged
+        // raw tree, but cannot acquire the provenance waiver.
+        let raw = try VerifiedRenameReceipt.observe(holdingURL, matching: originalRaw)
+        guard raw.manifest == originalRaw, try original.names() == j.evacuatedEntries else { throw VerifiedRenameReceipt.failure(".", "strict rollback source changed") }
+        let nodes = Dictionary(uniqueKeysWithValues: raw.nodes.map { ($0.path, $0) })
+        for name in j.evacuatedEntries {
+            try Paths.checkedIdentity(f)
+            try verifiedEntryMove(name, from: original, to: selectedHandle, node: nodes[name])
+        }
+        try original.sync(); try selectedHandle.sync()
+        guard try original.names().isEmpty,
+              try Snapshot.manifest(selectedURL, matching: originalRaw).contentsMatchExpected(originalRaw) else { throw VerifiedRenameReceipt.failure(".", "strict reverse rename raw metadata changed") }
+    }
+    private func rollbackCompletedEvacuation(_ f: Folder, journal j: inout Journal, holdingURL: URL, original: DirectoryHandle, originalRaw: Manifest, expected: Manifest, selectedHandle: DirectoryHandle, selectedURL: URL) throws {
+        var receipt = try VerifiedRenameReceipt(operation: .rollback, folder: f, journal: j, source: holdingURL,
+            destination: selectedHandle, matching: j.originalRename?.after?.manifest ?? expected)
+        guard receipt.before.manifest == originalRaw,
+              receipt.before == j.originalRename?.after else { throw VerifiedRenameReceipt.failure(".", "rollback source changed before rename intent") }
+        j.publicationRename = receipt; try store.write(j, for: f.id)
+        let renameNodes = Dictionary(uniqueKeysWithValues: receipt.before.nodes.map { ($0.path, $0) })
+        for name in receipt.names {
+            try Paths.checkedIdentity(f)
+            guard try DirectoryHandle.open(holdingURL).identity() == original.identity() else { throw VerifiedRenameReceipt.failure(".", "rollback holding path replaced") }
+            try verifiedEntryMove(name, from: original, to: selectedHandle, node: renameNodes[name])
+        }
+        try renameSync(original.fd, label: "rollback holding"); try renameSync(selectedHandle.fd, label: "rollback source")
+        try Paths.checkedIdentity(f)
+        try receipt.complete(at: selectedURL)
+        guard try original.names().isEmpty else { throw VerifiedRenameReceipt.failure(".", "rollback holding gained entries") }
+        j.publicationRename = receipt; try store.write(j, for: f.id)
+    }
+    private func verifyRollbackRawSource(_ selectedURL: URL, expected: Manifest) throws {
+        guard try Snapshot.manifest(selectedURL, matching: expected) == expected else { throw VerifiedRenameReceipt.failure(".", "rollback raw source changed") }
+    }
+
     public func save(_ ref: String) throws {
         _ = try volumeTransaction(ref) { f in
             var j = try store.journal(f.id)
-            guard j.phase == .mounted else { throw NestError("A volume transaction is pending.", code: 6) }
+            guard j.phase == .mounted else { throw NestError("A volume transaction is pending.", code: NestError.Code.retained) }
             _ = try requireLive(f, j)
-            guard f.options.sync else { throw NestError("Temporary mode preserves the initial folder. Explicit export can rescue current RAM data.", code: 64) }
+            guard f.options.sync else { throw NestError("Temporary mode preserves the initial folder. Explicit export can rescue current RAM data.", code: NestError.Code.usage) }
             var evidence: Snapshot.CaptureEvidence?
             do {
                 _ = try captureNative(f, journal: &j, quiesce: false, didCapture: { evidence = $0 })
@@ -479,7 +499,7 @@ public final class Engine: @unchecked Sendable {
     public func unmount(_ ref: String, ignoreBusy: Bool = false) throws {
         let f = try folder(ref), j = try store.journal(f.id)
         if j.phase == .idle { return }
-        guard j.nativeTmpfs != nil else { throw NestError("A live historical session is unsupported. Finish it using its original version; this package contains no old storage engine.", code: 6) }
+        guard j.nativeTmpfs != nil else { throw NestError("A live historical session is unsupported. Finish it using its original version; this package contains no old storage engine.", code: NestError.Code.retained) }
         try unmountNative(ref, ignoreBusy: ignoreBusy)
     }
     public func finalize(_ ref: String) throws {
@@ -489,7 +509,7 @@ public final class Engine: @unchecked Sendable {
     private func restore(_ f: Folder, journal j: inout Journal) throws {
         if j.managedLink != nil { try restoreLinkedOriginal(f, journal: &j, temporary: false); return }
         try Paths.checkedIdentity(f)
-        guard let revision = j.restoreRevision ?? j.revision else { throw NestError("No committed snapshot. Export originals instead.", code: 6) }
+        guard let revision = j.restoreRevision ?? j.revision else { throw NestError("No committed snapshot. Export originals instead.", code: NestError.Code.retained) }
         let (source, authenticated) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
         let original = try Snapshot.materializationManifest(source,expected:authenticated,context:.managedRevision)
         if let receipt = j.publicationRename {
@@ -503,12 +523,12 @@ public final class Engine: @unchecked Sendable {
         }
         var expected = original
         if let copied = j.restoreManifest {
-            guard j.restoreStage != nil, try copied.matchesCopy(of: original) else { throw NestError("Restore copy observation is not bound to the verified revision.", code: 6) }
+            guard j.restoreStage != nil, try copied.matchesCopy(of: original) else { throw NestError("Restore copy observation is not bound to the verified revision.", code: NestError.Code.retained) }
             expected = copied
         }
         if expected.publicRoot.map({ $0.mode & 0o500 != 0o500 }) == true || expected.entries.contains(where:{
-            if $0.kind == "directory" { return $0.mode & 0o500 != 0o500 || (!$0.path.contains("/") && $0.mode & 0o200 == 0) }
-            return ($0.kind == "file" || $0.kind == "symlink") && $0.mode & 0o400 == 0
+            if $0.isDirectory { return $0.mode & 0o500 != 0o500 || (!$0.path.contains("/") && $0.mode & 0o200 == 0) }
+            return ($0.isRegularFile || $0.isSymlink) && $0.mode & 0o400 == 0
         }) {
             try restoreRestrictive(f,journal:&j,source:source,expected:expected);return
         }
@@ -519,9 +539,9 @@ public final class Engine: @unchecked Sendable {
         // A rename may be durable even if its following journal checkpoint was not.
         let present = Set(actual.entries.filter { !$0.path.contains("/") }.map(\.path))
         guard actual.contentsMatchExpected(expected.selecting(topNames: present)) else {
-            throw NestError("Recovery conflict in already restored entries. Snapshot retained.", code: 6)
+            throw NestError("Recovery conflict in already restored entries. Snapshot retained.", code: NestError.Code.retained)
         }
-        if !present.isEmpty && j.phase != .restoring { throw NestError("Mountpoint gained new entries. Export snapshot; automatic restore is blocked.", code: 6) }
+        if !present.isEmpty && j.phase != .restoring { throw NestError("Mountpoint gained new entries. Export snapshot; automatic restore is blocked.", code: NestError.Code.retained) }
         if j.restoreStage == nil {
             let stage = selected.deletingLastPathComponent().appendingPathComponent(".ramnest-\(f.id.uuidString)-restore-\(UUID().uuidString)")
             let parent = try DirectoryHandle.open(stage.deletingLastPathComponent())
@@ -538,14 +558,14 @@ public final class Engine: @unchecked Sendable {
             j.restoreStage = stage.path; j.phase = .restoring
             try store.write(j, for: f.id)
         }
-        guard let stagePath = j.restoreStage else { throw NestError("Missing restore staging path.", code: 6) }
+        guard let stagePath = j.restoreStage else { throw NestError("Missing restore staging path.", code: NestError.Code.retained) }
         let stagingRoot = try DirectoryHandle.open(URL(fileURLWithPath: stagePath))
         let stageIdentity = try stagingRoot.identity()
-        guard stageIdentity.device == j.restoreStageDevice, stageIdentity.inode == j.restoreStageInode else { throw NestError("Restore staging-directory identity changed. Snapshot retained.", code: 4) }
+        guard stageIdentity.device == j.restoreStageDevice, stageIdentity.inode == j.restoreStageInode else { throw NestError("Restore staging-directory identity changed. Snapshot retained.", code: NestError.Code.unsafePath) }
         let stagingData = try stagingRoot.child("data")
         let dataIdentity = try stagingData.identity()
         guard dataIdentity.device == j.restoreDataDevice, dataIdentity.inode == j.restoreDataInode else {
-            throw NestError("Restore data-directory identity changed. Snapshot retained.", code: 4)
+            throw NestError("Restore data-directory identity changed. Snapshot retained.", code: NestError.Code.unsafePath)
         }
         // A public read-only root remains read-only in the verified copy. Only
         // this identity-pinned private staging directory needs owner wx while
@@ -561,35 +581,35 @@ public final class Engine: @unchecked Sendable {
             guard let mode = originalStageMode, mode | 0o300 != mode,
                   try marker.names().isEmpty, fstat(stagingData.fd, &st) == 0, st.st_uid == getuid(),
                   st.st_mode & 0o7777 == mode || st.st_mode & 0o7777 == mode | 0o300 else {
-                throw NestError("Unexpected restore staging permissions. Snapshot retained.", code: 6)
+                throw NestError("Unexpected restore staging permissions. Snapshot retained.", code: NestError.Code.retained)
             }
-            guard fchmod(stagingData.fd, mode) == 0 else { throw NestError("Cannot restore staging root mode.", code: 6) }
+            guard fchmod(stagingData.fd, mode) == 0 else { throw NestError("Cannot restore staging root mode.", code: NestError.Code.retained) }
             try stagingData.sync()
         }
         try resetStagePermissions()
         let remaining = expected.selecting(topNames: Set(topNames).subtracting(present))
         let staged = try Snapshot.manifest(URL(fileURLWithPath: stagePath).appendingPathComponent("data"), matching: remaining)
         guard staged.matchesExpected(remaining) else {
-            throw NestError("Restore staging contents changed; no remaining entries moved. Snapshot retained.", code: 6)
+            throw NestError("Restore staging contents changed; no remaining entries moved. Snapshot retained.", code: NestError.Code.retained)
         }
         let selectedHandle = try DirectoryHandle.open(selected); try selectedHandle.verify(f)
         // Check inode equivalence across the selected/staged boundary too.
         // Separate subset manifests alone cannot detect a split cross-boundary link.
         let selectedCursor = DirectoryCursor(selectedHandle), stagedCursor = DirectoryCursor(stagingData)
         var groups: [String: String] = [:], identities: [String: String] = [:]
-        for entry in expected.entries where entry.kind == "file" {
+        for entry in expected.entries where entry.isRegularFile {
             let top = String(entry.path.split(separator: "/")[0])
             let (parent, leaf) = try (present.contains(top) ? selectedCursor : stagedCursor).parent(of: entry.path)
             let st = try parent.entryStat(leaf)
             let identity = "\(st.st_dev):\(st.st_ino)", group = entry.hardlink ?? entry.path
-            if let prior = groups[group], prior != identity { throw NestError("Restore hardlink class split; remaining entries retained.", code: 6) }
-            if let prior = identities[identity], prior != group { throw NestError("Restore hardlink classes merged; remaining entries retained.", code: 6) }
+            if let prior = groups[group], prior != identity { throw NestError("Restore hardlink class split; remaining entries retained.", code: NestError.Code.retained) }
+            if let prior = identities[identity], prior != group { throw NestError("Restore hardlink classes merged; remaining entries retained.", code: NestError.Code.retained) }
             groups[group] = identity; identities[identity] = group
         }
         if let mode = originalStageMode, mode | 0o300 != mode, !Set(topNames).isSubset(of: present) {
             if try !stagingRoot.exists(permissionMarker) { _ = try stagingRoot.createDirectory(permissionMarker) }
             try stagingRoot.sync()
-            guard fchmod(stagingData.fd, mode | 0o300) == 0 else { throw NestError("Cannot prepare private restore staging root.", code: 6) }
+            guard fchmod(stagingData.fd, mode | 0o300) == 0 else { throw NestError("Cannot prepare private restore staging root.", code: NestError.Code.retained) }
             try stagingData.sync()
         }
         var renameReceipt: VerifiedRenameReceipt?
@@ -614,7 +634,7 @@ public final class Engine: @unchecked Sendable {
         }
         try resetStagePermissions()
         if try stagingRoot.exists(permissionMarker) {
-            guard unlinkat(stagingRoot.fd, permissionMarker, AT_REMOVEDIR) == 0 else { throw NestError("Cannot finish restore staging permissions.", code: 6) }
+            guard unlinkat(stagingRoot.fd, permissionMarker, AT_REMOVEDIR) == 0 else { throw NestError("Cannot finish restore staging permissions.", code: NestError.Code.retained) }
             try stagingRoot.sync()
         }
         try Snapshot.restorePublicRootMetadata(from: stagingData, to: selectedHandle, manifest: expected)
@@ -625,7 +645,7 @@ public final class Engine: @unchecked Sendable {
             renameReceipt = receipt
         }
         guard (renameReceipt != nil || restored.contentsMatchExpected(expected)),
-              try Manifest(entries: [], publicRoot: restored.publicRoot).matchesCopy(of: Manifest(entries: [], publicRoot: expected.publicRoot)) else { throw NestError("Restored content verification failed. Snapshot retained.", code: 6) }
+              try Manifest(entries: [], publicRoot: restored.publicRoot).matchesCopy(of: Manifest(entries: [], publicRoot: expected.publicRoot)) else { throw NestError("Restored content verification failed. Snapshot retained.", code: NestError.Code.retained) }
         try restored.preflight(capacity: f.capacity)
         try Paths.checkedIdentity(f)
         try Store.syncDirectory(selected)
@@ -644,10 +664,10 @@ public final class Engine: @unchecked Sendable {
         let selectedHandle = try DirectoryHandle.open(selected);try selectedHandle.verify(f)
         let actual: Manifest
         do { actual = try Snapshot.manifest(selected,matching:expected) }
-        catch { throw NestError("Restrictive restore recovery cannot independently verify published content; snapshot and publication evidence retained. " + error.localizedDescription, code: 6) }
+        catch { throw NestError("Restrictive restore recovery cannot independently verify published content; snapshot and publication evidence retained. " + error.localizedDescription, code: NestError.Code.retained) }
         let topNames = expected.entries.filter { !$0.path.contains("/") }.map(\.path)
         let present = Set(actual.entries.filter { !$0.path.contains("/") }.map(\.path))
-        guard actual.contentsMatchExpected(expected.selecting(topNames:present)), present.isEmpty || j.phase == .restoring else { throw NestError("Restrictive restore conflicts with public content; retained.", code: 6) }
+        guard actual.contentsMatchExpected(expected.selecting(topNames:present)), present.isEmpty || j.phase == .restoring else { throw NestError("Restrictive restore conflicts with public content; retained.", code: NestError.Code.retained) }
         if j.restoreStage == nil {
             let stage = selected.deletingLastPathComponent().appendingPathComponent(".ramnest-\(f.id.uuidString)-restore-\(UUID().uuidString)")
             let parent = try DirectoryHandle.open(stage.deletingLastPathComponent()), root = try parent.createDirectory(stage.lastPathComponent)
@@ -663,29 +683,29 @@ public final class Engine: @unchecked Sendable {
         }
         let stage = URL(fileURLWithPath:j.restoreStage!), root = try DirectoryHandle.open(stage)
         let rootIdentity = try root.identity()
-        guard rootIdentity.device == j.restoreStageDevice, rootIdentity.inode == j.restoreStageInode else { throw NestError("Restrictive restore stage identity changed.", code: 6) }
+        guard rootIdentity.device == j.restoreStageDevice, rootIdentity.inode == j.restoreStageInode else { throw NestError("Restrictive restore stage identity changed.", code: NestError.Code.retained) }
         let data = try root.child("data")
         let dataIdentity = try data.identity()
-        guard dataIdentity.device == j.restoreDataDevice, dataIdentity.inode == j.restoreDataInode, try root.names() == ["data"] else { throw NestError("Restrictive restore data identity/namespace changed.", code: 6) }
+        guard dataIdentity.device == j.restoreDataDevice, dataIdentity.inode == j.restoreDataInode, try root.names() == ["data"] else { throw NestError("Restrictive restore data identity/namespace changed.", code: NestError.Code.retained) }
         let remaining = expected.selecting(topNames:Set(topNames).subtracting(present))
         let staged: Manifest
         do { staged = try StorageModes(remaining).projecting(Snapshot.scanManifest(stage.appendingPathComponent("data"),matching:remaining,phase:"restore-accessible-readback")) }
-        catch { throw NestError("Interrupted restrictive publication cannot be independently verified; stage, data, receipts and committed snapshot retained. " + error.localizedDescription, code: 6) }
-        guard staged.matchesExpected(remaining) else { throw NestError("Restrictive restore staging integrity mismatch.", code: 6) }
+        catch { throw NestError("Interrupted restrictive publication cannot be independently verified; stage, data, receipts and committed snapshot retained. " + error.localizedDescription, code: NestError.Code.retained) }
+        guard staged.matchesExpected(remaining) else { throw NestError("Restrictive restore staging integrity mismatch.", code: NestError.Code.retained) }
         // Preserve the full inode partition across an earlier public/private
         // boundary. Never finalize a private alias of an already-public inode.
         let publicCursor = DirectoryCursor(selectedHandle), privateCursor = DirectoryCursor(data)
         var groups: [String:String] = [:], identities: [String:String] = [:]
         var publicIdentities = Set<String>(), privateIdentities = Set<String>()
-        for e in expected.entries where e.kind == "file" {
+        for e in expected.entries where e.isRegularFile {
             let isPublic = present.contains(String(e.path.split(separator:"/")[0]))
             let (parent,name) = try (isPublic ? publicCursor : privateCursor).parent(of:e.path), st = try parent.entryStat(name)
             let identity = "\(st.st_dev):\(st.st_ino)", group = e.hardlink ?? e.path
-            guard groups[group] == nil || groups[group] == identity, identities[identity] == nil || identities[identity] == group else { throw NestError("Restrictive restore hardlink partition changed.", code: 6) }
+            guard groups[group] == nil || groups[group] == identity, identities[identity] == nil || identities[identity] == group else { throw NestError("Restrictive restore hardlink partition changed.", code: NestError.Code.retained) }
             groups[group] = identity;identities[identity] = group
             if isPublic { publicIdentities.insert(identity) } else { privateIdentities.insert(identity) }
         }
-        guard publicIdentities.isDisjoint(with:privateIdentities) else { throw NestError("Cannot finalize a cross-boundary public hardlink; retained.", code: 6) }
+        guard publicIdentities.isDisjoint(with:privateIdentities) else { throw NestError("Cannot finalize a cross-boundary public hardlink; retained.", code: NestError.Code.retained) }
         var expectedReceipt = PublicationReceipt(manifest:expected,destination:selected.lastPathComponent,phase:"verified-accessible")
         // Old pending receipts predate measured provenance costs. Their stage
         // has just passed exact legacy readback; preserve its original digest.
@@ -699,7 +719,7 @@ public final class Engine: @unchecked Sendable {
             if receipt.manifestDigest == oldReceipt.manifestDigest { expectedReceipt = oldReceipt }
         }
         guard let receipt = j.publicationReceipt, receipt.version == 1, receipt.manifestDigest == expectedReceipt.manifestDigest,
-              receipt.destination == expectedReceipt.destination else { throw NestError("Missing or unauthenticated restrictive publication receipt; retained.", code: 6) }
+              receipt.destination == expectedReceipt.destination else { throw NestError("Missing or unauthenticated restrictive publication receipt; retained.", code: NestError.Code.retained) }
         let names = Dictionary(uniqueKeysWithValues:topNames.filter{!present.contains($0)}.map{($0,".ramnest-publish-"+UUID().uuidString)})
         j.publicationReceipt?.phase = "finalizing";j.publicationReceipt?.privateNames = names;try store.write(j,for:f.id)
         // Darwin cannot move a 0000/read-only directory across parents. Move
@@ -726,7 +746,7 @@ public final class Engine: @unchecked Sendable {
         let originals = Dictionary(uniqueKeysWithValues:remaining.entries.map{(shadowPath($0.path),$0.path)})
         for i in finalized.identities.indices {
             guard let path = originals[finalized.identities[i].path], let before = transferred[path],
-                  before.device == finalized.identities[i].device, before.inode == finalized.identities[i].inode else { throw NestError("Publication transfer identity changed; all evidence retained.", code: 6) }
+                  before.device == finalized.identities[i].device, before.inode == finalized.identities[i].inode else { throw NestError("Publication transfer identity changed; all evidence retained.", code: NestError.Code.retained) }
             finalized.identities[i].path = path
         }
         finalized.privateNames = names
@@ -743,9 +763,9 @@ public final class Engine: @unchecked Sendable {
         let copiedRoot = try Snapshot.preparePublicRoot(from:data,to:selectedHandle,selected:selected,manifest:expected)
         var finalManifest = expected; finalManifest.publicRoot = copiedRoot
         try finalManifest.preflight(capacity: f.capacity)
-        guard let logical = expected.publicRoot?.mode, fchmod(selectedHandle.fd,mode_t(logical)) == 0 else { throw NestError("Cannot finalize selected root permissions.", code: 6) }
+        guard let logical = expected.publicRoot?.mode, fchmod(selectedHandle.fd,mode_t(logical)) == 0 else { throw NestError("Cannot finalize selected root permissions.", code: NestError.Code.retained) }
         var finalRoot = stat()
-        guard fstat(selectedHandle.fd,&finalRoot) == 0, finalRoot.st_mode & 0o7777 == logical else { throw NestError("Selected root final-mode verification failed.", code: 6) }
+        guard fstat(selectedHandle.fd,&finalRoot) == 0, finalRoot.st_mode & 0o7777 == logical else { throw NestError("Selected root final-mode verification failed.", code: NestError.Code.retained) }
         try selectedHandle.sync()
         try Paths.checkedIdentity(f)
         j.publicationReceipt?.phase = "published";j.phase = .idle;j.mountedDevice = nil;j.lastError = nil
@@ -754,7 +774,7 @@ public final class Engine: @unchecked Sendable {
     }
     public func recover(_ ref: String) throws {
         guard try store.journal(folder(ref).id).reviewedRecovery == nil else {
-            throw NestError("This legacy publication has a reviewed-recovery acknowledgement. Use Review Legacy Recovery for an interrupted confirmation; completed recovery retains its backups until explicit RESET.", code: 6)
+            throw NestError("This legacy publication has a reviewed-recovery acknowledgement. Use Review Legacy Recovery for an interrupted confirmation; completed recovery retains its backups until explicit RESET.", code: NestError.Code.retained)
         }
         if try store.journal(folder(ref).id).nativeTmpfs != nil { try finalizeNative(ref, explicitRecovery: true) }
         else { try recoverLegacyData(ref) }
@@ -764,16 +784,16 @@ public final class Engine: @unchecked Sendable {
     private func recoverLegacyData(_ ref: String) throws {
         try volumeTransaction(ref) { f in
             var j = try store.journal(f.id)
-            guard j.reviewedRecovery == nil else { throw NestError("Use a fresh legacy recovery review; ordinary Recover cannot consume an acknowledgement.", code: 6) }
+            guard j.reviewedRecovery == nil else { throw NestError("Use a fresh legacy recovery review; ordinary Recover cannot consume an acknowledgement.", code: NestError.Code.retained) }
             guard !Paths.mounts().contains(where: { $0.path == (j.managedLink?.mountPath ?? f.path) }) else {
-                throw NestError("A historical mount is still present. Use its original version; native RAMNest will not operate on it.", code: 6)
+                throw NestError("A historical mount is still present. Use its original version; native RAMNest will not operate on it.", code: NestError.Code.retained)
             }
             if let socket = j.socket {
                 var st = stat()
-                guard lstat(socket, &st) != 0 && errno == ENOENT else { throw NestError("Historical helper authority is not retired. Export its committed disk checkpoint or use the original version.", code: 6) }
+                guard lstat(socket, &st) != 0 && errno == ENOENT else { throw NestError("Historical helper authority is not retired. Export its committed disk checkpoint or use the original version.", code: NestError.Code.retained) }
             }
             for pid in [j.startupHelperPID, j.quiescedHelperPID].compactMap({ $0 }) where pid > 1 {
-                guard kill(pid, 0) != 0 && errno == ESRCH else { throw NestError("A historical helper may still be alive; only committed checkpoint export is available.", code: 6) }
+                guard kill(pid, 0) != 0 && errno == ESRCH else { throw NestError("A historical helper may still be alive; only committed checkpoint export is available.", code: NestError.Code.retained) }
             }
             do {
             if j.phase == .idle { if j.managedLink != nil { try finishLinkedRestore(f, journal: &j) }; cleanSnapshots(try refreshedFolder(f), &j); return }
@@ -795,12 +815,12 @@ public final class Engine: @unchecked Sendable {
             let selected: String
             var captured: Snapshot.CaptureEvidence?
             if live, j.nativeTmpfs != nil {
-                guard mountedIdentity(f, j), j.populationVerified else { throw NestError("Native RAM is unavailable or its link changed. Export without --live recovers only a committed disk checkpoint.", code: 6) }
+                guard mountedIdentity(f, j), j.populationVerified else { throw NestError("Native RAM is unavailable or its link changed. Export without --live recovers only a committed disk checkpoint.", code: NestError.Code.retained) }
                 selected = try captureNative(f, journal: &j, quiesce: false, didCapture: { captured = $0 })
             }
-            else if live { throw NestError("Live export requires a bound native tmpfs tree. Historical disk checkpoints can be exported without --live.", code: 6) }
+            else if live { throw NestError("Live export requires a bound native tmpfs tree. Historical disk checkpoints can be exported without --live.", code: NestError.Code.retained) }
             else if let candidate = revision ?? j.revision { selected = candidate }
-            else { throw NestError("No snapshot exists yet.", code: 6) }
+            else { throw NestError("No snapshot exists yet.", code: NestError.Code.retained) }
             let verified = try Snapshot.verifiedEvidence(store: store, id: f.id, revision: selected)
             let (data, manifest) = try verified.validate(store: store, id: f.id, revision: selected)
             try Paths.rejectSymlinks(destination.deletingLastPathComponent().path)
@@ -812,29 +832,29 @@ public final class Engine: @unchecked Sendable {
         try SizeParser.validate(capacity)
         try volumeTransaction(ref) { current in
             var f = current; let j = try store.journal(f.id)
-            guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery retains this record until explicit RESET; capacity was not changed.", code: 6) }
+            guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery retains this record until explicit RESET; capacity was not changed.", code: NestError.Code.retained) }
             guard j.phase == .idle, !Paths.mounts().contains(where: { $0.path == (j.nativeTmpfs.map { NativeTmpfsPaths.mount($0.session).path } ?? j.managedLink?.mountPath ?? f.path) }) else {
-                throw NestError("Native tmpfs does not support live resize on this macOS version. Eject/recover first; capacity was not changed.", code: 64)
+                throw NestError("Native tmpfs does not support live resize on this macOS version. Eject/recover first; capacity was not changed.", code: NestError.Code.usage)
             }
             try Paths.checkedIdentity(f)
-            guard try Snapshot.manifest(URL(fileURLWithPath: f.path), verification: fileVerification()).allocatedEstimate <= capacity else { throw NestError("Cannot shrink below folder contents.", code: 6) }
+            guard try Snapshot.manifest(URL(fileURLWithPath: f.path), verification: fileVerification()).allocatedEstimate <= capacity else { throw NestError("Cannot shrink below folder contents.", code: NestError.Code.retained) }
             f.capacity = capacity
             try store.locked {
                 var latest = try store.load()
-                guard let i = latest.folders.firstIndex(where: { $0.id == f.id }) else { throw NestError("Folder was removed.", code: 6) }
+                guard let i = latest.folders.firstIndex(where: { $0.id == f.id }) else { throw NestError("Folder was removed.", code: NestError.Code.retained) }
                 latest.folders[i].capacity = f.capacity; try store.save(latest)
             }
         }
     }
     public func delete(_ ref: String, destroy: Bool = false, confirmed: Bool = false) throws {
-        guard !destroy || confirmed else { throw NestError("Destructive deletion requires --destroy --confirm-delete.", code: 64) }
+        guard !destroy || confirmed else { throw NestError("Destructive deletion requires --destroy --confirm-delete.", code: NestError.Code.usage) }
         let f = try folder(ref)
         let j = try store.locked { try store.journal(f.id) }
         if j.phase != .idle { try unmount(f.id.uuidString) }
         try volumeTransaction(f.id.uuidString) { f in
             let c = try store.load(); let j = try store.journal(f.id)
-            guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery evidence is retained in this record. Use explicit RESET to remove managed metadata; external recovery folders are preserved.", code: 6) }
-            guard j.phase == .idle else { throw NestError("Recovery must finish before deleting configuration.", code: 6) }
+            guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery evidence is retained in this record. Use explicit RESET to remove managed metadata; external recovery folders are preserved.", code: NestError.Code.retained) }
+            guard j.phase == .idle else { throw NestError("Recovery must finish before deleting configuration.", code: NestError.Code.retained) }
             try Paths.checkedIdentity(f)
             if destroy {
                 _ = try Paths.validate(URL(fileURLWithPath: f.path), store: store, folders: c.folders, excluding: f.id)
@@ -851,7 +871,7 @@ public final class Engine: @unchecked Sendable {
 
     func evacuateLinkedOriginal(_ f: Folder, journal j: inout Journal, expected: Manifest,
                                 sourceBefore: VerifiedRenameReceipt.Observation? = nil) throws -> (DirectoryHandle, URL) {
-        guard var layout = j.managedLink, layout.stage == .reserved else { throw NestError("Unexpected linked-folder evacuation stage.", code: 6) }
+        guard var layout = j.managedLink, layout.stage == .reserved else { throw NestError("Unexpected linked-folder evacuation stage.", code: NestError.Code.retained) }
         let parent = try LinkedFolders.parent(layout, folder: f, root: session.linkedMountRoot)
         let root = try LinkedFolders.root(layout)
         if layout.version == 2 {
@@ -866,7 +886,7 @@ public final class Engine: @unchecked Sendable {
         let source = try parent.child(selected.lastPathComponent)
         try layout.source.verify(source)
         guard try Snapshot.manifest(selected, matching: expected).matchesExpected(expected),
-              try !parent.exists(holding.lastPathComponent) else { throw NestError("Source changed or original holding collision; retained.", code: 6) }
+              try !parent.exists(holding.lastPathComponent) else { throw NestError("Source changed or original holding collision; retained.", code: NestError.Code.retained) }
         // The wrapper is private; the original directory is never chmod-ed.
         // A crash before this identity checkpoint leaves an unknown wrapper
         // that recovery must retain rather than adopt by its generated name.
@@ -900,7 +920,7 @@ public final class Engine: @unchecked Sendable {
     }
 
     func publishOriginalLink(_ f: Folder, journal j: inout Journal) throws {
-        guard var layout = j.managedLink, layout.stage == .evacuated else { throw NestError("Unexpected linked-folder link publication stage.", code: 6) }
+        guard var layout = j.managedLink, layout.stage == .evacuated else { throw NestError("Unexpected linked-folder link publication stage.", code: NestError.Code.retained) }
         let parent = try LinkedFolders.parent(layout, folder: f, root: session.linkedMountRoot)
         _ = try LinkedFolders.root(layout)
         if layout.version == 2 { _ = try NativeTmpfsControl.observe(j, readonly: true) }
@@ -908,7 +928,7 @@ public final class Engine: @unchecked Sendable {
         let staged = URL(fileURLWithPath: layout.linkStagePath).lastPathComponent
         let selected = URL(fileURLWithPath: layout.originalPath).lastPathComponent
         guard try !parent.exists(selected), try !parent.exists(staged),
-              symlinkat(layout.mountPath, parent.fd, staged) == 0 else { throw NestError("Cannot reserve exact original-path symlink; retained.", code: 6) }
+              symlinkat(layout.mountPath, parent.fd, staged) == 0 else { throw NestError("Cannot reserve exact original-path symlink; retained.", code: NestError.Code.retained) }
         try parent.sync()
         let st = try parent.entryStat(staged)
         layout.link = .init((Paths.deviceID(st.st_dev), UInt64(st.st_ino)))
@@ -925,11 +945,11 @@ public final class Engine: @unchecked Sendable {
     /// configuration. Either side of either write can be resumed by identity.
     func restoreLinkedOriginal(_ f: Folder, journal j: inout Journal, temporary: Bool,
                                authorization: NativeTmpfsAuthorization? = nil) throws {
-        guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery requires its separate confirmation flow.", code: 6) }
-        guard var layout = j.managedLink else { throw NestError("Missing linked-folder authority.", code: 6) }
+        guard j.reviewedRecovery == nil else { throw NestError("Reviewed recovery requires its separate confirmation flow.", code: NestError.Code.retained) }
+        guard var layout = j.managedLink else { throw NestError("Missing linked-folder authority.", code: NestError.Code.retained) }
         let parent = try LinkedFolders.parent(layout, folder: f, root: session.linkedMountRoot)
         _ = try LinkedFolders.root(layout)
-        guard !Paths.mounts().contains(where: { $0.path == layout.mountPath || $0.path.hasPrefix(layout.mountPath + "/") }) else { throw NestError("Internal linked-folder mount remains present; restore blocked.", code: 6) }
+        guard !Paths.mounts().contains(where: { $0.path == layout.mountPath || $0.path.hasPrefix(layout.mountPath + "/") }) else { throw NestError("Internal linked-folder mount remains present; restore blocked.", code: NestError.Code.retained) }
         if j.nativeTmpfs != nil { try NativeTmpfsControl.assertAbsent(j) }
         let selected = URL(fileURLWithPath: f.path)
         let selectedExists = try parent.exists(selected.lastPathComponent)
@@ -938,7 +958,7 @@ public final class Engine: @unchecked Sendable {
            layout.source.matches(try parent.entryStat(selected.lastPathComponent)) {
             // Evacuation never happened. Never select this branch after RAM
             // activation or after a newer committed checkpoint exists.
-            guard !j.populationVerified, j.revision == j.initialRevision || j.initialRevision == nil else { throw NestError("Unexpected committed RAM authority; originals retained.", code: 6) }
+            guard !j.populationVerified, j.revision == j.initialRevision || j.initialRevision == nil else { throw NestError("Unexpected committed RAM authority; originals retained.", code: NestError.Code.retained) }
             try layout.source.verify(parent.child(selected.lastPathComponent))
             if let intent = j.originalRename {
                 guard intent.after == nil, try VerifiedRenameReceipt.observe(selected, matching: intent.before.manifest) == intent.before else { throw VerifiedRenameReceipt.failure(".", "unmoved linked-folder original changed") }
@@ -954,46 +974,56 @@ public final class Engine: @unchecked Sendable {
         else { alreadyPublished = false }
         if !alreadyPublished { try layout.source.verify(LinkedFolders.holding(layout, parent: parent).child("data")) }
         let useOriginal = layout.restoration.map { $0 == .original } ?? temporary
-        if layout.stage != .publishing {
-            let revision = useOriginal ? j.initialRevision : (j.restoreRevision ?? j.revision)
-            guard let revision else { throw NestError("Missing verified restore revision; backup and RAM retained.", code: 6) }
-            let (source, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
-            j.restoreRevision = revision
-            if useOriginal {
-                try layout.source.verify(LinkedFolders.holding(layout, parent: parent).child("data"))
-                let originalExpected = try originalObservation(f, journal: j, at: layout.originalDataURL, fallback: expected, allowStrictIncomplete: true)
-                j.restoreManifest = originalExpected
-                layout.restored = layout.source
-                layout.restoration = .original
-            } else {
-                // A crash during materialization has no publication authority.
-                // Retain the partial stage instead of adopting by its name.
-                guard j.restoreStage == nil else { throw NestError("Interrupted unverified restore stage retained; export committed snapshot before manual recovery.", code: 6) }
-                let stage = selected.deletingLastPathComponent().appendingPathComponent(".ramnest-\(f.id.uuidString)-restore-\(UUID().uuidString)")
-                let handle = try parent.createDirectory(stage.lastPathComponent)
-                let identity = try handle.identity()
-                j.restoreStage = stage.path; j.restoreStageDevice = identity.device; j.restoreStageInode = identity.inode
-                layout.restoration = .checkpoint; layout.stage = .restoring; j.managedLink = layout; j.phase = .restoring
-                try parent.sync(); try store.write(j, for: f.id)
-                // The final-mode tree is a direct sibling of the original.
-                // Darwin can publish a read-only root by same-parent swap;
-                // moving it out of a wrapper can require changing its mode.
-                let dataURL = stage.appendingPathExtension("data")
-                let copied = try Snapshot.copyTree(from: source, to: dataURL, manifest: expected, publicationStaging: true, sourceContext: .managedRevision)
-                try copied.preflight(capacity: f.capacity)
-                j.restoreManifest = copied
-                let data = try parent.child(dataURL.lastPathComponent), restored = try data.identity()
-                // Full independent readback preserves existing metadata,
-                // digest and hardlink checks. Unreadable final modes fail closed.
-                guard try Snapshot.manifest(dataURL, matching: copied).matchesExpected(copied) else { throw NestError("Restore stage readback failed; backup and RAM retained.", code: 6) }
-                try data.sync(); try handle.sync(); try parent.sync()
-                j.restoreDataDevice = restored.device; j.restoreDataInode = restored.inode
-                layout.restored = .init(restored)
-            }
-            layout.stage = .publishing; j.managedLink = layout; j.phase = .restoring
-            try store.write(j, for: f.id)
+        try materializeRestoreStage(f, journal: &j, layout: &layout, parent: parent, selected: selected, useOriginal: useOriginal)
+        try publishLinkedRestore(f, journal: &j, layout: layout, parent: parent, selected: selected, useOriginal: useOriginal)
+        try verifyPublishedRestore(f, journal: j, layout: layout, parent: parent, selected: selected)
+        layout.stage = .restored; j.managedLink = layout; try store.write(j, for: f.id)
+        try finishLinkedRestore(f, journal: &j, authorization: authorization)
+    }
+
+    private func materializeRestoreStage(_ f: Folder, journal j: inout Journal, layout: inout LinkedFolderLayout, parent: DirectoryHandle, selected: URL, useOriginal: Bool) throws {
+        guard layout.stage != .publishing else { return }
+        let revision = useOriginal ? j.initialRevision : (j.restoreRevision ?? j.revision)
+        guard let revision else { throw NestError("Missing verified restore revision; backup and RAM retained.", code: NestError.Code.retained) }
+        let (source, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
+        j.restoreRevision = revision
+        if useOriginal {
+            try layout.source.verify(LinkedFolders.holding(layout, parent: parent).child("data"))
+            let originalExpected = try originalObservation(f, journal: j, at: layout.originalDataURL, fallback: expected, allowStrictIncomplete: true)
+            j.restoreManifest = originalExpected
+            layout.restored = layout.source
+            layout.restoration = .original
+        } else {
+            // A crash during materialization has no publication authority.
+            // Retain the partial stage instead of adopting by its name.
+            guard j.restoreStage == nil else { throw NestError("Interrupted unverified restore stage retained; export committed snapshot before manual recovery.", code: NestError.Code.retained) }
+            let stage = selected.deletingLastPathComponent().appendingPathComponent(".ramnest-\(f.id.uuidString)-restore-\(UUID().uuidString)")
+            let handle = try parent.createDirectory(stage.lastPathComponent)
+            let identity = try handle.identity()
+            j.restoreStage = stage.path; j.restoreStageDevice = identity.device; j.restoreStageInode = identity.inode
+            layout.restoration = .checkpoint; layout.stage = .restoring; j.managedLink = layout; j.phase = .restoring
+            try parent.sync(); try store.write(j, for: f.id)
+            // The final-mode tree is a direct sibling of the original.
+            // Darwin can publish a read-only root by same-parent swap;
+            // moving it out of a wrapper can require changing its mode.
+            let dataURL = stage.appendingPathExtension("data")
+            let copied = try Snapshot.copyTree(from: source, to: dataURL, manifest: expected, publicationStaging: true, sourceContext: .managedRevision)
+            try copied.preflight(capacity: f.capacity)
+            j.restoreManifest = copied
+            let data = try parent.child(dataURL.lastPathComponent), restored = try data.identity()
+            // Full independent readback preserves existing metadata,
+            // digest and hardlink checks. Unreadable final modes fail closed.
+            guard try Snapshot.manifest(dataURL, matching: copied).matchesExpected(copied) else { throw NestError("Restore stage readback failed; backup and RAM retained.", code: NestError.Code.retained) }
+            try data.sync(); try handle.sync(); try parent.sync()
+            j.restoreDataDevice = restored.device; j.restoreDataInode = restored.inode
+            layout.restored = .init(restored)
         }
-        guard let restored = layout.restored else { throw NestError("Missing publication identity.", code: 6) }
+        layout.stage = .publishing; j.managedLink = layout; j.phase = .restoring
+        try store.write(j, for: f.id)
+    }
+
+    private func publishLinkedRestore(_ f: Folder, journal j: inout Journal, layout: LinkedFolderLayout, parent: DirectoryHandle, selected: URL, useOriginal: Bool) throws {
+        guard let restored = layout.restored else { throw NestError("Missing publication identity.", code: NestError.Code.retained) }
         let nowExists = try parent.exists(selected.lastPathComponent)
         if nowExists, restored.matches(try parent.entryStat(selected.lastPathComponent)) {
             if var receipt = j.publicationRename {
@@ -1014,7 +1044,7 @@ public final class Engine: @unchecked Sendable {
             if useOriginal { from = try LinkedFolders.holding(layout, parent: parent); name = "data" }
             else {
                 guard let stage = j.restoreStage, let device = j.restoreStageDevice, let inode = j.restoreStageInode,
-                      URL(fileURLWithPath: stage).deletingLastPathComponent() == selected.deletingLastPathComponent() else { throw NestError("Missing bound restore stage.", code: 6) }
+                      URL(fileURLWithPath: stage).deletingLastPathComponent() == selected.deletingLastPathComponent() else { throw NestError("Missing bound restore stage.", code: NestError.Code.retained) }
                 let container = try parent.child(URL(fileURLWithPath: stage).lastPathComponent)
                 try LinkedFolderLayout.Identity((device, inode)).verify(container)
                 from = parent; name = URL(fileURLWithPath: stage).appendingPathExtension("data").lastPathComponent
@@ -1056,11 +1086,11 @@ public final class Engine: @unchecked Sendable {
                 if let receipt = renameReceipt, receipt.publicationSwap != nil {
                     try receipt.verifyPublicationSwapPreflight(folder: f, journal: j)
                 }
-                guard renameatx_np(from.fd, name, parent.fd, selected.lastPathComponent, UInt32(RENAME_SWAP)) == 0 else { throw NestError("Atomic original-path restore failed; backup and RAM retained.", code: 6) }
+                guard renameatx_np(from.fd, name, parent.fd, selected.lastPathComponent, UInt32(RENAME_SWAP)) == 0 else { throw NestError("Atomic original-path restore failed; backup and RAM retained.", code: NestError.Code.retained) }
             } else {
                 // Only evacuation/linking (or a recorded publishing intent)
                 // permits absence; an active link disappearing is a conflict.
-                guard !j.populationVerified else { throw NestError("Managed original-path link disappeared; backup and RAM retained.", code: 6) }
+                guard !j.populationVerified else { throw NestError("Managed original-path link disappeared; backup and RAM retained.", code: NestError.Code.retained) }
                 try from.renameNoReplace(name, to: parent, as: selected.lastPathComponent)
             }
             try from.sync(); try parent.sync()
@@ -1078,20 +1108,22 @@ public final class Engine: @unchecked Sendable {
                 _ = try intent.verifyStrictIncomplete(at: selected)
             }
         }
+    }
+
+    private func verifyPublishedRestore(_ f: Folder, journal j: Journal, layout: LinkedFolderLayout, parent: DirectoryHandle, selected: URL) throws {
+        guard let restored = layout.restored else { throw NestError("Missing publication identity.", code: NestError.Code.retained) }
         try restored.verify(parent.child(selected.lastPathComponent))
         if let revision = j.restoreRevision {
             let (_, expected) = try Snapshot.verified(store: store, id: f.id, revision: revision, verification: j.fileVerification)
             let publicationExpected = j.restoreManifest ?? expected
             let materialized = try Snapshot.materializationManifest(try Snapshot.dataURL(store: store, id: f.id, revision: revision), expected: expected, context: .managedRevision)
             let bound = try j.publicationRename.map { try $0.matchesPublicationCopy(publicationExpected, of: materialized) } ?? publicationExpected.matchesCopy(of: materialized)
-            guard bound, try Snapshot.manifest(selected, matching: publicationExpected).matchesExpected(publicationExpected) else { throw NestError("Published restore readback failed; backup and RAM retained.", code: 6) }
+            guard bound, try Snapshot.manifest(selected, matching: publicationExpected).matchesExpected(publicationExpected) else { throw NestError("Published restore readback failed; backup and RAM retained.", code: NestError.Code.retained) }
         }
-        layout.stage = .restored; j.managedLink = layout; try store.write(j, for: f.id)
-        try finishLinkedRestore(f, journal: &j, authorization: authorization)
     }
 
     func finishLinkedRestore(_ f: Folder, journal j: inout Journal, authorization supplied: NativeTmpfsAuthorization? = nil) throws {
-        guard var layout = j.managedLink, layout.stage == .restored, let restored = layout.restored else { throw NestError("linked-folder restoration is not committed.", code: 6) }
+        guard var layout = j.managedLink, layout.stage == .restored, let restored = layout.restored else { throw NestError("linked-folder restoration is not committed.", code: NestError.Code.retained) }
         let parent = try LinkedFolders.parent(layout, folder: f, root: session.linkedMountRoot)
         let selected = URL(fileURLWithPath: f.path)
         try restored.verify(parent.child(selected.lastPathComponent))
@@ -1110,7 +1142,7 @@ public final class Engine: @unchecked Sendable {
             let publicationExpected = j.restoreManifest ?? expected
             let materialized = try Snapshot.materializationManifest(try Snapshot.dataURL(store: store, id: f.id, revision: revision), expected: expected, context: .managedRevision)
             let bound = try j.publicationRename.map { try $0.matchesPublicationCopy(publicationExpected, of: materialized) } ?? publicationExpected.matchesCopy(of: materialized)
-            guard bound, try Snapshot.manifest(selected, matching: publicationExpected).matchesExpected(publicationExpected) else { throw NestError("Restored directory changed before configuration commit; retained.", code: 6) }
+            guard bound, try Snapshot.manifest(selected, matching: publicationExpected).matchesExpected(publicationExpected) else { throw NestError("Restored directory changed before configuration commit; retained.", code: NestError.Code.retained) }
         }
         // Journal first, config second, idle last. Bookmark cannot follow the
         // old inode into .original on any interrupted transition.
@@ -1118,7 +1150,7 @@ public final class Engine: @unchecked Sendable {
             var config = try store.load()
             guard let index = config.folders.firstIndex(where: { $0.id == f.id }), config.folders[index].path == f.path,
                   (config.folders[index].device == layout.source.device && config.folders[index].inode == layout.source.inode) ||
-                  (config.folders[index].device == restored.device && config.folders[index].inode == restored.inode) else { throw NestError("Configuration identity conflict; restored data retained.", code: 6) }
+                  (config.folders[index].device == restored.device && config.folders[index].inode == restored.inode) else { throw NestError("Configuration identity conflict; restored data retained.", code: NestError.Code.retained) }
             config.folders[index].device = restored.device; config.folders[index].inode = restored.inode
             config.folders[index].bookmark = try selected.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
             try store.save(config)
@@ -1127,13 +1159,13 @@ public final class Engine: @unchecked Sendable {
         // Remove only that inode/target; never traverse it or an opaque backup.
         if let stage = j.restoreStage {
             guard let device = j.restoreStageDevice, let inode = j.restoreStageInode,
-                  URL(fileURLWithPath: stage).deletingLastPathComponent() == selected.deletingLastPathComponent() else { throw NestError("Restore container authority changed; retained.", code: 6) }
+                  URL(fileURLWithPath: stage).deletingLastPathComponent() == selected.deletingLastPathComponent() else { throw NestError("Restore container authority changed; retained.", code: NestError.Code.retained) }
             let name = URL(fileURLWithPath: stage).lastPathComponent
             let dataName = URL(fileURLWithPath: stage).appendingPathExtension("data").lastPathComponent
             if try parent.exists(dataName) {
                 try LinkedFolders.verifyLink(layout, parent: parent, name: dataName)
                 try j.publicationRename?.verifyDisplacedSwapLink(at: URL(fileURLWithPath: stage).appendingPathExtension("data"))
-                guard unlinkat(parent.fd, dataName, 0) == 0 else { throw NestError("Cannot retire owned restore link.", code: 6) }; try parent.sync()
+                guard unlinkat(parent.fd, dataName, 0) == 0 else { throw NestError("Cannot retire owned restore link.", code: NestError.Code.retained) }; try parent.sync()
                 try session.publicationCheckpoint?("link-retired")
             }
             if try parent.exists(name) {
@@ -1141,7 +1173,7 @@ public final class Engine: @unchecked Sendable {
                 try LinkedFolderLayout.Identity((device, inode)).verify(container)
                 guard try container.names().isEmpty,
                       (try parent.entryStat(name)).st_ino == inode,
-                      unlinkat(parent.fd, name, AT_REMOVEDIR) == 0 else { throw NestError("Restore container is not owned/empty; retained.", code: 6) }
+                      unlinkat(parent.fd, name, AT_REMOVEDIR) == 0 else { throw NestError("Restore container is not owned/empty; retained.", code: NestError.Code.retained) }
                 try parent.sync()
                 try session.publicationCheckpoint?("stage-retired")
             }
@@ -1154,21 +1186,21 @@ public final class Engine: @unchecked Sendable {
             if layout.restoration == .original, try wrapper.exists("data") {
                 try LinkedFolders.verifyLink(layout, parent: wrapper, name: "data")
                 try j.publicationRename?.verifyDisplacedSwapLink(at: layout.originalDataURL)
-                guard unlinkat(wrapper.fd, "data", 0) == 0 else { throw NestError("Cannot retire original holding link.", code: 6) }; try wrapper.sync()
+                guard unlinkat(wrapper.fd, "data", 0) == 0 else { throw NestError("Cannot retire original holding link.", code: NestError.Code.retained) }; try wrapper.sync()
                 try session.publicationCheckpoint?("link-retired")
             }
         }
         let stagedLink = URL(fileURLWithPath: layout.linkStagePath).lastPathComponent
         if try parent.exists(stagedLink) {
             try LinkedFolders.verifyLink(layout, parent: parent, name: stagedLink)
-            guard unlinkat(parent.fd, stagedLink, 0) == 0 else { throw NestError("Cannot retire staged original-path link.", code: 6) }; try parent.sync()
+            guard unlinkat(parent.fd, stagedLink, 0) == 0 else { throw NestError("Cannot retire staged original-path link.", code: NestError.Code.retained) }; try parent.sync()
         }
         if !layout.mountReleased {
             if let record = j.nativeTmpfs {
                 let authorization = supplied ?? NativeTmpfsAuthorization(helper: helper)
                 defer { if supplied == nil { authorization.finish() } }
                 let reply = try nativeOperation("release", layout: layout, record: record, authorization: authorization)
-                guard reply.isEmpty else { throw NestError("Invalid native release receipt.", code: 6) }
+                guard reply.isEmpty else { throw NestError("Invalid native release receipt.", code: NestError.Code.retained) }
             } else { try LinkedFolders.releaseMountpoint(layout) }
             layout.mountReleased = true
         }
@@ -1187,16 +1219,16 @@ extension Engine {
     private func reviewControl(_ directory: DirectoryHandle, _ name: String) throws -> LegacyPublicationReview.ControlRecord {
         let before = try directory.entryStat(name)
         guard before.st_mode & S_IFMT == S_IFREG, before.st_uid == getuid(), before.st_nlink == 1,
-              before.st_size >= 0, before.st_size <= 64 << 20 else { throw NestError("Unsafe review control record; retained.", code: 6) }
+              before.st_size >= 0, before.st_size <= 64 << 20 else { throw NestError("Unsafe review control record; retained.", code: NestError.Code.retained) }
         let fd = openat(directory.fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else { throw NestError("Cannot read review control record; retained.", code: 6) }
+        guard fd >= 0 else { throw NestError("Cannot read review control record; retained.", code: NestError.Code.retained) }
         defer { close(fd) }
         var st = stat()
-        guard fstat(fd, &st) == 0, VerifiedRenameReceipt.Node("", st) == VerifiedRenameReceipt.Node("", before) else { throw NestError("Review control record changed; retained.", code: 6) }
+        guard fstat(fd, &st) == 0, VerifiedRenameReceipt.Node("", st) == VerifiedRenameReceipt.Node("", before) else { throw NestError("Review control record changed; retained.", code: NestError.Code.retained) }
         let data = try FileHandle(fileDescriptor: fd, closeOnDealloc: false).readToEnd() ?? Data()
         guard data.count == before.st_size, fstat(fd, &st) == 0,
               VerifiedRenameReceipt.Node("", st) == VerifiedRenameReceipt.Node("", before),
-              VerifiedRenameReceipt.Node("", try directory.entryStat(name)) == VerifiedRenameReceipt.Node("", before) else { throw NestError("Review control record changed while reading; retained.", code: 6) }
+              VerifiedRenameReceipt.Node("", try directory.entryStat(name)) == VerifiedRenameReceipt.Node("", before) else { throw NestError("Review control record changed while reading; retained.", code: NestError.Code.retained) }
         return .init(bytes: data, node: VerifiedRenameReceipt.Node("", before))
     }
     private func reviewedEvidence(_ id: UUID) throws -> (ReviewedPublicationEvidence, LegacyPublicationReview.ControlRecord, LegacyPublicationReview.ControlRecord) {
@@ -1205,7 +1237,7 @@ extension Engine {
         let currentFolder = try store.resolve(id.uuidString, config: config)
         let journalRecord = try reviewControl(store.managedVolume(id), "journal.json"), rawJournal = journalRecord.bytes
         let current = try store.journalDecoder.decode(Journal.self, from: rawJournal)
-        guard current.reviewedRecovery?.completedAt == nil else { throw NestError("Reviewed recovery is already complete; no action was repeated.", code: 6) }
+        guard current.reviewedRecovery?.completedAt == nil else { throw NestError("Reviewed recovery is already complete; no action was repeated.", code: NestError.Code.retained) }
         let originalBytes = current.reviewedRecovery?.evidence.originalJournal ?? rawJournal
         let base = try store.journalDecoder.decode(Journal.self, from: originalBytes)
         let f = current.reviewedRecovery?.evidence.folder ?? currentFolder
@@ -1222,7 +1254,7 @@ extension Engine {
               let stagePath = base.restoreStage, let initialID = base.initialRevision,
               let latestID = base.restoreRevision, latestID == base.revision,
               base.startupHelperPID == nil, base.quiescedHelperPID == nil else {
-            throw NestError("Review requires an already-published native checkpoint with an incomplete legacy receipt, retained original and initial/latest SHA-256 snapshots; no mutation performed.", code: 6)
+            throw NestError("Review requires an already-published native checkpoint with an incomplete legacy receipt, retained original and initial/latest SHA-256 snapshots; no mutation performed.", code: NestError.Code.retained)
         }
         let parent = try LinkedFolders.parent(layout, folder: currentFolder, root: session.linkedMountRoot)
         _ = try LinkedFolders.root(layout)
@@ -1230,23 +1262,23 @@ extension Engine {
         let mountPaths = [f.path, layout.mountPath, layout.holdingPath, stagePath, stagePath + ".data"] +
             (base.nativeTmpfs.map { [NativeTmpfsPaths.mount($0.session).path] } ?? [])
         guard !Paths.mounts().contains(where: { mount in mountPaths.contains { mount.path == $0 || mount.path.hasPrefix($0 + "/") } }) else {
-            throw NestError("A mount remains at a reviewed recovery path; review stopped.", code: 6)
+            throw NestError("A mount remains at a reviewed recovery path; review stopped.", code: NestError.Code.retained)
         }
         if base.nativeTmpfs != nil { try NativeTmpfsControl.assertAbsent(base) }
         if let socket = base.socket {
             var st = stat()
-            guard lstat(socket, &st) != 0 && errno == ENOENT else { throw NestError("A recorded helper socket remains; review stopped without contacting it.", code: 6) }
+            guard lstat(socket, &st) != 0 && errno == ENOENT else { throw NestError("A recorded helper socket remains; review stopped without contacting it.", code: NestError.Code.retained) }
         }
         try restored.verify(parent.child(selected.lastPathComponent))
         let wrapper = try LinkedFolders.holding(layout, parent: parent)
-        guard try wrapper.names() == ["data"] else { throw NestError("Original holding namespace changed; retained.", code: 6) }
+        guard try wrapper.names() == ["data"] else { throw NestError("Original holding namespace changed; retained.", code: NestError.Code.retained) }
         try layout.source.verify(wrapper.child("data"))
         let container = try parent.child(stage.lastPathComponent)
         guard let device = base.restoreStageDevice, let inode = base.restoreStageInode,
-              try container.names().isEmpty else { throw NestError("Restore wrapper changed; retained.", code: 6) }
+              try container.names().isEmpty else { throw NestError("Restore wrapper changed; retained.", code: NestError.Code.retained) }
         try LinkedFolderLayout.Identity((device, inode)).verify(container)
         try LinkedFolders.verifyLink(layout, parent: parent, name: stage.appendingPathExtension("data").lastPathComponent)
-        guard try !parent.exists(URL(fileURLWithPath: layout.linkStagePath).lastPathComponent) else { throw NestError("Unexpected staged link; review stopped.", code: 6) }
+        guard try !parent.exists(URL(fileURLWithPath: layout.linkStagePath).lastPathComponent) else { throw NestError("Unexpected staged link; review stopped.", code: NestError.Code.retained) }
         _ = try originalReceipt.verify(at: layout.originalDataURL)
         let original = try VerifiedRenameReceipt.observe(layout.originalDataURL, matching: originalReceipt.after!.manifest)
         let published = try VerifiedRenameReceipt.observe(selected, matching: receipt.before.manifest)
@@ -1260,7 +1292,7 @@ extension Engine {
         }
         let initial = try revision(initialID), latest = initialID == latestID ? initial : try revision(latestID)
         var parentStat = stat()
-        guard fstat(parent.fd, &parentStat) == 0 else { throw NestError("Cannot inspect reviewed parent; retained.", code: 6) }
+        guard fstat(parent.fd, &parentStat) == 0 else { throw NestError("Cannot inspect reviewed parent; retained.", code: NestError.Code.retained) }
         let evidence = try ReviewedPublicationEvidence(folder: f, originalJournal: originalBytes, layout: layout, stagePath: stagePath,
             parent: VerifiedRenameReceipt.Node("", parentStat),
             stage: VerifiedRenameReceipt.Node("", parent.entryStat(stage.lastPathComponent)),
@@ -1268,7 +1300,7 @@ extension Engine {
             published: published, publishedMACL: macl, displaced: displaced, original: original, initial: initial, latest: latest)
         try evidence.validate(fixtureRoot: store.linkedFixtureRoot)
         if let accepted = current.reviewedRecovery {
-            guard accepted.evidence == evidence else { throw NestError("Previously acknowledged recovery evidence changed; all copies retained.", code: 6) }
+            guard accepted.evidence == evidence else { throw NestError("Previously acknowledged recovery evidence changed; all copies retained.", code: NestError.Code.retained) }
         }
         // Snapshot verification can be long. Recheck the public/holding sides
         // and raw control identities after it, before granting write authority.
@@ -1277,7 +1309,7 @@ extension Engine {
               try VerifiedRenameReceipt.SwapLink.observe(stage.appendingPathExtension("data")) == displaced,
               try reviewControl(store.managedVolume(id), "journal.json") == journalRecord,
               try reviewControl(DirectoryHandle.open(store.root), "configuration.json") == configRecord else {
-            throw NestError("Recovery evidence changed during verification; no further metadata mutation is authorized. Start a fresh review.", code: 6)
+            throw NestError("Recovery evidence changed during verification; no further metadata mutation is authorized. Start a fresh review.", code: NestError.Code.retained)
         }
         return (evidence, journalRecord, configRecord)
     }
@@ -1285,11 +1317,11 @@ extension Engine {
         // Atomic configuration reads suffice to select an ID. Admission must
         // precede waiting for repository.lock, including a repeated request
         // arriving while this Engine is already completing a confirmation.
-        guard try DirectoryHandle.open(store.root).exists(RepositoryReset.lockName) else { throw NestError("Missing recovery coordination lock; review stopped.", code: 6) }
+        guard try DirectoryHandle.open(store.root).exists(RepositoryReset.lockName) else { throw NestError("Missing recovery coordination lock; review stopped.", code: NestError.Code.retained) }
         let id = try store.access { try store.resolve(ref, config: store.load()).id }
         reviewLock.lock()
         guard !runningReviews.contains(id), pendingReviews[id] == nil else {
-            reviewLock.unlock(); throw NestError("A recovery review is already open or busy. Cancel it before starting another.", code: 7)
+            reviewLock.unlock(); throw NestError("A recovery review is already open or busy. Cancel it before starting another.", code: NestError.Code.busy)
         }
         runningReviews.insert(id); reviewLock.unlock()
         defer { reviewLock.lock(); runningReviews.remove(id); reviewLock.unlock() }
@@ -1299,7 +1331,7 @@ extension Engine {
         var bounded = try store.journalDecoder.decode(Journal.self, from: review.journalBytes)
         let acceptance = ReviewedRecoveryAcknowledgement.Acceptance(token: review.token, date: Date(), acceptsMissingHistoricRecord: true)
         if bounded.reviewedRecovery != nil {
-            guard bounded.reviewedRecovery!.acceptances.count < 128 else { throw NestError("Recovery acknowledgement retry bound reached; all evidence retained.", code: 6) }
+            guard bounded.reviewedRecovery!.acceptances.count < 128 else { throw NestError("Recovery acknowledgement retry bound reached; all evidence retained.", code: NestError.Code.retained) }
             bounded.reviewedRecovery!.acceptances.append(acceptance)
         }
         else { bounded.reviewedRecovery = .init(evidence: review.evidence, acceptance: acceptance) }
@@ -1307,7 +1339,7 @@ extension Engine {
         // token, so an oversized audit record cannot strand an accepted review.
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard try encoder.encode(bounded).count <= (64 << 20) - 64 * 1024 else {
-            throw NestError("Recovery evidence exceeds the 64 MiB acknowledgement bound. Review stopped without metadata changes; all copies retained.", code: 6)
+            throw NestError("Recovery evidence exceeds the 64 MiB acknowledgement bound. Review stopped without metadata changes; all copies retained.", code: NestError.Code.retained)
         }
         reviewLock.lock(); pendingReviews[id] = review.token; reviewLock.unlock()
         return review
@@ -1318,11 +1350,11 @@ extension Engine {
     }
     public func confirmLegacyPublicationReview(_ review: LegacyPublicationReview, token: UUID,
                                               acceptsMissingHistoricRecord: Bool) throws {
-        guard acceptsMissingHistoricRecord, token == review.token else { throw NestError("Explicit acceptance of the missing historic record and the issued review token are required.", code: 6) }
+        guard acceptsMissingHistoricRecord, token == review.token else { throw NestError("Explicit acceptance of the missing historic record and the issued review token are required.", code: NestError.Code.retained) }
         let id = review.evidence.folder.id
         reviewLock.lock()
         guard pendingReviews[id] == token, !runningReviews.contains(id) else {
-            reviewLock.unlock(); throw NestError("Recovery review was cancelled, consumed or is busy. No action was repeated; start a fresh review.", code: 7)
+            reviewLock.unlock(); throw NestError("Recovery review was cancelled, consumed or is busy. No action was repeated; start a fresh review.", code: NestError.Code.busy)
         }
         pendingReviews.removeValue(forKey: id); runningReviews.insert(id); reviewLock.unlock()
         defer { reviewLock.lock(); runningReviews.remove(id); reviewLock.unlock() }
@@ -1330,19 +1362,19 @@ extension Engine {
             // No metadata writes before a fresh, full check under BOTH locks.
             let fresh = try reviewedEvidence(id)
             guard fresh.0 == review.evidence, fresh.1 == review.journalControl, fresh.2 == review.configurationControl else {
-                throw NestError("Recovery review is stale. Folder, journal, configuration or snapshots changed; no metadata was changed. Start a fresh review.", code: 6)
+                throw NestError("Recovery review is stale. Folder, journal, configuration or snapshots changed; no metadata was changed. Start a fresh review.", code: NestError.Code.retained)
             }
             var journal = try store.journalDecoder.decode(Journal.self, from: fresh.1.bytes)
             let acceptance = ReviewedRecoveryAcknowledgement.Acceptance(token: token, date: Date(), acceptsMissingHistoricRecord: true)
             if journal.reviewedRecovery != nil {
-                guard journal.reviewedRecovery!.acceptances.count < 128 else { throw NestError("Recovery acknowledgement retry bound reached; all evidence retained.", code: 6) }
+                guard journal.reviewedRecovery!.acceptances.count < 128 else { throw NestError("Recovery acknowledgement retry bound reached; all evidence retained.", code: NestError.Code.retained) }
                 journal.reviewedRecovery!.acceptances.append(acceptance)
             } else { journal.reviewedRecovery = .init(evidence: review.evidence, acceptance: acceptance) }
             try store.write(journal, for: id)
             try session.publicationCheckpoint?("review-accepted")
             _ = try reviewedEvidence(id)
             var config = try store.load()
-            guard let index = config.folders.firstIndex(where: { $0.id == id }), let restored = journal.managedLink?.restored else { throw NestError("Reviewed folder configuration disappeared; evidence retained.", code: 6) }
+            guard let index = config.folders.firstIndex(where: { $0.id == id }), let restored = journal.managedLink?.restored else { throw NestError("Reviewed folder configuration disappeared; evidence retained.", code: NestError.Code.retained) }
             config.folders[index].device = restored.device; config.folders[index].inode = restored.inode
             config.folders[index].bookmark = try URL(fileURLWithPath: review.folderPath).bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
             try store.save(config)
@@ -1353,11 +1385,11 @@ extension Engine {
             // wrapper, displaced link, receipts and ALL snapshots are retained.
             if let record = journal.nativeTmpfs {
                 let authorization = NativeTmpfsAuthorization(helper: helper); defer { authorization.finish() }
-                guard try nativeOperation("release", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid reviewed reservation-release receipt; retained.", code: 6) }
+                guard try nativeOperation("release", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid reviewed reservation-release receipt; retained.", code: NestError.Code.retained) }
             } else { try LinkedFolders.releaseMountpoint(layout) }
             let reservationRoot = try LinkedFolders.root(layout)
             let reservationName = layout.version == 2 ? layout.session.uuidString : URL(fileURLWithPath: layout.mountPath).lastPathComponent
-            guard try !reservationRoot.exists(reservationName) else { throw NestError("Reviewed mount reservation was not retired; acknowledgement and all recovery copies retained.", code: 6) }
+            guard try !reservationRoot.exists(reservationName) else { throw NestError("Reviewed mount reservation was not retired; acknowledgement and all recovery copies retained.", code: NestError.Code.retained) }
             try session.publicationCheckpoint?("review-released")
             _ = try reviewedEvidence(id)
             layout.stage = .restored; layout.mountReleased = true; journal.managedLink = layout
@@ -1383,7 +1415,7 @@ extension Engine {
             let config = try receipt.configuration.map { try JSONDecoder().decode(Configuration.self, from: $0) }
             for folder in config?.folders ?? [] {
                 guard !mounts.contains(where: { $0.path == folder.path || $0.path.hasPrefix(folder.path + "/") }) else {
-                    throw NestError("A managed original path is still mounted; Quit stopped.", code: 7)
+                    throw NestError("A managed original path is still mounted; Quit stopped.", code: NestError.Code.busy)
                 }
             }
             // Cleanup may already have removed some journals. Every remaining
@@ -1409,7 +1441,7 @@ extension Engine {
             let stable = try transaction.stableLock()
             defer { transaction.release([stable]) }
             guard try StorageRelocation.readReceipt(at: manager.location.bootstrapRoot) == nil else {
-                throw NestError("Finish the pending storage move/cleanup before RESET.", code: 6)
+                throw NestError("Finish the pending storage move/cleanup before RESET.", code: NestError.Code.retained)
             }
             let directory = try DirectoryHandle.open(store.root)
             if try directory.exists(RepositoryReset.receiptName) {
@@ -1424,7 +1456,7 @@ extension Engine {
             do {
                 let volumes = try directory.child("volumes")
                 for name in try volumes.names() {
-                    guard UUID(uuidString: name)?.uuidString == name else { throw NestError("Unknown volume blocks RESET.", code: 6) }
+                    guard UUID(uuidString: name)?.uuidString == name else { throw NestError("Unknown volume blocks RESET.", code: NestError.Code.retained) }
                     locks.append(try transaction.lock(volumes.child(name), "transaction.lock", nonblocking: true))
                 }
             } catch { transaction.release(locks); throw error }
@@ -1441,12 +1473,12 @@ extension Engine {
             }
             for status in current {
                 if status.journal.phase == .idle {
-                    guard !status.mounted, !status.connected else { throw NestError("Unexpected mount blocks RESET.", code: 6) }
+                    guard !status.mounted, !status.connected else { throw NestError("Unexpected mount blocks RESET.", code: NestError.Code.retained) }
                 } else {
                     guard status.journal.phase == .mounted, status.journal.lastError == nil, status.journal.cleanupWarning == nil,
                           status.journal.populationVerified, status.journal.nativeTmpfs != nil,
                           status.mounted, status.connected, status.helperActive == true else {
-                        throw NestError("\(status.folder.name) needs recovery or has uncertain mount identity. RESET stopped.", code: 6)
+                        throw NestError("\(status.folder.name) needs recovery or has uncertain mount identity. RESET stopped.", code: NestError.Code.retained)
                     }
                 }
             }
@@ -1456,7 +1488,7 @@ extension Engine {
                 var journal = try store.journal(status.id)
                 guard journal.phase == .mounted, let native = journal.nativeTmpfs,
                       native.session == status.journal.nativeTmpfs?.session else {
-                    throw NestError("Native session changed before RESET eject; data retained.", code: 6)
+                    throw NestError("Native session changed before RESET eject; data retained.", code: NestError.Code.retained)
                 }
                 journal.resetUnmountSession = native.session
                 try store.write(journal, for: status.id)
@@ -1485,7 +1517,7 @@ extension Engine {
                                                        assertAbsent: session.resetAssertAbsent ?? NativeTmpfsControl.assertAbsent)
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let bytes = try encoder.encode(receipt)
-            guard bytes.count <= 64 << 20 else { throw NestError("RESET inventory exceeds its safe durable bound; data retained.", code: 6) }
+            guard bytes.count <= 64 << 20 else { throw NestError("RESET inventory exceeds its safe durable bound; data retained.", code: NestError.Code.retained) }
             try transaction.atomic(bytes, directory: directory, name: RepositoryReset.receiptName)
             try session.resetCheckpoint?("prepared")
             try RepositoryReset.finish(receipt, store: store, transaction: transaction, checkpoint: session.resetCheckpoint)

@@ -20,6 +20,7 @@ extension RAMNestTestSuite {
         @Test func `Read only original prior clones preserve current metadata and both sources`() throws { try SnapshotOptimizationScenarios.readonlyOriginalClone() }
         @Test func `Clone preparation rejects foreign replacements without normalizing them`() throws { try SnapshotOptimizationScenarios.cloneTargetReplacement() }
         @Test func `Unsupported clone copies current source and preserves sparse allocation`() throws { try SnapshotOptimizationScenarios.cloneFallback() }
+        @Test func `Other clone errors fail without creating fallback targets`() throws { try SnapshotOptimizationScenarios.cloneErrors() }
         @Test func `Clone rejects prior replacement and failed partial targets`() throws { try SnapshotOptimizationScenarios.cloneRaces() }
     }
 }
@@ -347,7 +348,7 @@ enum SnapshotOptimizationScenarios {
         }
     }
     static func cloneFallback() throws {
-        for failure in [ENOTSUP, EXDEV] {
+        for failure in [ENOTSUP, EXDEV, ENOSYS, EINVAL] {
             let f = try Fixture("fallback-\(failure)", policy: .sizeAndModTime); try sparseFixture(f)
             let first = try f.capture(policy: .sizeAndModTime)
             try mutate(f.source.appendingPathComponent("payload")) // same length/mtime, different CURRENT bytes
@@ -357,6 +358,49 @@ enum SnapshotOptimizationScenarios {
             try check(attempts == 1, "forced clone fallback attempted once")
             try check(Data(contentsOf: data.appendingPathComponent("payload")).first == 88, "fallback reads CURRENT source, never prior disk bytes")
             try physicalSparse(data)
+        }
+    }
+    static func cloneErrors() throws {
+        for failure in [EACCES, EIO] {
+            let f = try Fixture("clone-error-\(failure)"), first = try f.capture()
+            let destination = f.root.appendingPathComponent("failed-copy")
+            var attempts = 0, priorFD: Int32 = -1, operations = Snapshot.CopyOperations()
+            operations.clone = { prior, _, _ in priorFD = prior; attempts += 1; errno = failure; return -1 }
+            do {
+                _ = try Snapshot.copyAccessibleTree(from: f.source, to: destination, manifest: Snapshot.manifest(f.source),
+                    previous: f.data(first.revision), previousContext: .managedRevision, operations: operations)
+                throw NestError("TEST: unexpected clone fallback")
+            } catch let error as NestError {
+                try check(error.code == 6 && error.message == "Snapshot clone failed (errno \(failure)).", "non-fallback errno preserved")
+            }
+            try check(attempts == 1, "failed clone attempted exactly once")
+            try check(priorFD >= 0 && fcntl(priorFD, F_GETFD) == -1 && errno == EBADF, "failed clone closes its pinned prior descriptor")
+            try check(!DirectoryHandle.open(destination).exists("payload"), "rejected clone creates no fallback target")
+            try check(Data(contentsOf: f.source.appendingPathComponent("payload")) == Data("original".utf8), "current source retained")
+            _ = try Snapshot.verified(store: f.store, id: f.folder.id, revision: first.revision)
+        }
+        // A failed syscall may have created an unknown inode. Never remove,
+        // normalize, or open it for fallback, even for a supported fallback errno.
+        for failure in [ENOTSUP, EXDEV, ENOSYS, EINVAL] {
+            let f = try Fixture("clone-partial-\(failure)"), first = try f.capture()
+            let destination = f.root.appendingPathComponent("partial-copy")
+            var operations = Snapshot.CopyOperations()
+            operations.clone = { _, parent, name in
+                let fd = openat(parent, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o400)
+                try check(fd >= 0, "create owned partial target")
+                defer { close(fd) }
+                try check(write(fd, "partial", 7) == 7, "seed partial target")
+                errno = failure; return -1
+            }
+            try rejects {
+                _ = try Snapshot.copyAccessibleTree(from: f.source, to: destination, manifest: Snapshot.manifest(f.source),
+                    previous: f.data(first.revision), previousContext: .managedRevision, operations: operations)
+            }
+            let partial = destination.appendingPathComponent("payload")
+            try check(Data(contentsOf: partial) == Data("partial".utf8), "unknown failed target retained without fallback writes")
+            try check(DirectoryHandle.open(destination).entryStat("payload").st_mode & 0o7777 == 0o400, "partial target policy unchanged")
+            try check(Data(contentsOf: f.source.appendingPathComponent("payload")) == Data("original".utf8), "current source unchanged")
+            _ = try Snapshot.verified(store: f.store, id: f.folder.id, revision: first.revision)
         }
     }
     static func cloneRaces() throws {

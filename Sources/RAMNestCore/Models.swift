@@ -2,9 +2,20 @@ import Foundation
 import Darwin
 
 public struct NestError: Error, LocalizedError, Sendable {
+    public enum Code {
+        public static let error: Int32 = 1
+        public static let helper: Int32 = 2
+        public static let unsafePath: Int32 = 4
+        public static let retained: Int32 = 6
+        public static let busy: Int32 = 7
+        public static let usage: Int32 = 64
+        public static let coherenceBlocked: Int32 = 78
+    }
     public let message: String
     public let code: Int32
-    public init(_ message: String, code: Int32 = 1) { self.message = message; self.code = code }
+    public init(_ message: String, code: Int32 = Code.error) { self.message = message; self.code = code }
+    public static func retained(_ message: String) -> Self { Self(message, code: Code.retained) }
+    public static func usage(_ message: String) -> Self { Self(message, code: Code.usage) }
     public var errorDescription: String? { message }
 }
 public enum Comparison: String, Codable, CaseIterable, Sendable { case sizeAndModTime, checksum }
@@ -185,21 +196,21 @@ public struct Journal: Codable, Equatable, Sendable {
         publicationRename = values.contains(.publicationRename) ? try values.decode(VerifiedRenameReceipt.self, forKey: .publicationRename) : nil
         reviewedRecovery = values.contains(.reviewedRecovery) ? try values.decode(ReviewedRecoveryAcknowledgement.self, forKey: .reviewedRecovery) : nil
         for receipt in [originalRename, publicationRename].compactMap({ $0 }) {
-            guard receipt.session == session else { throw NestError("Rename receipt session mismatch; retained.", code: 6) }
+            guard receipt.session == session else { throw NestError("Rename receipt session mismatch; retained.", code: NestError.Code.retained) }
         }
         if let originalRename {
             guard originalRename.operation == .evacuation, initialSourceManifest == originalRename.before.manifest,
                   evacuation != nil, evacuationDevice == originalRename.destinationDevice,
                   evacuationInode == originalRename.destinationInode else {
-                throw NestError("Rename receipt source binding mismatch; retained.", code: 6)
+                throw NestError("Rename receipt source binding mismatch; retained.", code: NestError.Code.retained)
             }
         }
         if let publicationRename, publicationRename.operation == .evacuation {
-            throw NestError("Invalid publication rename operation; retained.", code: 6)
+            throw NestError("Invalid publication rename operation; retained.", code: NestError.Code.retained)
         }
         restoreManifest = values.contains(.restoreManifest) ? try values.decode(Manifest.self, forKey: .restoreManifest) : nil
         for manifest in [initialSourceManifest, restoreManifest, originalRename?.before.manifest, publicationRename?.before.manifest].compactMap({ $0 }) {
-            guard manifest.fileVerification == fileVerification else { throw NestError("Journal file verification policy disagrees with transaction authority; retained.", code: 6) }
+            guard manifest.fileVerification == fileVerification else { throw NestError("Journal file verification policy disagrees with transaction authority; retained.", code: NestError.Code.retained) }
         }
         restoreStage = try values.decodeIfPresent(String.self, forKey: .restoreStage)
         restoreStageDevice = try values.decodeIfPresent(UInt64.self, forKey: .restoreStageDevice)
@@ -221,19 +232,19 @@ public struct Journal: Codable, Equatable, Sendable {
         resetUnmountSession = values.contains(.resetUnmountSession) ? try values.decode(UUID.self, forKey: .resetUnmountSession) : nil
         if let resetUnmountSession {
             guard resetUnmountSession == session, resetUnmountSession == nativeTmpfs?.session else {
-                throw NestError("RESET unmount provenance does not match the native session; all data retained.", code: 6)
+                throw NestError("RESET unmount provenance does not match the native session; all data retained.", code: NestError.Code.retained)
             }
         }
         guard legacyLink == nil || (nativeLink == nil && nativeTmpfs == nil),
               legacyLink == nil || legacyLink?.version == 1,
               (nativeLink == nil) == (nativeTmpfs == nil),
               nativeLink == nil || (nativeLink?.version == 2 && backend == .tmpfs && nativeTmpfs?.session == session) else {
-            throw NestError("Mixed or partial native/legacy journal authority; all data retained.", code: 6)
+            throw NestError("Mixed or partial native/legacy journal authority; all data retained.", code: NestError.Code.retained)
         }
         guard backend != .tmpfs || nativeTmpfs != nil ||
               ((phase == .idle || phase == .preparing || phase == .recoveryRequired) &&
                !populationVerified && legacyLink == nil && evacuation == nil && originalRename == nil && publicationRename == nil) else {
-            throw NestError("Native session lacks native mount authority; legacy recovery is forbidden.", code: 6)
+            throw NestError("Native session lacks native mount authority; legacy recovery is forbidden.", code: NestError.Code.retained)
         }
         if let nativeTmpfs {
             try nativeTmpfs.validate()
@@ -247,7 +258,7 @@ public struct Journal: Codable, Equatable, Sendable {
                   !(populationVerified && (phase == .pendingRestore || phase == .restoring)) || nativeTmpfs.managedUnmount || nativeTmpfs.lossDisclosure != nil,
                   nativeTmpfs.quiescence == nil || (populationVerified && quiescedRevision != nil &&
                     quiescedRevision == revision && quiescedSession == session) else {
-                throw NestError("Native session identity is incomplete; retained.", code: 6)
+                throw NestError("Native session identity is incomplete; retained.", code: NestError.Code.retained)
             }
         }
         if let layout = managedLink {
@@ -368,11 +379,11 @@ public enum SizeParser {
         let suffixes: [(String, UInt64)] = [("GIB", 1<<30), ("MIB", 1<<20), ("GB", 1<<30), ("MB", 1<<20), ("G", 1<<30), ("M", 1<<20), ("B", 1)]
         var digits = s; var multiplier: UInt64 = 1
         for (suffix, factor) in suffixes where s.hasSuffix(suffix) { digits = String(s.dropLast(suffix.count)); multiplier = factor; break }
-        guard let value = UInt64(digits), value > 0, value <= UInt64.max / multiplier else { throw NestError("Invalid size. Use an integer such as 512MB or 4GB.", code: 64) }
+        guard let value = UInt64(digits), value > 0, value <= UInt64.max / multiplier else { throw NestError("Invalid size. Use an integer such as 512MB or 4GB.", code: NestError.Code.usage) }
         return value * multiplier
     }
     public static func validate(_ bytes: UInt64) throws {
-        guard bytes >= 16<<20, bytes <= ProcessInfo.processInfo.physicalMemory / 4 * 3 else { throw NestError("Capacity must be 16 MiB through 75% of physical memory.", code: 64) }
+        guard bytes >= 16<<20, bytes <= ProcessInfo.processInfo.physicalMemory / 4 * 3 else { throw NestError("Capacity must be 16 MiB through 75% of physical memory.", code: NestError.Code.usage) }
     }
 }
 

@@ -15,10 +15,10 @@ public struct NativeFilesystemID: Codable, Equatable, Sendable {
     }
     public init(from decoder: Decoder) throws {
         let all = try decoder.container(keyedBy: Key.self)
-        guard Set(all.allKeys.map(\.stringValue)) == ["first", "second"] else { throw NestError("Unknown native fsid authority.", code: 6) }
+        guard Set(all.allKeys.map(\.stringValue)) == ["first", "second"] else { throw NestError("Unknown native fsid authority.", code: NestError.Code.retained) }
         let values = try decoder.container(keyedBy: CodingKeys.self)
         first = try values.decode(UInt32.self, forKey: .first); second = try values.decode(UInt32.self, forKey: .second)
-        guard first != 0 || second != 0 else { throw NestError("Zero native filesystem identity.", code: 6) }
+        guard first != 0 || second != 0 else { throw NestError("Zero native filesystem identity.", code: NestError.Code.retained) }
     }
 }
 public struct NativeTmpfsRecord: Codable, Equatable, Sendable {
@@ -43,7 +43,7 @@ public struct NativeTmpfsRecord: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let all = try decoder.container(keyedBy: Key.self)
         guard Set(all.allKeys.map(\.stringValue)).isSubset(of: Set(CodingKeys.allCases.map(\.rawValue))) else {
-            throw NestError("Unknown native session authority; retained.", code: 6)
+            throw NestError("Unknown native session authority; retained.", code: NestError.Code.retained)
         }
         let c = try decoder.container(keyedBy: CodingKeys.self)
         version = try c.decode(Int.self, forKey: .version)
@@ -63,7 +63,7 @@ public struct NativeTmpfsRecord: Codable, Equatable, Sendable {
               filesystem.map({ $0.first != 0 || $0.second != 0 }) ?? true,
               data == nil || filesystem != nil, !managedUnmount || filesystem != nil,
               quiescence == nil || quiescence == NativeSnapshotSafety.receiptVersion else {
-            throw NestError("Malformed native mount authority; all recovery data retained.", code: 6)
+            throw NestError("Malformed native mount authority; all recovery data retained.", code: NestError.Code.retained)
         }
     }
 }
@@ -77,19 +77,19 @@ enum NativeTmpfsPaths {
         var st = stat()
         guard fstat(handle.fd, &st) == 0, st.st_uid == 0, st.st_mode & S_IFMT == S_IFDIR,
               st.st_mode & 0o7777 == 0o755, st.st_flags == 0 else {
-            throw NestError("Native runtime parent is not a protected root-owned directory; retained.", code: 4)
+            throw NestError("Native runtime parent is not a protected root-owned directory; retained.", code: NestError.Code.unsafePath)
         }
         errno = 0
         if let acl = acl_get_fd_np(handle.fd, ACL_TYPE_EXTENDED) {
             defer { acl_free(UnsafeMutableRawPointer(acl)) }
             var entry: acl_entry_t?
             let result = acl_get_entry(acl, Int32(ACL_FIRST_ENTRY.rawValue), &entry)
-            guard result == -1, errno == EINVAL else { throw NestError("Native runtime parent has an unsupported ACL.", code: 4) }
-        } else if errno != ENOENT && errno != ENOTSUP { throw NestError("Cannot inspect native runtime ACL.", code: 4) }
+            guard result == -1, errno == EINVAL else { throw NestError("Native runtime parent has an unsupported ACL.", code: NestError.Code.unsafePath) }
+        } else if errno != ENOENT && errno != ENOTSUP { throw NestError("Cannot inspect native runtime ACL.", code: NestError.Code.unsafePath) }
     }
     static func boundRoot(_ layout: LinkedFolderLayout) throws -> DirectoryHandle {
         try layout.validate()
-        guard layout.version == 2, layout.mountRoot == root.path else { throw NestError("Not a native mount slot.", code: 4) }
+        guard layout.version == 2, layout.mountRoot == root.path else { throw NestError("Not a native mount slot.", code: NestError.Code.unsafePath) }
         let handle = try DirectoryHandle.open(root); try requireRoot(handle); try layout.root.verify(handle)
         let slot = try handle.child(layout.session.uuidString); try requireRoot(slot)
         return handle
@@ -112,12 +112,12 @@ enum NativeTmpfsControl {
     static func arguments(_ operation: String, layout: LinkedFolderLayout, record: NativeTmpfsRecord) throws -> [String] {
         try layout.validate(); try record.validate()
         guard layout.version == 2, layout.session == record.session, record.uid == getuid(),
-              ["mount", "readonly", "freeze", "thaw", "unmount", "release"].contains(operation) else { throw NestError("Invalid native control authority.", code: 4) }
+              ["mount", "readonly", "freeze", "thaw", "unmount", "release"].contains(operation) else { throw NestError("Invalid native control authority.", code: NestError.Code.unsafePath) }
         var args = ["--native-v1", operation, String(record.uid), record.session.uuidString,
                     String(layout.root.device), String(layout.root.inode), String(layout.mountpoint.device), String(layout.mountpoint.inode)]
         if operation == "mount" { args += [String(record.capacity), "true"] }
         else if operation != "release" {
-            guard let fs = record.filesystem else { throw NestError("Missing native filesystem identity.", code: 6) }
+            guard let fs = record.filesystem else { throw NestError("Missing native filesystem identity.", code: NestError.Code.retained) }
             args += [String(fs.first), String(fs.second), String(record.capacity)]
         }
         return args
@@ -125,15 +125,15 @@ enum NativeTmpfsControl {
     static func observe(_ journal: Journal, requireData: Bool = true, readonly: Bool? = nil) throws -> NativeMountObservation {
         guard let layout = journal.nativeLink, let record = journal.nativeTmpfs,
               journal.backend == .tmpfs, journal.session == record.session, layout.session == record.session,
-              let expected = record.filesystem, journal.phase != .idle, !record.managedUnmount else { throw NestError("No bound native tmpfs session.", code: 6) }
+              let expected = record.filesystem, journal.phase != .idle, !record.managedUnmount else { throw NestError("No bound native tmpfs session.", code: NestError.Code.retained) }
         _ = try NativeTmpfsPaths.boundRoot(layout)
         let mountURL = NativeTmpfsPaths.mount(record.session)
         let handle = try DirectoryHandle.open(mountURL)
         var fs = statfs()
-        guard fstatfs(handle.fd, &fs) == 0 else { throw NestError("Cannot inspect native tmpfs.", code: 6) }
+        guard fstatfs(handle.fd, &fs) == 0 else { throw NestError("Cannot inspect native tmpfs.", code: NestError.Code.retained) }
         let type = withUnsafePointer(to: &fs.f_fstypename) { $0.withMemoryRebound(to: CChar.self, capacity: Int(MFSTYPENAMELEN)) { String(cString: $0) } }
         let path = withUnsafePointer(to: &fs.f_mntonname) { $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) } }
-        guard fs.f_flags & UInt32(MNT_NOSUID | MNT_NODEV) == UInt32(MNT_NOSUID | MNT_NODEV) else { throw NestError("Native safety mount flags changed; retained.", code: 6) }
+        guard fs.f_flags & UInt32(MNT_NOSUID | MNT_NODEV) == UInt32(MNT_NOSUID | MNT_NODEV) else { throw NestError("Native safety mount flags changed; retained.", code: NestError.Code.retained) }
         let ro = fs.f_flags & UInt32(MNT_RDONLY) != 0
         let accounting = try NativeKernelMountValidation.inspect(type: type, path: path, filesystem: NativeFilesystemID(fs),
             expectedPath: mountURL.path, expectedFilesystem: expected, readOnly: ro, requiredReadOnly: readonly,
@@ -141,29 +141,29 @@ enum NativeTmpfsControl {
         let page = sysconf(_SC_PAGESIZE)
         guard page > 0, accounting.capacity >= (record.capacity / UInt64(page)) * UInt64(page),
               accounting.capacity <= ((record.capacity + UInt64(page) - 1) / UInt64(page)) * UInt64(page) else {
-            throw NestError("Native maximum does not match the recorded requested capacity.", code: 6)
+            throw NestError("Native maximum does not match the recorded requested capacity.", code: NestError.Code.retained)
         }
         guard !Paths.mounts().contains(where: { $0.path.hasPrefix(mountURL.path + "/") }) else {
-            throw NestError("Nested native mount detected; no snapshot authorized.", code: 6)
+            throw NestError("Nested native mount detected; no snapshot authorized.", code: NestError.Code.retained)
         }
         var data: LinkedFolderLayout.Identity?
         if requireData {
-            guard let identity = record.data else { throw NestError("Native data identity is not committed.", code: 6) }
+            guard let identity = record.data else { throw NestError("Native data identity is not committed.", code: NestError.Code.retained) }
             let dataHandle = try DirectoryHandle.open(NativeTmpfsPaths.data(record.session))
             try identity.verify(dataHandle)
             var dataFS = statfs()
-            guard fstatfs(dataHandle.fd, &dataFS) == 0, NativeFilesystemID(dataFS) == expected else { throw NestError("Native data left its bound filesystem.", code: 6) }
+            guard fstatfs(dataHandle.fd, &dataFS) == 0, NativeFilesystemID(dataFS) == expected else { throw NestError("Native data left its bound filesystem.", code: NestError.Code.retained) }
             data = identity
         }
         return NativeMountObservation(filesystem: expected, readOnly: ro, used: accounting.used, capacity: accounting.capacity, data: data)
     }
     static func assertAbsent(_ journal: Journal) throws {
-        guard let layout = journal.nativeLink else { throw NestError("No native reservation authority.", code: 6) }
+        guard let layout = journal.nativeLink else { throw NestError("No native reservation authority.", code: NestError.Code.retained) }
         try layout.validate()
         let rootHandle = try DirectoryHandle.open(NativeTmpfsPaths.root)
         try NativeTmpfsPaths.requireRoot(rootHandle); try layout.root.verify(rootHandle)
         let path = NativeTmpfsPaths.mount(layout.session)
-        guard !Paths.mounts().contains(where: { $0.path == path.path || $0.path.hasPrefix(path.path + "/") }) else { throw NestError("A mount is still present in the native slot; recovery is blocked.", code: 6) }
+        guard !Paths.mounts().contains(where: { $0.path == path.path || $0.path.hasPrefix(path.path + "/") }) else { throw NestError("A mount is still present in the native slot; recovery is blocked.", code: NestError.Code.retained) }
         // A successfully released slot may already be absent after a crash.
         let root = try DirectoryHandle.open(NativeTmpfsPaths.root)
         if try !root.exists(layout.session.uuidString) { return }
@@ -178,10 +178,10 @@ enum NativeSnapshotSafety {
     static let blockedMessage = "Native snapshot requires a complete privileged mapping scan after read-only remount. Close all files and mappings in the RAM tree; Ignore Busy cannot bypass this guard. No current-RAM checkpoint was committed."
     static let receiptVersion = "no-regular-vnode-references-v1"
     static var supported: Bool { true }
-    static func requireValidatedMappings() throws { throw NestError(blockedMessage, code: 78) }
+    static func requireValidatedMappings() throws { throw NestError(blockedMessage, code: NestError.Code.coherenceBlocked) }
     static func validateReceipt(_ reply: [String], filesystem: NativeFilesystemID) throws {
         guard reply == [receiptVersion, String(filesystem.first), String(filesystem.second)] else {
-            throw NestError("Missing or mismatched native mapping-scan receipt. Read-only remount alone cannot authorize a snapshot.", code: 78)
+            throw NestError("Missing or mismatched native mapping-scan receipt. Read-only remount alone cannot authorize a snapshot.", code: NestError.Code.coherenceBlocked)
         }
     }
     static func freeze(readonly: () throws -> Void, verify: () throws -> Void,
@@ -202,10 +202,10 @@ enum NativeKernelMountValidation {
                         blockSize: UInt64) throws -> (used: UInt64, capacity: UInt64) {
         guard type == "tmpfs", path == expectedPath, filesystem == expectedFilesystem,
               requiredReadOnly.map({ $0 == readOnly }) ?? true else {
-            throw NestError("Native mount identity/type/fsid or read-only flag changed. No stale disk tree can be saved as RAM.", code: 6)
+            throw NestError("Native mount identity/type/fsid or read-only flag changed. No stale disk tree can be saved as RAM.", code: NestError.Code.retained)
         }
         guard blockSize > 0, blocks <= UInt64.max / blockSize, free <= blocks else {
-            throw NestError("Invalid native statfs accounting.", code: 6)
+            throw NestError("Invalid native statfs accounting.", code: NestError.Code.retained)
         }
         return ((blocks - free) * blockSize, blocks * blockSize)
     }
@@ -232,7 +232,7 @@ enum NativeCheckpointTransaction {
             if attemptedFreeze, !attemptedThaw, stillBoundReadonly() {
                 do { try thaw() }
                 catch {
-                    let combined = NestError(failure.localizedDescription + " Rollback thaw failed; native mount remains guarded. " + error.localizedDescription, code: 6)
+                    let combined = NestError(failure.localizedDescription + " Rollback thaw failed; native mount remains guarded. " + error.localizedDescription, code: NestError.Code.retained)
                     try invalidate(combined, true); throw combined
                 }
             }
@@ -261,7 +261,7 @@ enum NativeJournalTransition {
         guard let record = journal.nativeTmpfs, journal.nativeLink?.stage == .restored,
               journal.nativeLink?.mountReleased == true,
               !journal.populationVerified || record.managedUnmount || record.lossDisclosure != nil else {
-            throw NestError("Native restoration is not completed/retired.", code: 6)
+            throw NestError("Native restoration is not completed/retired.", code: NestError.Code.retained)
         }
         journal.nativeTmpfs?.quiescence = nil; journal.nativeTmpfs?.periodicAuthorization = nil
         journal.quiescedRevision = nil; journal.quiescedSession = nil
@@ -270,7 +270,7 @@ enum NativeJournalTransition {
     static func resetCompletedAuthority(_ journal: inout Journal) throws {
         guard journal.phase == .idle,
               journal.managedLink == nil || (journal.managedLink?.stage == .restored && journal.managedLink?.mountReleased == true) else {
-            throw NestError("Only completed idle authority can be reset.", code: 6)
+            throw NestError("Only completed idle authority can be reset.", code: NestError.Code.retained)
         }
         SnapshotRetention.remember(&journal)
         journal.managedLink = nil; journal.nativeTmpfs = nil; journal.resetUnmountSession = nil
@@ -308,7 +308,7 @@ public struct NativePeriodicSaveRequest: Sendable {
               journal.nativeTmpfs?.periodicAuthorization == authorization, journal.socket == socket,
               journal.fileVerification == verification, folder.options.sync, folder.options.periodicSave,
               FolderOptions.intervals.contains(interval), folder.options.intervalMinutes == interval else {
-            throw NestError("Retired or changed periodic native session; no save or administrator operation was started.", code: 6)
+            throw NestError("Retired or changed periodic native session; no save or administrator operation was started.", code: NestError.Code.retained)
         }
     }
 }

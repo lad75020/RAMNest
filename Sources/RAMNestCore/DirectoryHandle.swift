@@ -9,53 +9,53 @@ public final class DirectoryHandle: @unchecked Sendable {
     deinit { close(fd) }
     public static func open(_ url: URL) throws -> DirectoryHandle {
         var descriptor = Darwin.open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard descriptor >= 0 else { throw NestError("Cannot open filesystem root.", code: 4) }
+        guard descriptor >= 0 else { throw NestError("Cannot open filesystem root.", code: NestError.Code.unsafePath) }
         for part in url.standardizedFileURL.pathComponents where part != "/" {
             let next = openat(descriptor, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             close(descriptor)
-            guard next >= 0 else { throw NestError("Path is missing, changed, or traverses a symlink: \(url.path)", code: 4) }
+            guard next >= 0 else { throw NestError("Path is missing, changed, or traverses a symlink: \(url.path)", code: NestError.Code.unsafePath) }
             descriptor = next
         }
         return DirectoryHandle(fd: descriptor)
     }
     public func identity() throws -> (device: UInt64, inode: UInt64) {
-        var st = stat(); guard fstat(fd, &st) == 0 else { throw NestError("Cannot inspect directory handle.", code: 4) }
+        var st = stat(); guard fstat(fd, &st) == 0 else { throw NestError("Cannot inspect directory handle.", code: NestError.Code.unsafePath) }
         return (Paths.deviceID(st.st_dev), UInt64(st.st_ino))
     }
     public func verify(_ folder: Folder) throws {
         let actual = try identity()
-        guard actual.device == folder.device && actual.inode == folder.inode else { throw NestError("Selected directory identity changed. Recovery is blocked.", code: 4) }
+        guard actual.device == folder.device && actual.inode == folder.inode else { throw NestError("Selected directory identity changed. Recovery is blocked.", code: NestError.Code.unsafePath) }
     }
     public func child(_ name: String) throws -> DirectoryHandle {
         try Self.checkName(name)
         let result = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard result >= 0 else { throw NestError("Cannot open child directory: \(name)", code: 4) }
+        guard result >= 0 else { throw NestError("Cannot open child directory: \(name)", code: NestError.Code.unsafePath) }
         return DirectoryHandle(fd: result)
     }
     public func parent(of relative: String) throws -> (DirectoryHandle, String) {
         let parts = relative.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
-        guard let last = parts.last else { throw NestError("Invalid relative path.", code: 4) }
+        guard let last = parts.last else { throw NestError("Invalid relative path.", code: NestError.Code.unsafePath) }
         var current = DirectoryHandle(fd: dup(fd))
         for part in parts.dropLast() { current = try current.child(part) }
         try Self.checkName(last); return (current, last)
     }
     public func createDirectory(_ name: String) throws -> DirectoryHandle {
         try Self.checkName(name)
-        guard mkdirat(fd, name, 0o700) == 0 else { throw NestError("Cannot create new private directory: \(name)", code: 6) }
+        guard mkdirat(fd, name, 0o700) == 0 else { throw NestError("Cannot create new private directory: \(name)", code: NestError.Code.retained) }
         return try child(name)
     }
     public func renameNoReplace(_ name: String, to destination: DirectoryHandle, as newName: String) throws {
         try Self.checkName(name); try Self.checkName(newName)
-        guard renameatx_np(fd, name, destination.fd, newName, UInt32(RENAME_EXCL)) == 0 else { throw NestError("Recovery move failed or conflicts with a new entry: \(newName): \(String(cString: strerror(errno)))", code: 6) }
+        guard renameatx_np(fd, name, destination.fd, newName, UInt32(RENAME_EXCL)) == 0 else { throw NestError("Recovery move failed or conflicts with a new entry: \(newName): \(String(cString: strerror(errno)))", code: NestError.Code.retained) }
     }
     public func exists(_ name: String) throws -> Bool {
         try Self.checkName(name); var st = stat()
         if fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 { return true }
-        guard errno == ENOENT else { throw NestError("Cannot inspect recovery entry.", code: 6) }; return false
+        guard errno == ENOENT else { throw NestError("Cannot inspect recovery entry.", code: NestError.Code.retained) }; return false
     }
     public func names() throws -> [String] {
         let duplicate = dup(fd)
-        guard duplicate >= 0, let directory = fdopendir(duplicate) else { if duplicate >= 0 { close(duplicate) }; throw NestError("Cannot enumerate anchored directory.", code: 6) }
+        guard duplicate >= 0, let directory = fdopendir(duplicate) else { if duplicate >= 0 { close(duplicate) }; throw NestError("Cannot enumerate anchored directory.", code: NestError.Code.retained) }
         defer { closedir(directory) }
         rewinddir(directory)
         var result: [String] = []
@@ -64,33 +64,33 @@ public final class DirectoryHandle: @unchecked Sendable {
             let name = withUnsafePointer(to: &entry.pointee.d_name) { pointer in pointer.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN)+1) { String(cString: $0) } }
             if name != "." && name != ".." { result.append(name) }
         }
-        guard errno == 0 else { throw NestError("Directory enumeration failed.", code: 6) }
+        guard errno == 0 else { throw NestError("Directory enumeration failed.", code: NestError.Code.retained) }
         return result.sorted()
     }
-    public func sync() throws { guard fsync(fd) == 0 else { throw NestError("Directory sync failed.", code: 6) } }
+    public func sync() throws { guard fsync(fd) == 0 else { throw NestError("Directory sync failed.", code: NestError.Code.retained) } }
     func requireOwnedDirectory(device: UInt64, privateMode: Bool = false) throws {
         var st = stat()
         guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFDIR,
               st.st_uid == getuid(), Paths.deviceID(st.st_dev) == device,
               !privateMode || st.st_mode & 0o077 == 0 else {
-            throw NestError("Snapshot cleanup requires an owned directory on the repository device.", code: 4)
+            throw NestError("Snapshot cleanup requires an owned directory on the repository device.", code: NestError.Code.unsafePath)
         }
     }
     func entryStat(_ name: String) throws -> stat {
         try Self.checkName(name)
         var st = stat()
-        guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { throw NestError("Cannot inspect snapshot cleanup entry: \(name)", code: 6) }
+        guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { throw NestError("Cannot inspect snapshot cleanup entry: \(name)", code: NestError.Code.retained) }
         return st
     }
     func readJSON<T: Decodable>(_ type: T.Type, _ name: String, decoder: JSONDecoder = JSONDecoder()) throws -> T {
         try Self.checkName(name)
         let descriptor = openat(fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard descriptor >= 0 else { throw NestError("Cannot read managed snapshot metadata: \(name)", code: 6) }
+        guard descriptor >= 0 else { throw NestError("Cannot read managed snapshot metadata: \(name)", code: NestError.Code.retained) }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         var st = stat()
         guard fstat(descriptor, &st) == 0, st.st_mode & S_IFMT == S_IFREG,
               st.st_uid == getuid(), st.st_size >= 0, st.st_size <= 64 << 20 else {
-            throw NestError("Unexpected managed snapshot metadata: \(name)", code: 6)
+            throw NestError("Unexpected managed snapshot metadata: \(name)", code: NestError.Code.retained)
         }
         return try decoder.decode(type, from: handle.readToEnd() ?? Data())
     }
@@ -102,27 +102,27 @@ public final class DirectoryHandle: @unchecked Sendable {
         let revision = try child(name)
         let device = try identity().device
         try revision.requireOwnedDirectory(device: device, privateMode: true)
-        guard try revision.identity().inode == UInt64(candidate.st_ino) else { throw NestError("Revision identity changed; cleanup skipped.", code: 6) }
+        guard try revision.identity().inode == UInt64(candidate.st_ino) else { throw NestError("Revision identity changed; cleanup skipped.", code: NestError.Code.retained) }
         let metadata = try revision.readJSON(StoredManifest.self, "manifest.json")
-        guard try revision.names() == (metadata.storageFormat == 2 ? ["data", "manifest.json", "modes.bin"] : ["data", "manifest.json"]) else { throw NestError("Unexpected revision contents; snapshot retained.", code: 6) }
+        guard try revision.names() == (metadata.storageFormat == 2 ? ["data", "manifest.json", "modes.bin"] : ["data", "manifest.json"]) else { throw NestError("Unexpected revision contents; snapshot retained.", code: NestError.Code.retained) }
         let manifest = metadata.logical
         if metadata.storageFormat == 2 {
             let descriptor = openat(revision.fd,"modes.bin",O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-            guard descriptor >= 0 else { throw NestError("Missing cleanup storage mode map.", code: 6) };defer { close(descriptor) }
+            guard descriptor >= 0 else { throw NestError("Missing cleanup storage mode map.", code: NestError.Code.retained) };defer { close(descriptor) }
             var st = stat()
             guard fstat(descriptor,&st) == 0, st.st_uid == getuid(), st.st_gid == getgid(), st.st_mode & S_IFMT == S_IFREG,
-                  st.st_mode & 0o7777 == 0o600, st.st_nlink == 1, st.st_size >= 0, st.st_size <= StorageModes.maximumBytes else { throw NestError("Invalid cleanup storage mode map.", code: 6) }
+                  st.st_mode & 0o7777 == 0o600, st.st_nlink == 1, st.st_size >= 0, st.st_size <= StorageModes.maximumBytes else { throw NestError("Invalid cleanup storage mode map.", code: NestError.Code.retained) }
             let bytes = try FileHandle(fileDescriptor:descriptor,closeOnDealloc:false).readToEnd() ?? Data()
             let modes = try StorageModes(data:bytes)
-            guard Snapshot.digest(bytes) == metadata.modeMapDigest, modes.records == (try StorageModes(manifest)).records else { throw NestError("Cleanup storage mode map integrity mismatch.", code: 6) }
+            guard Snapshot.digest(bytes) == metadata.modeMapDigest, modes.records == (try StorageModes(manifest)).records else { throw NestError("Cleanup storage mode map integrity mismatch.", code: NestError.Code.retained) }
         }
         var expected: [String: Entry] = [:]
         for entry in manifest.entries {
             guard expected.updateValue(entry, forKey: entry.path) == nil,
-                  ["directory", "file", "symlink"].contains(entry.kind) else { throw NestError("Invalid old manifest; snapshot retained.", code: 6) }
+                  ["directory", "file", "symlink"].contains(entry.kind) else { throw NestError("Invalid old manifest; snapshot retained.", code: NestError.Code.retained) }
         }
         var filesystem = statfs()
-        guard fstatfs(fd, &filesystem) == 0 else { throw NestError("Cannot inspect cleanup filesystem.", code: 6) }
+        guard fstatfs(fd, &filesystem) == 0 else { throw NestError("Cannot inspect cleanup filesystem.", code: NestError.Code.retained) }
         struct Removal {
             // Store paths, not open handles: a wide tree must not retain one
             // descriptor per subdirectory until deletion starts.
@@ -142,27 +142,27 @@ public final class DirectoryHandle: @unchecked Sendable {
             var prefix: [String] = []
             for part in parentPath {
                 prefix.append(part); parent = try parent.child(part)
-                guard let expected = directoryIdentities[prefix.joined(separator: "/")], try parent.identity() == expected else { throw NestError("Snapshot ancestor changed; retained.", code: 6) }
+                guard let expected = directoryIdentities[prefix.joined(separator: "/")], try parent.identity() == expected else { throw NestError("Snapshot ancestor changed; retained.", code: NestError.Code.retained) }
             }
             let st = try parent.entryStat(childName)
             let kind = st.st_mode & S_IFMT
             if relative != nil && SnapshotExclusion.directory(childName,st.st_mode) {
-                throw NestError("Old snapshot contains excluded disk Trash; revision retained without subtree access.",code:6)
+                throw NestError("Old snapshot contains excluded disk Trash; revision retained without subtree access.",code: NestError.Code.retained)
             }
-            guard relative != nil || kind == S_IFDIR else { throw NestError("Unexpected snapshot data root; snapshot retained.", code: 6) }
+            guard relative != nil || kind == S_IFDIR else { throw NestError("Unexpected snapshot data root; snapshot retained.", code: NestError.Code.retained) }
             guard st.st_uid == getuid(), Paths.deviceID(st.st_dev) == device,
-                  st.st_flags & ~UInt32(UF_HIDDEN | UF_NODUMP | UF_COMPRESSED) == 0 else { throw NestError("Unsafe snapshot cleanup entry; snapshot retained.", code: 6) }
+                  st.st_flags & ~UInt32(UF_HIDDEN | UF_NODUMP | UF_COMPRESSED) == 0 else { throw NestError("Unsafe snapshot cleanup entry; snapshot retained.", code: NestError.Code.retained) }
             if let relative {
                 guard let e = expected[relative], seen.insert(relative).inserted,
-                      (kind == S_IFDIR && e.kind == "directory") || (kind == S_IFREG && e.kind == "file" && st.st_size == e.size) || (kind == S_IFLNK && e.kind == "symlink" && st.st_size == e.size) else {
-                    throw NestError("Old snapshot namespace changed; snapshot retained.", code: 6)
+                      (kind == S_IFDIR && e.isDirectory) || (kind == S_IFREG && e.isRegularFile && st.st_size == e.size) || (kind == S_IFLNK && e.isSymlink && st.st_size == e.size) else {
+                    throw NestError("Old snapshot namespace changed; snapshot retained.", code: NestError.Code.retained)
                 }
                 if metadata.storageFormat == 2 {
                     let policy: UInt16 = kind == S_IFREG ? 0o600 : 0o700
-                    guard st.st_mode & 0o7777 == policy else { throw NestError("Cleanup private physical mode drift; retained.", code: 6) }
+                    guard st.st_mode & 0o7777 == policy else { throw NestError("Cleanup private physical mode drift; retained.", code: NestError.Code.retained) }
                 }
             } else if metadata.storageFormat == 2 {
-                guard st.st_mode & 0o7777 == 0o700 else { throw NestError("Cleanup private root mode drift; retained.", code: 6) }
+                guard st.st_mode & 0o7777 == 0o700 else { throw NestError("Cleanup private root mode drift; retained.", code: NestError.Code.retained) }
             }
             if kind == S_IFDIR {
                 let child = try parent.child(childName)
@@ -171,23 +171,23 @@ public final class DirectoryHandle: @unchecked Sendable {
                 var childFS = statfs()
                 guard opened.inode == UInt64(st.st_ino), fstatfs(child.fd, &childFS) == 0,
                       childFS.f_fsid.val.0 == filesystem.f_fsid.val.0,
-                      childFS.f_fsid.val.1 == filesystem.f_fsid.val.1 else { throw NestError("Snapshot cleanup crossed a mount or changed directory.", code: 6) }
+                      childFS.f_fsid.val.1 == filesystem.f_fsid.val.1 else { throw NestError("Snapshot cleanup crossed a mount or changed directory.", code: NestError.Code.retained) }
                 let path = parentPath + [childName]
                 directoryIdentities[path.joined(separator: "/")] = opened
                 pending.append(Inspection(childName: childName, relative: relative, parentPath: parentPath, finish: true, info: st))
                 for part in try child.names().reversed() { pending.append(Inspection(childName: part, relative: relative.map { $0 + "/" + part } ?? part, parentPath: path, finish: false, info: nil)) }
                 continue
             } else {
-                guard kind == S_IFREG || kind == S_IFLNK else { throw NestError("Unexpected snapshot entry type.", code: 6) }
+                guard kind == S_IFREG || kind == S_IFLNK else { throw NestError("Unexpected snapshot entry type.", code: NestError.Code.retained) }
             }
             removals.append(Removal(parentPath: parentPath, name: childName, info: st))
         }
-        guard seen == Set(expected.keys) else { throw NestError("Old snapshot entries are missing; snapshot retained.", code: 6) }
+        guard seen == Set(expected.keys) else { throw NestError("Old snapshot entries are missing; snapshot retained.", code: NestError.Code.retained) }
         let manifestStat = try revision.entryStat("manifest.json")
         guard manifestStat.st_mode & S_IFMT == S_IFREG, Paths.deviceID(manifestStat.st_dev) == device,
-              manifestStat.st_flags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else { throw NestError("Unsafe old manifest; snapshot retained.", code: 6) }
+              manifestStat.st_flags & ~UInt32(UF_HIDDEN | UF_NODUMP) == 0 else { throw NestError("Unsafe old manifest; snapshot retained.", code: NestError.Code.retained) }
         if metadata.storageFormat == 2 {
-            guard manifestStat.st_mode & 0o7777 == 0o600, manifestStat.st_uid == getuid(), manifestStat.st_gid == getgid(), manifestStat.st_nlink == 1 else { throw NestError("Cleanup private manifest policy drift; retained.", code: 6) }
+            guard manifestStat.st_mode & 0o7777 == 0o600, manifestStat.st_uid == getuid(), manifestStat.st_gid == getgid(), manifestStat.st_nlink == 1 else { throw NestError("Cleanup private manifest policy drift; retained.", code: NestError.Code.retained) }
         }
         removals.append(Removal(parentPath: [], name: "manifest.json", info: manifestStat))
         if metadata.storageFormat == 2 { removals.append(Removal(parentPath:[],name:"modes.bin",info:try revision.entryStat("modes.bin"))) }
@@ -205,7 +205,7 @@ public final class DirectoryHandle: @unchecked Sendable {
                       opened == expected, fstatfs(child.fd, &childFS) == 0,
                       childFS.f_fsid.val.0 == filesystem.f_fsid.val.0,
                       childFS.f_fsid.val.1 == filesystem.f_fsid.val.1 else {
-                    throw NestError("Snapshot cleanup parent changed; cleanup stopped.", code: 6)
+                    throw NestError("Snapshot cleanup parent changed; cleanup stopped.", code: NestError.Code.retained)
                 }
                 current = child
             }
@@ -216,15 +216,15 @@ public final class DirectoryHandle: @unchecked Sendable {
             let parent = try removal.parentPath.map { try reopenParent($0) } ?? self
             let now = try parent.entryStat(removal.name)
             guard now.st_dev == removal.info.st_dev, now.st_ino == removal.info.st_ino,
-                  now.st_mode & S_IFMT == removal.info.st_mode & S_IFMT else { throw NestError("Snapshot cleanup entry changed; cleanup stopped.", code: 6) }
+                  now.st_mode & S_IFMT == removal.info.st_mode & S_IFMT else { throw NestError("Snapshot cleanup entry changed; cleanup stopped.", code: NestError.Code.retained) }
             guard unlinkat(parent.fd, removal.name, now.st_mode & S_IFMT == S_IFDIR ? AT_REMOVEDIR : 0) == 0 else {
-                throw NestError("Snapshot cleanup could not remove an obsolete revision: \(String(cString: strerror(errno)))", code: 6)
+                throw NestError("Snapshot cleanup could not remove an obsolete revision: \(String(cString: strerror(errno)))", code: NestError.Code.retained)
             }
         }
         try sync()
     }
     private static func checkName(_ name: String) throws {
-        guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else { throw NestError("Invalid managed entry name.", code: 4) }
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else { throw NestError("Invalid managed entry name.", code: NestError.Code.unsafePath) }
     }
 }
 
@@ -237,14 +237,14 @@ final class DirectoryCursor {
     init(_ root: DirectoryHandle) { self.root = root }
     func parent(of path: String) throws -> (DirectoryHandle, String) {
         let components = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
-        guard let name = components.last, !name.isEmpty else { throw NestError("Invalid relative path.", code: 4) }
+        guard let name = components.last, !name.isEmpty else { throw NestError("Invalid relative path.", code: NestError.Code.unsafePath) }
         var directory = root, prefix = ""
         for component in components.dropLast() {
             prefix = prefix.isEmpty ? component : prefix + "/" + component
             if let cached = handles[prefix] {
                 let named = try directory.entryStat(component), pinned = try cached.identity()
                 guard named.st_mode & S_IFMT == S_IFDIR, Paths.deviceID(named.st_dev) == pinned.device,
-                      UInt64(named.st_ino) == pinned.inode else { throw NestError("Cached directory ancestor changed.", code: 4) }
+                      UInt64(named.st_ino) == pinned.inode else { throw NestError("Cached directory ancestor changed.", code: NestError.Code.unsafePath) }
                 directory = cached
             }
             else {
@@ -253,7 +253,7 @@ final class DirectoryCursor {
                 order.append(prefix); handles[prefix] = directory
             }
         }
-        guard name != ".", name != "..", !name.contains("\0") else { throw NestError("Invalid relative path.", code: 4) }
+        guard name != ".", name != "..", !name.contains("\0") else { throw NestError("Invalid relative path.", code: NestError.Code.unsafePath) }
         return (directory, name)
     }
 }

@@ -53,177 +53,297 @@ public actor Activities {
         if worker != nil && !["capabilities", "storage_status", "storage_pause"].contains(name) {
             throw MCPFailure("busy", "A storage worker owns the repository. Poll storage_status or request storage_pause.")
         }
-        func string(_ key: String) -> String { if case .string(let s) = a[key] { s } else { "" } }
-        func bool(_ key: String, _ fallback: Bool = false) -> Bool { if case .bool(let b) = a[key] { b } else { fallback } }
-        func capacity() -> UInt64 { if case .integer(let n) = a["capacityBytes"] { UInt64(n) } else { 0 } }
-        func ref() -> String { UUID(uuidString: string("id"))!.uuidString }
-        func path(_ key: String) -> URL { URL(fileURLWithPath: string(key)) }
-
-        switch name {
-        case "capabilities":
-            let package: JSON
-            do { package = .object(["available": .bool(true), "app": .string(try bridge.requirePackage().path), "compiledCLIIdentity": try bridge.identity(), "verification": .string("sealed package/static prerequisites only; native authorization and lifecycle are checked by the packaged CLI per operation")]) }
-            catch { package = .object(["available": .bool(false), "reason": .string(error.localizedDescription)]) }
-            return .object(["platform": .string("macOS"), "backend": .string("tmpfs"), "package": package,
-                "loginItem": .string("app-owned bridge; requires package; reports actual SMAppService status"),
-                "unsupported": .array(["backend selection", "app compression", "FSEvents suppression", "live resize", "native reviewed-publication recovery (use RAMNest app)"].map(JSON.string)),
-                "startupMounts": .bool(false), "exitUnmounts": .bool(false), "storageBootstrap": .string(location.bootstrapRoot.path)])
-        case "folder_list": return try JSON.encode(core().statuses())
-        case "folder_info":
-            let e = try core(), f = try e.folder(ref())
-            guard let s = try e.statuses().first(where: { $0.id == f.id }) else { throw MCPFailure("missing", "Folder disappeared.") }
-            return try JSON.encode(s)
-        case "folder_create":
-            if bool("mount") { _ = try bridge.requirePackage() }
-            let e = try core()
-            let options = try editedOptions(.init(), patch: a["options"])
-            let f = try e.create(path: path("path"), name: a["name"] == nil ? nil : string("name"), capacity: capacity(), options: options)
-            invalidateReviews()
-            if bool("mount") {
-                do { _ = try bridge.cli(["mount", f.id.uuidString], root: e.store.root) }
-                catch { throw MCPFailure("create_mount_failed", "Registered folder \(f.id.uuidString), but mounting failed: \(error.localizedDescription). Inspect folder_info before retrying.") }
-            }
-            return try JSON.encode(f)
-        case "folder_mount", "folder_reconnect", "folder_save", "folder_unmount":
-            let e = try core(), f = try e.folder(ref())
-            if name == "folder_unmount", try e.store.journal(f.id).phase == .idle { return ok(["alreadyIdle": .bool(true)]) }
-            var args = [String(name.dropFirst("folder_".count)), f.id.uuidString]
-            if bool("ignoreBusy") { args.append("--ignore-busy") }
-            invalidateReviews()
-            return try bridge.cli(args, root: e.store.root)
-        case "folder_resize":
-            let e = try core(); try e.resize(ref(), capacity: capacity()); invalidateReviews()
-            return try JSON.encode(e.folder(ref()))
-        case "folder_rename", "folder_options":
-            let e = try core(); var f = try e.folder(ref())
-            if try e.store.journal(f.id).phase != .idle { _ = try bridge.requirePackage() }
-            if name == "folder_rename" { f.name = string("name") }
-            else {
-                guard case .object(let patch) = a["options"], !patch.isEmpty else { throw MCPFailure("invalid_arguments", "options must contain at least one setting.") }
-                f.options = try editedOptions(f.options, patch: a["options"])
-            }
-            try e.update(f); invalidateReviews(); return try JSON.encode(e.folder(ref()))
-        case "folder_delete":
-            let destroy = bool("destroy"), id = ref()
-            guard !destroy || string("confirmation") == "DELETE " + id else { throw MCPFailure("confirmation_required", "Destructive delete requires confirmation='DELETE \(id)'.") }
-            guard destroy || a["confirmation"] == nil else { throw MCPFailure("invalid_arguments", "confirmation is only accepted with destroy=true.") }
-            let e = try core(), f = try e.folder(id), j = try e.store.journal(f.id)
-            invalidateReviews()
-            if j.phase != .idle {
-                var args = ["delete", id]
-                args += destroy ? ["--destroy", "--confirm-delete"] : ["--keep"]
-                return try bridge.cli(args, root: e.store.root)
-            }
-            try e.delete(id, destroy: destroy, confirmed: destroy)
-            return ok(["originalsKept": .bool(!destroy), "snapshotsRetained": .bool(true)])
-        case "folder_recover":
-            let e = try core(), f = try e.folder(ref()), j = try e.store.journal(f.id)
-            guard j.phase != .idle else { throw MCPFailure("invalid_state", "Folder is idle; no recovery is pending.") }
-            invalidateReviews()
-            if j.nativeTmpfs != nil { return try bridge.cli(["recover", f.id.uuidString], root: e.store.root) }
-            try e.recover(f.id.uuidString); return ok(["source": .string("committed checkpoint or intact originals; no lost RAM rescue")])
-        case "folder_export":
-            guard !bool("live") || a["revision"] == nil else { throw MCPFailure("invalid_arguments", "live and revision are mutually exclusive.") }
-            let e = try core(), f = try e.folder(ref())
-            if bool("live") { return try bridge.cli(["export", f.id.uuidString, string("destination"), "--live"], root: e.store.root) }
-            try e.export(f.id.uuidString, destination: path("destination"), revision: a["revision"] == nil ? nil : UUID(uuidString: string("revision"))!.uuidString)
-            return ok(["source": .string("committed disk checkpoint"), "destination": a["destination"]!])
-        case "folder_busy": return .object(["processes": .string(try core().busyProcesses(ref()))])
-        case "folder_open", "folder_reveal":
-            let folder = try core().folder(ref()), reveal = name == "folder_reveal"
-            let accepted = await MainActor.run {
-                if reveal { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: folder.path) }
-                else { NSWorkspace.shared.open(URL(fileURLWithPath: folder.path)) }
-            }
-            guard accepted else { throw MCPFailure("desktop_unavailable", "macOS did not accept the Finder request; a logged-in desktop may be required.") }
-            return ok(["desktopRequestAccepted": .bool(true), "path": .string(folder.path), "verification": .string("OS request accepted; Finder window visibility is not observed")])
-        case "recovery_review":
-            guard reviews.count < 32 else { throw MCPFailure("review_bound", "Cancel outstanding reviews before starting another (maximum 32).") }
-            let e = try core(), folder = try e.folder(ref())
-            try Self.requireSupportedReview(e.store.journal(folder.id))
-            let review = try e.reviewLegacyPublication(ref())
-            reviews[review.token] = (review, Date())
-            return .object(["token": .string(review.token.uuidString), "expiresInSeconds": .integer(600),
-                "folderPath": .string(review.folderPath), "revision": .string(review.revision), "initialRevision": .string(review.initialRevision),
-                "retainedOriginalPath": .string(review.retainedOriginalPath), "retainedLinkPath": .string(review.retainedLinkPath), "snapshotPath": .string(review.snapshotPath),
-                "disclosure": .string("Historic rename proof is missing. Acceptance acknowledges that gap, updates the reviewed publication record, and retains backups. Review paths and checkpoints before confirming.")])
-        case "recovery_confirm":
-            guard bool("acceptsMissingHistoricRecord"), string("confirmation") == "ACCEPT MISSING HISTORIC RECORD" else { throw MCPFailure("confirmation_required", "Explicit missing historic record acceptance and exact confirmation text are required.") }
-            let token = UUID(uuidString: string("token"))!
-            guard let (review, _) = reviews[token] else { throw MCPFailure("invalid_review", "Token is unknown, expired, cancelled, consumed or from another MCP session.") }
-            let e = try core()
-            try Self.requireSupportedReview(e.store.journal(e.folder(review.folderPath).id))
-            reviews.removeValue(forKey: token)
-            try e.confirmLegacyPublicationReview(review, token: token, acceptsMissingHistoricRecord: true)
-            return ok(["backupsRetained": .bool(true)])
-        case "recovery_cancel":
-            let token = UUID(uuidString: string("token"))!
-            guard let (review, _) = reviews.removeValue(forKey: token) else { throw MCPFailure("invalid_review", "No outstanding same-session review has this token.") }
-            try core().cancelLegacyPublicationReview(review); return ok()
-        case "settings_get": return try preferences()
-        case "settings_update":
-            guard !a.isEmpty else { throw MCPFailure("invalid_arguments", "Supply menuBarMode or fileVerification.") }
-            let e = try core()
-            // One atomic locked update, retaining unknown historical fields as Core decodes them.
-            try e.store.locked {
-                var config = try e.store.load()
-                if case .bool(let value) = a["menuBarMode"] { config.menuBarMode = value }
-                if case .string(let value) = a["fileVerification"] { config.fileVerification = FileVerification(rawValue: value)! }
-                try e.store.save(config)
-            }
-            invalidateReviews()
-            let saved = try preferences()
-            for (key, value) in a { guard saved[key] == value else { throw MCPFailure("readback", "Preference readback failed for \(key).") } }
-            return saved
-        case "login_item_get": return try bridge.login()
-        case "login_item_set": return try bridge.login(enabled: bool("enabled"))
-        case "storage_status":
-            if worker != nil { return .object(["job": .object(job), "bootstrap": .string(location.bootstrapRoot.path)]) }
-            return try storageState()
-        case "storage_move", "storage_retry":
-            if name == "storage_retry", try manager.state().pending == nil {
-                throw MCPFailure("no_pending_storage", "There is no pending storage move or cleanup to retry.")
-            }
-            invalidateReviews()
-            let store = name == "storage_move" ? try core().store : nil
-            let parent = a["parent"].map { _ in path("parent") }
-            let cancel = StorageMoveCancellation(), manager = manager, id = UUID().uuidString
-            cancellation = cancel; engine = nil
-            job = ["running": .bool(true), "id": .string(id), "operation": .string(name), "progress": .string("Preparing"), "pauseRequested": .bool(false)]
-            worker = Task.detached { [self] in
-                do {
-                    let progress: @Sendable (String) -> Void = { text in Task { await self.progress(text, id: id) } }
-                    if let store, let parent { _ = try manager.move(store: store, toParent: parent, cancellation: cancel, progress: progress) }
-                    else { _ = try manager.retry(cancellation: cancel, progress: progress) }
-                    await self.finished(id: id, error: nil)
-                } catch { await self.finished(id: id, error: error.localizedDescription) }
-            }
-            return ok(["job": .object(job)])
-        case "storage_pause":
-            guard let cancellation, worker != nil else { throw MCPFailure("no_storage_job", "No running storage job to pause.") }
-            cancellation.cancel(); job["pauseRequested"] = .bool(true)
-            return ok(["pauseRequested": .bool(true), "meaning": .string("cooperative before commit; poll storage_status for the final result")])
-        case "settings_reset":
-            guard string("confirmation") == "RESET RAMNEST" else { throw MCPFailure("confirmation_required", "RESET requires confirmation='RESET RAMNEST'. Originals and storage selection are preserved; records and snapshots are removed.") }
-            let e = try core()
-            invalidateReviews()
-            if try e.statuses().contains(where: { $0.journal.phase != .idle }) {
-                _ = try bridge.cli(["reset", "--confirm-reset", "--reset-bootstrap", location.bootstrapRoot.path], root: e.store.root)
-            } else { try e.reset(location: location) }
-            engine = nil
-            return ok(["originalsPreserved": .bool(true), "selectedStoragePreserved": .bool(true), "preferences": .string("retained, matching app RESET"), "appRestart": .string("Restart an open GUI manually to discard its stale view; MCP never launches it")])
-        case "install_cli":
-            let app = try bridge.requirePackage(), directory = path("directory")
-            try Paths.rejectSymlinks(directory.path)
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else { throw MCPFailure("invalid_directory", "Choose an existing directory.") }
-            let target = directory.appendingPathComponent("ramnest"), cli = app.appendingPathComponent("Contents/Helpers/ramnest")
-            try FileManager.default.createSymbolicLink(at: target, withDestinationURL: cli)
-            guard try FileManager.default.destinationOfSymbolicLink(atPath: target.path) == cli.path else { throw MCPFailure("readback", "CLI launcher readback failed.") }
-            return ok(["installed": .string(target.path), "target": .string(cli.path)])
-        default: throw MCPFailure("unknown_tool", "Unknown tool.")
-        }
+        guard let handler = Self.handlers[name] else { throw MCPFailure("unknown_tool", "Unknown tool.") }
+        return try await handler(self, ToolArguments(a))
     }
+
+    // The table stores unbound actor-isolated operations, never closures that
+    // capture an Activities instance. Dispatch stays on the calling actor.
+    private typealias Handler = @Sendable (isolated Activities, ToolArguments) async throws -> JSON
+    private static let handlers: [String: Handler] = [
+        "capabilities": { actor, arguments in try actor.handleCapabilities(arguments) },
+        "folder_list": { actor, arguments in try actor.handleFolderList(arguments) },
+        "folder_info": { actor, arguments in try actor.handleFolderInfo(arguments) },
+        "folder_create": { actor, arguments in try actor.handleFolderCreate(arguments) },
+        "folder_mount": { actor, arguments in try actor.handleFolderMount(arguments) },
+        "folder_reconnect": { actor, arguments in try actor.handleFolderReconnect(arguments) },
+        "folder_save": { actor, arguments in try actor.handleFolderSave(arguments) },
+        "folder_unmount": { actor, arguments in try actor.handleFolderUnmount(arguments) },
+        "folder_resize": { actor, arguments in try actor.handleFolderResize(arguments) },
+        "folder_rename": { actor, arguments in try actor.handleFolderRename(arguments) },
+        "folder_options": { actor, arguments in try actor.handleFolderOptions(arguments) },
+        "folder_delete": { actor, arguments in try actor.handleFolderDelete(arguments) },
+        "folder_recover": { actor, arguments in try actor.handleFolderRecover(arguments) },
+        "folder_export": { actor, arguments in try actor.handleFolderExport(arguments) },
+        "folder_busy": { actor, arguments in try actor.handleFolderBusy(arguments) },
+        "folder_open": { actor, arguments in try await actor.handleFolderOpen(arguments) },
+        "folder_reveal": { actor, arguments in try await actor.handleFolderReveal(arguments) },
+        "recovery_review": { actor, arguments in try actor.handleRecoveryReview(arguments) },
+        "recovery_confirm": { actor, arguments in try actor.handleRecoveryConfirm(arguments) },
+        "recovery_cancel": { actor, arguments in try actor.handleRecoveryCancel(arguments) },
+        "settings_get": { actor, arguments in try actor.handleSettingsGet(arguments) },
+        "settings_update": { actor, arguments in try actor.handleSettingsUpdate(arguments) },
+        "login_item_get": { actor, arguments in try actor.handleLoginItemGet(arguments) },
+        "login_item_set": { actor, arguments in try actor.handleLoginItemSet(arguments) },
+        "storage_status": { actor, arguments in try actor.handleStorageStatus(arguments) },
+        "storage_move": { actor, arguments in try actor.handleStorageMove(arguments) },
+        "storage_retry": { actor, arguments in try actor.handleStorageRetry(arguments) },
+        "storage_pause": { actor, arguments in try actor.handleStoragePause(arguments) },
+        "settings_reset": { actor, arguments in try actor.handleSettingsReset(arguments) },
+        "install_cli": { actor, arguments in try actor.handleInstallCli(arguments) }
+    ]
+    static var handlerNames: Set<String> { Set(handlers.keys) }
+
+    private func handleCapabilities(_ a: ToolArguments) throws -> JSON {
+        let package: JSON
+        do { package = .object(["available": .bool(true), "app": .string(try bridge.requirePackage().path), "compiledCLIIdentity": try bridge.identity(), "verification": .string("sealed package/static prerequisites only; native authorization and lifecycle are checked by the packaged CLI per operation")]) }
+        catch { package = .object(["available": .bool(false), "reason": .string(error.localizedDescription)]) }
+        return .object(["platform": .string("macOS"), "backend": .string("tmpfs"), "package": package,
+            "loginItem": .string("app-owned bridge; requires package; reports actual SMAppService status"),
+            "unsupported": .array(["backend selection", "app compression", "FSEvents suppression", "live resize", "native reviewed-publication recovery (use RAMNest app)"].map(JSON.string)),
+            "startupMounts": .bool(false), "exitUnmounts": .bool(false), "storageBootstrap": .string(location.bootstrapRoot.path)])
+    }
+
+    private func handleFolderList(_ a: ToolArguments) throws -> JSON {
+        return try JSON.encode(core().statuses())
+    }
+
+    private func handleFolderInfo(_ a: ToolArguments) throws -> JSON {
+        let e = try core(), f = try e.folder(a.ref())
+        guard let s = try e.statuses().first(where: { $0.id == f.id }) else { throw MCPFailure("missing", "Folder disappeared.") }
+        return try JSON.encode(s)
+    }
+
+    private func handleFolderCreate(_ a: ToolArguments) throws -> JSON {
+        if a.bool("mount") { _ = try bridge.requirePackage() }
+        let e = try core()
+        let options = try editedOptions(.init(), patch: a["options"])
+        let f = try e.create(path: a.path("path"), name: a["name"] == nil ? nil : a.string("name"), capacity: a.capacity(), options: options)
+        invalidateReviews()
+        if a.bool("mount") {
+            do { _ = try bridge.cli(["mount", f.id.uuidString], root: e.store.root) }
+            catch { throw MCPFailure("create_mount_failed", "Registered folder \(f.id.uuidString), but mounting failed: \(error.localizedDescription). Inspect folder_info before retrying.") }
+        }
+        return try JSON.encode(f)
+    }
+
+    private func controlFolder(_ command: String, _ a: ToolArguments) throws -> JSON {
+        let e = try core(), f = try e.folder(a.ref())
+        if command == "unmount", try e.store.journal(f.id).phase == .idle { return ok(["alreadyIdle": .bool(true)]) }
+        var args = [command, f.id.uuidString]
+        if a.bool("ignoreBusy") { args.append("--ignore-busy") }
+        invalidateReviews()
+        return try bridge.cli(args, root: e.store.root)
+    }
+
+    private func handleFolderMount(_ a: ToolArguments) throws -> JSON {
+        return try controlFolder("mount", a)
+    }
+
+    private func handleFolderReconnect(_ a: ToolArguments) throws -> JSON {
+        return try controlFolder("reconnect", a)
+    }
+
+    private func handleFolderSave(_ a: ToolArguments) throws -> JSON {
+        return try controlFolder("save", a)
+    }
+
+    private func handleFolderUnmount(_ a: ToolArguments) throws -> JSON {
+        return try controlFolder("unmount", a)
+    }
+
+    private func handleFolderResize(_ a: ToolArguments) throws -> JSON {
+        let e = try core(); try e.resize(a.ref(), capacity: a.capacity()); invalidateReviews()
+        return try JSON.encode(e.folder(a.ref()))
+    }
+
+    private func handleFolderRename(_ a: ToolArguments) throws -> JSON {
+        let e = try core(); var f = try e.folder(a.ref())
+        if try e.store.journal(f.id).phase != .idle { _ = try bridge.requirePackage() }
+        f.name = a.string("name")
+        try e.update(f); invalidateReviews(); return try JSON.encode(e.folder(a.ref()))
+    }
+
+    private func handleFolderOptions(_ a: ToolArguments) throws -> JSON {
+        let e = try core(); var f = try e.folder(a.ref())
+        if try e.store.journal(f.id).phase != .idle { _ = try bridge.requirePackage() }
+        guard case .object(let patch) = a["options"], !patch.isEmpty else { throw MCPFailure("invalid_arguments", "options must contain at least one setting.") }
+        f.options = try editedOptions(f.options, patch: a["options"])
+        try e.update(f); invalidateReviews(); return try JSON.encode(e.folder(a.ref()))
+    }
+
+    private func handleFolderDelete(_ a: ToolArguments) throws -> JSON {
+        let destroy = a.bool("destroy"), id = a.ref()
+        guard !destroy || a.string("confirmation") == "DELETE " + id else { throw MCPFailure("confirmation_required", "Destructive delete requires confirmation='DELETE \(id)'.") }
+        guard destroy || a["confirmation"] == nil else { throw MCPFailure("invalid_arguments", "confirmation is only accepted with destroy=true.") }
+        let e = try core(), f = try e.folder(id), j = try e.store.journal(f.id)
+        invalidateReviews()
+        if j.phase != .idle {
+            var args = ["delete", id]
+            args += destroy ? ["--destroy", "--confirm-delete"] : ["--keep"]
+            return try bridge.cli(args, root: e.store.root)
+        }
+        try e.delete(id, destroy: destroy, confirmed: destroy)
+        return ok(["originalsKept": .bool(!destroy), "snapshotsRetained": .bool(true)])
+    }
+
+    private func handleFolderRecover(_ a: ToolArguments) throws -> JSON {
+        let e = try core(), f = try e.folder(a.ref()), j = try e.store.journal(f.id)
+        guard j.phase != .idle else { throw MCPFailure("invalid_state", "Folder is idle; no recovery is pending.") }
+        invalidateReviews()
+        if j.nativeTmpfs != nil { return try bridge.cli(["recover", f.id.uuidString], root: e.store.root) }
+        try e.recover(f.id.uuidString); return ok(["source": .string("committed checkpoint or intact originals; no lost RAM rescue")])
+    }
+
+    private func handleFolderExport(_ a: ToolArguments) throws -> JSON {
+        guard !a.bool("live") || a["revision"] == nil else { throw MCPFailure("invalid_arguments", "live and revision are mutually exclusive.") }
+        let e = try core(), f = try e.folder(a.ref())
+        if a.bool("live") { return try bridge.cli(["export", f.id.uuidString, a.string("destination"), "--live"], root: e.store.root) }
+        try e.export(f.id.uuidString, destination: a.path("destination"), revision: a["revision"] == nil ? nil : UUID(uuidString: a.string("revision"))!.uuidString)
+        return ok(["source": .string("committed disk checkpoint"), "destination": a["destination"]!])
+    }
+
+    private func handleFolderBusy(_ a: ToolArguments) throws -> JSON {
+        return .object(["processes": .string(try core().busyProcesses(a.ref()))])
+    }
+
+    private func requestFinder(_ a: ToolArguments, reveal: Bool) async throws -> JSON {
+        let folder = try core().folder(a.ref())
+        let accepted = await MainActor.run {
+            if reveal { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: folder.path) }
+            else { NSWorkspace.shared.open(URL(fileURLWithPath: folder.path)) }
+        }
+        guard accepted else { throw MCPFailure("desktop_unavailable", "macOS did not accept the Finder request; a logged-in desktop may be required.") }
+        return ok(["desktopRequestAccepted": .bool(true), "path": .string(folder.path), "verification": .string("OS request accepted; Finder window visibility is not observed")])
+    }
+
+    private func handleFolderOpen(_ a: ToolArguments) async throws -> JSON {
+        return try await requestFinder(a, reveal: false)
+    }
+
+    private func handleFolderReveal(_ a: ToolArguments) async throws -> JSON {
+        return try await requestFinder(a, reveal: true)
+    }
+
+    private func handleRecoveryReview(_ a: ToolArguments) throws -> JSON {
+        guard reviews.count < 32 else { throw MCPFailure("review_bound", "Cancel outstanding reviews before starting another (maximum 32).") }
+        let e = try core(), folder = try e.folder(a.ref())
+        try Self.requireSupportedReview(e.store.journal(folder.id))
+        let review = try e.reviewLegacyPublication(a.ref())
+        reviews[review.token] = (review, Date())
+        return .object(["token": .string(review.token.uuidString), "expiresInSeconds": .integer(600),
+            "folderPath": .string(review.folderPath), "revision": .string(review.revision), "initialRevision": .string(review.initialRevision),
+            "retainedOriginalPath": .string(review.retainedOriginalPath), "retainedLinkPath": .string(review.retainedLinkPath), "snapshotPath": .string(review.snapshotPath),
+            "disclosure": .string("Historic rename proof is missing. Acceptance acknowledges that gap, updates the reviewed publication record, and retains backups. Review paths and checkpoints before confirming.")])
+    }
+
+    private func handleRecoveryConfirm(_ a: ToolArguments) throws -> JSON {
+        guard a.bool("acceptsMissingHistoricRecord"), a.string("confirmation") == "ACCEPT MISSING HISTORIC RECORD" else { throw MCPFailure("confirmation_required", "Explicit missing historic record acceptance and exact confirmation text are required.") }
+        let token = UUID(uuidString: a.string("token"))!
+        guard let (review, _) = reviews[token] else { throw MCPFailure("invalid_review", "Token is unknown, expired, cancelled, consumed or from another MCP session.") }
+        let e = try core()
+        try Self.requireSupportedReview(e.store.journal(e.folder(review.folderPath).id))
+        reviews.removeValue(forKey: token)
+        try e.confirmLegacyPublicationReview(review, token: token, acceptsMissingHistoricRecord: true)
+        return ok(["backupsRetained": .bool(true)])
+    }
+
+    private func handleRecoveryCancel(_ a: ToolArguments) throws -> JSON {
+        let token = UUID(uuidString: a.string("token"))!
+        guard let (review, _) = reviews.removeValue(forKey: token) else { throw MCPFailure("invalid_review", "No outstanding same-session review has this token.") }
+        try core().cancelLegacyPublicationReview(review); return ok()
+    }
+
+    private func handleSettingsGet(_ a: ToolArguments) throws -> JSON {
+        return try preferences()
+    }
+
+    private func handleSettingsUpdate(_ a: ToolArguments) throws -> JSON {
+        guard !a.values.isEmpty else { throw MCPFailure("invalid_arguments", "Supply menuBarMode or fileVerification.") }
+        let e = try core()
+        // One atomic locked update, retaining unknown historical fields as Core decodes them.
+        try e.store.locked {
+            var config = try e.store.load()
+            if case .bool(let value) = a["menuBarMode"] { config.menuBarMode = value }
+            if case .string(let value) = a["fileVerification"] { config.fileVerification = FileVerification(rawValue: value)! }
+            try e.store.save(config)
+        }
+        invalidateReviews()
+        let saved = try preferences()
+        for (key, value) in a.values { guard saved[key] == value else { throw MCPFailure("readback", "Preference readback failed for \(key).") } }
+        return saved
+    }
+
+    private func handleLoginItemGet(_ a: ToolArguments) throws -> JSON {
+        return try bridge.login()
+    }
+
+    private func handleLoginItemSet(_ a: ToolArguments) throws -> JSON {
+        return try bridge.login(enabled: a.bool("enabled"))
+    }
+
+    private func handleStorageStatus(_ a: ToolArguments) throws -> JSON {
+        if worker != nil { return .object(["job": .object(job), "bootstrap": .string(location.bootstrapRoot.path)]) }
+        return try storageState()
+    }
+
+    private func startStorageWorker(_ name: String, _ a: ToolArguments) throws -> JSON {
+        if name == "storage_retry", try manager.state().pending == nil {
+            throw MCPFailure("no_pending_storage", "There is no pending storage move or cleanup to retry.")
+        }
+        invalidateReviews()
+        let store = name == "storage_move" ? try core().store : nil
+        let parent = a["parent"].map { _ in a.path("parent") }
+        let cancel = StorageMoveCancellation(), manager = manager, id = UUID().uuidString
+        cancellation = cancel; engine = nil
+        job = ["running": .bool(true), "id": .string(id), "operation": .string(name), "progress": .string("Preparing"), "pauseRequested": .bool(false)]
+        worker = Task.detached { [self] in
+            do {
+                let progress: @Sendable (String) -> Void = { text in Task { await self.progress(text, id: id) } }
+                if let store, let parent { _ = try manager.move(store: store, toParent: parent, cancellation: cancel, progress: progress) }
+                else { _ = try manager.retry(cancellation: cancel, progress: progress) }
+                await self.finished(id: id, error: nil)
+            } catch { await self.finished(id: id, error: error.localizedDescription) }
+        }
+        return ok(["job": .object(job)])
+    }
+
+    private func handleStorageMove(_ a: ToolArguments) throws -> JSON {
+        return try startStorageWorker("storage_move", a)
+    }
+
+    private func handleStorageRetry(_ a: ToolArguments) throws -> JSON {
+        return try startStorageWorker("storage_retry", a)
+    }
+
+    private func handleStoragePause(_ a: ToolArguments) throws -> JSON {
+        guard let cancellation, worker != nil else { throw MCPFailure("no_storage_job", "No running storage job to pause.") }
+        cancellation.cancel(); job["pauseRequested"] = .bool(true)
+        return ok(["pauseRequested": .bool(true), "meaning": .string("cooperative before commit; poll storage_status for the final result")])
+    }
+
+    private func handleSettingsReset(_ a: ToolArguments) throws -> JSON {
+        guard a.string("confirmation") == "RESET RAMNEST" else { throw MCPFailure("confirmation_required", "RESET requires confirmation='RESET RAMNEST'. Originals and storage selection are preserved; records and snapshots are removed.") }
+        let e = try core()
+        invalidateReviews()
+        if try e.statuses().contains(where: { $0.journal.phase != .idle }) {
+            _ = try bridge.cli(["reset", "--confirm-reset", "--reset-bootstrap", location.bootstrapRoot.path], root: e.store.root)
+        } else { try e.reset(location: location) }
+        engine = nil
+        return ok(["originalsPreserved": .bool(true), "selectedStoragePreserved": .bool(true), "preferences": .string("retained, matching app RESET"), "appRestart": .string("Restart an open GUI manually to discard its stale view; MCP never launches it")])
+    }
+
+    private func handleInstallCli(_ a: ToolArguments) throws -> JSON {
+        let app = try bridge.requirePackage(), directory = a.path("directory")
+        try Paths.rejectSymlinks(directory.path)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else { throw MCPFailure("invalid_directory", "Choose an existing directory.") }
+        let target = directory.appendingPathComponent("ramnest"), cli = app.appendingPathComponent("Contents/Helpers/ramnest")
+        try FileManager.default.createSymbolicLink(at: target, withDestinationURL: cli)
+        guard try FileManager.default.destinationOfSymbolicLink(atPath: target.path) == cli.path else { throw MCPFailure("readback", "CLI launcher readback failed.") }
+        return ok(["installed": .string(target.path), "target": .string(cli.path)])
+    }
+
     // Native confirmation persists acceptance before invoking privileged release.
     // This executable is deliberately NOT on Core's privileged caller allowlist.
     // Reject before issuing a token or entering that write path; never widen it.
@@ -275,4 +395,17 @@ public actor Activities {
         await current?.value
         // No mount/unmount/reconnect is performed here.
     }
+}
+
+/// Accessors for arguments already checked against the tool's exact schema.
+/// UUID/capacity conversion is safe only after pre-dispatch validation.
+private struct ToolArguments: Sendable {
+    let values: [String: JSON]
+    init(_ values: [String: JSON]) { self.values = values }
+    subscript(_ key: String) -> JSON? { values[key] }
+    func string(_ key: String) -> String { if case .string(let s) = values[key] { s } else { "" } }
+    func bool(_ key: String, _ fallback: Bool = false) -> Bool { if case .bool(let b) = values[key] { b } else { fallback } }
+    func capacity() -> UInt64 { if case .integer(let n) = values["capacityBytes"] { UInt64(n) } else { 0 } }
+    func ref() -> String { UUID(uuidString: string("id"))!.uuidString }
+    func path(_ key: String) -> URL { URL(fileURLWithPath: string(key)) }
 }

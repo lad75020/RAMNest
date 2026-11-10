@@ -16,7 +16,7 @@ enum SparseContent {
     static func copy(_ source: Int32, to destination: Int32, size: Int64,
                      seekExtent: ExtentSeeker = Darwin.lseek) throws {
         var buffer = [UInt8](repeating: 0, count: 65536)
-        var info = stat();guard fstat(source, &info) == 0 else { throw NestError("Cannot inspect sparse copy source.", code: 6) }
+        var info = stat();guard fstat(source, &info) == 0 else { throw NestError("Cannot inspect sparse copy source.", code: NestError.Code.retained) }
         var holes: [(Int64, Int64)] = []
         func recordHole(_ start: Int64, _ end: Int64) {
             guard end > start else { return }
@@ -31,7 +31,7 @@ enum SparseContent {
                     let error = errno
                     if error == ENXIO { recordHole(position, size); break }
                     if unsupportedExtents(error) { extents = false }
-                    else { throw NestError("Cannot query copy extents (errno \(error)).", code: 6) }
+                    else { throw NestError("Cannot query copy extents (errno \(error)).", code: NestError.Code.retained) }
                 } else {
                     let next = max(position, data / 65536 * 65536)
                     recordHole(position, min(next, size)); position = next
@@ -42,7 +42,7 @@ enum SparseContent {
             while done < count {
                 let got = buffer.withUnsafeMutableBytes { pread(source, $0.baseAddress!.advanced(by: done), count-done, position+Int64(done)) }
                 if got < 0 && errno == EINTR { continue }
-                guard got > 0 else { throw NestError("Sparse copy source changed.", code: 6) }
+                guard got > 0 else { throw NestError("Sparse copy source changed.", code: NestError.Code.retained) }
                 done += got
             }
             if buffer.prefix(count).contains(where: { $0 != 0 }) {
@@ -50,19 +50,19 @@ enum SparseContent {
                 while done < count {
                     let wrote = buffer.withUnsafeBytes { pwrite(destination, $0.baseAddress!.advanced(by: done), count-done, position+Int64(done)) }
                     if wrote < 0 && errno == EINTR { continue }
-                    guard wrote > 0 else { throw NestError("Sparse copy write failed.", code: 6) }
+                    guard wrote > 0 else { throw NestError("Sparse copy write failed.", code: NestError.Code.retained) }
                     done += wrote
                 }
             } else { recordHole(position, position + Int64(count)) }
             position += Int64(count)
         }
-        guard ftruncate(destination, size) == 0 else { throw NestError("Sparse copy length failed.", code: 6) }
+        guard ftruncate(destination, size) == 0 else { throw NestError("Sparse copy length failed.", code: NestError.Code.retained) }
         // APFS can allocate skipped zero ranges when dirty data is flushed.
         // Deallocate only source-proven holes/zero blocks after all writes and
         // length changes; partially nonzero filesystem blocks remain untouched.
         if !holes.isEmpty {
             var filesystem = statfs()
-            guard fstatfs(destination, &filesystem) == 0, filesystem.f_bsize > 0 else { throw NestError("Cannot inspect sparse copy destination.", code: 6) }
+            guard fstatfs(destination, &filesystem) == 0, filesystem.f_bsize > 0 else { throw NestError("Cannot inspect sparse copy destination.", code: NestError.Code.retained) }
             let type = withUnsafePointer(to: &filesystem.f_fstypename) {
                 $0.withMemoryRebound(to: CChar.self, capacity: Int(MFSTYPENAMELEN)) { String(cString: $0) }
             }
@@ -76,20 +76,20 @@ enum SparseContent {
                     var hole = fpunchhole_t(fp_flags: 0, reserved: 0, fp_offset: alignedStart, fp_length: alignedEnd - alignedStart)
                     var result: Int32
                     repeat { result = fcntl(destination, F_PUNCHHOLE, &hole) } while result < 0 && errno == EINTR
-                    guard result == 0 else { throw NestError("Cannot preserve APFS sparse allocation (errno \(errno)).", code: 6) }
+                    guard result == 0 else { throw NestError("Cannot preserve APFS sparse allocation (errno \(errno)).", code: NestError.Code.retained) }
                 }
             }
         }
     }
     static func scan(_ fd: Int32, size: Int64, legacy: Bool = false, verification: FileVerification = .sha256,
                      seekExtent: ExtentSeeker = Darwin.lseek) throws -> Result {
-        guard size >= 0 else { throw NestError("Invalid sparse length.", code: 6) }
+        guard size >= 0 else { throw NestError("Invalid sparse length.", code: NestError.Code.retained) }
         let sparseHash = size > 1 << 20 && !legacy
         // nil is a real no-content-SHA path, including sparse page hashes.
         var hash: SHA256? = verification == .sha256 ? SHA256() : nil
         var allocated: UInt64 = 0, bytesRead: UInt64 = 0, sha256Bytes: UInt64 = 0
         if sparseHash { hash?.update(data: Data("RAMNest sparse64 v1 length=\(size)\n".utf8)) }
-        var info = stat();guard fstat(fd, &info) == 0 else { throw NestError("Cannot inspect sparse source.", code: 6) }
+        var info = stat();guard fstat(fd, &info) == 0 else { throw NestError("Cannot inspect sparse source.", code: NestError.Code.retained) }
         var position: Int64 = 0, extents = sparseHash && info.st_flags & UInt32(UF_COMPRESSED) == 0
         var buffer = [UInt8](repeating: 0, count: 65536)
         while position < size {
@@ -100,7 +100,7 @@ enum SparseContent {
                     let error = errno
                     if error == ENXIO { break }
                     if unsupportedExtents(error) { extents = false }
-                    else { throw NestError("Cannot query sparse extents (errno \(error)).", code: 6) }
+                    else { throw NestError("Cannot query sparse extents (errno \(error)).", code: NestError.Code.retained) }
                 } else { position = max(position, (data / 65536) * 65536); if position >= size { break } }
             }
             let count = Int(min(Int64(65536), size-position))
@@ -109,7 +109,7 @@ enum SparseContent {
             while done < count {
                 let got = buffer.withUnsafeMutableBytes { pread(fd, $0.baseAddress!.advanced(by: done), count-done, position+Int64(done)) }
                 if got < 0 && errno == EINTR { continue }
-                guard got > 0 else { throw NestError("Source changed during sparse read.", code: 6) }
+                guard got > 0 else { throw NestError("Source changed during sparse read.", code: NestError.Code.retained) }
                 done += got; bytesRead += UInt64(got)
             }
             let nonzero = buffer.contains { $0 != 0 }

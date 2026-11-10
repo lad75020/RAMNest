@@ -14,10 +14,10 @@ public enum Paths {
             var st = stat()
             if lstat(current, &st) != 0 {
                 if allowMissingLast && errno == ENOENT { return }
-                throw NestError("Cannot inspect path: \(current)", code: 4)
+                throw NestError("Cannot inspect path: \(current)", code: NestError.Code.unsafePath)
             }
-            guard st.st_mode & S_IFMT != S_IFLNK else { throw NestError("Symlink traversal is not allowed: \(current)", code: 4) }
-            if index < components.count - 1 && st.st_mode & S_IFMT != S_IFDIR { throw NestError("Path component is not a directory.", code: 4) }
+            guard st.st_mode & S_IFMT != S_IFLNK else { throw NestError("Symlink traversal is not allowed: \(current)", code: NestError.Code.unsafePath) }
+            if index < components.count - 1 && st.st_mode & S_IFMT != S_IFDIR { throw NestError("Path component is not a directory.", code: NestError.Code.unsafePath) }
         }
     }
     public static func filesystemID(_ signed: Int32) -> UInt64 { UInt64(UInt32(bitPattern: signed)) }
@@ -34,22 +34,22 @@ public enum Paths {
     }
     public static func validate(_ url: URL, store: Store, folders: [Folder], excluding: UUID? = nil) throws -> stat {
         let path = url.standardizedFileURL.path
-        guard !path.contains("\n"), !path.contains("\t"), !path.contains("\0") else { throw NestError("Control characters are not allowed in managed paths.", code: 4) }
+        guard !path.contains("\n"), !path.contains("\t"), !path.contains("\0") else { throw NestError("Control characters are not allowed in managed paths.", code: NestError.Code.unsafePath) }
         try rejectSymlinks(path)
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let forbidden = ["/", "/Users", "/Volumes", "/private", "/private/tmp", "/private/var", "/tmp", "/System", "/Library", "/Applications", "/usr", "/bin", "/sbin", "/dev", "/etc", "/var", home, home + "/Library"]
-        guard !forbidden.contains(path), !["/System", "/Library", "/Applications", "/usr", "/bin", "/sbin", "/dev"].contains(where: { path.hasPrefix($0 + "/") }) else { throw NestError("Choose a data folder, not a root, home, or system folder.", code: 4) }
-        for unsafe in [home + "/Library/Containers", home + "/Library/Group Containers", store.root.path, NativeTmpfsPaths.root.path] where overlaps(path, unsafe) { throw NestError("This location overlaps protected app storage.", code: 4) }
-        guard !folders.contains(where: { $0.id != excluding && overlaps(path, $0.path) }) else { throw NestError("RAM folders cannot overlap or nest.", code: 4) }
-        guard !mounts().contains(where: { $0.path == path || $0.path.hasPrefix(path + "/") }) else { throw NestError("Folder is or contains an existing mount.", code: 4) }
+        guard !forbidden.contains(path), !["/System", "/Library", "/Applications", "/usr", "/bin", "/sbin", "/dev"].contains(where: { path.hasPrefix($0 + "/") }) else { throw NestError("Choose a data folder, not a root, home, or system folder.", code: NestError.Code.unsafePath) }
+        for unsafe in [home + "/Library/Containers", home + "/Library/Group Containers", store.root.path, NativeTmpfsPaths.root.path] where overlaps(path, unsafe) { throw NestError("This location overlaps protected app storage.", code: NestError.Code.unsafePath) }
+        guard !folders.contains(where: { $0.id != excluding && overlaps(path, $0.path) }) else { throw NestError("RAM folders cannot overlap or nest.", code: NestError.Code.unsafePath) }
+        guard !mounts().contains(where: { $0.path == path || $0.path.hasPrefix(path + "/") }) else { throw NestError("Folder is or contains an existing mount.", code: NestError.Code.unsafePath) }
         var st = stat()
-        guard lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR, st.st_uid == getuid() else { throw NestError("Choose an existing directory owned by the current user.", code: 4) }
+        guard lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR, st.st_uid == getuid() else { throw NestError("Choose an existing directory owned by the current user.", code: NestError.Code.unsafePath) }
         return st
     }
     public static func checkedIdentity(_ folder: Folder) throws {
         try rejectSymlinks(folder.path)
         var st = stat()
-        guard lstat(folder.path, &st) == 0, deviceID(st.st_dev) == folder.device, UInt64(st.st_ino) == folder.inode else { throw NestError("Folder identity changed. Locate the original folder or export its snapshot; automatic recovery is blocked.", code: 4) }
+        guard lstat(folder.path, &st) == 0, deviceID(st.st_dev) == folder.device, UInt64(st.st_ino) == folder.inode else { throw NestError("Folder identity changed. Locate the original folder or export its snapshot; automatic recovery is blocked.", code: NestError.Code.unsafePath) }
     }
     public static func resolveBookmark(_ folder: Folder) throws -> Folder {
         try resolveBookmark(folder, resolver: { bookmark in
@@ -63,7 +63,7 @@ public enum Paths {
                                 sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
                                 uptime: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) throws -> Folder {
         if (try? checkedIdentity(folder)) != nil { return folder }
-        guard let bookmark = folder.bookmark else { throw NestError("Original folder is missing; recovery is blocked.", code: 4) }
+        guard let bookmark = folder.bookmark else { throw NestError("Original folder is missing; recovery is blocked.", code: NestError.Code.unsafePath) }
         let deadline = uptime() + 1.5
         var lastMissing: NSError?
         for attempt in 0..<8 {
@@ -81,13 +81,13 @@ public enum Paths {
                 sleep(0.2)
                 continue
             }
-            guard url.isFileURL else { throw NestError("Bookmark did not resolve to a local directory; recovery is blocked.", code: 4) }
+            guard url.isFileURL else { throw NestError("Bookmark did not resolve to a local directory; recovery is blocked.", code: NestError.Code.unsafePath) }
             var updated = folder; updated.path = url.path
             try checkedIdentity(updated)
             try DirectoryHandle.open(url).verify(updated)
             return updated
         }
-        throw NestError("Original folder is still unavailable after bounded bookmark retries. No folder was accepted or moved. Retry the mount after the rename settles, or locate the original folder (device \(folder.device), inode \(folder.inode)). Bookmark error: \(lastMissing?.localizedDescription ?? "file not found")", code: 4)
+        throw NestError("Original folder is still unavailable after bounded bookmark retries. No folder was accepted or moved. Retry the mount after the rename settles, or locate the original folder (device \(folder.device), inode \(folder.inode)). Bookmark error: \(lastMissing?.localizedDescription ?? "file not found")", code: NestError.Code.unsafePath)
     }
     public static func socketDirectory(for store: Store) throws -> URL {
         // macOS Unix sockets have a 104-byte path limit. Do not put them in Application Support.
@@ -115,13 +115,13 @@ public struct LinkedFolderLayout: Codable, Equatable, Sendable {
         private enum CodingKeys: String, CodingKey { case device, inode }
         public init(from decoder: Decoder) throws {
             let all = try decoder.container(keyedBy: Key.self)
-            guard Set(all.allKeys.map(\.stringValue)) == ["device", "inode"] else { throw NestError("Malformed linked-folder identity.", code: 6) }
+            guard Set(all.allKeys.map(\.stringValue)) == ["device", "inode"] else { throw NestError("Malformed linked-folder identity.", code: NestError.Code.retained) }
             let values = try decoder.container(keyedBy: CodingKeys.self)
             device = try values.decode(UInt64.self, forKey: .device); inode = try values.decode(UInt64.self, forKey: .inode)
-            guard inode > 0 else { throw NestError("Invalid linked-folder inode.", code: 6) }
+            guard inode > 0 else { throw NestError("Invalid linked-folder inode.", code: NestError.Code.retained) }
         }
         func verify(_ handle: DirectoryHandle) throws {
-            guard try Identity(handle.identity()) == self else { throw NestError("linked-folder directory identity changed; data retained.", code: 4) }
+            guard try Identity(handle.identity()) == self else { throw NestError("linked-folder directory identity changed; data retained.", code: NestError.Code.unsafePath) }
         }
         func matches(_ st: stat) -> Bool { device == Paths.deviceID(st.st_dev) && inode == UInt64(st.st_ino) }
     }
@@ -155,7 +155,7 @@ public struct LinkedFolderLayout: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let all = try decoder.container(keyedBy: Key.self)
         let allowed = Set(CodingKeys.allCases.map(\.rawValue))
-        guard all.allKeys.allSatisfy({ allowed.contains($0.stringValue) }) else { throw NestError("Unknown linked-folder layout fields; recovery blocked.", code: 6) }
+        guard all.allKeys.allSatisfy({ allowed.contains($0.stringValue) }) else { throw NestError("Unknown linked-folder layout fields; recovery blocked.", code: NestError.Code.retained) }
         let c = try decoder.container(keyedBy: CodingKeys.self)
         version = try c.decode(Int.self, forKey: .version)
         folderID = try c.decode(UUID.self, forKey: .folderID); session = try c.decode(UUID.self, forKey: .session)
@@ -206,7 +206,7 @@ public struct LinkedFolderLayout: Codable, Equatable, Sendable {
               !mountReleased || stage == .restored,
               link.map({ $0.inode > 0 && $0.device == parent.device && $0 != source && $0 != parent }) ?? true,
               restored.map({ $0.inode > 0 && $0.device == parent.device }) ?? true else {
-            throw NestError("Invalid linked-folder symlink authority; recovery blocked and all data retained.", code: 6)
+            throw NestError("Invalid linked-folder symlink authority; recovery blocked and all data retained.", code: NestError.Code.retained)
         }
     }
 }
@@ -217,7 +217,7 @@ enum LinkedFolders {
     static func requirePrivateDirectory(_ handle: DirectoryHandle, device: UInt64, checkACL: Bool = true) throws {
         try handle.requireOwnedDirectory(device: device, privateMode: true)
         var st = stat()
-        guard fstat(handle.fd, &st) == 0, st.st_mode & 0o7777 == 0o700 else { throw NestError("linked-folder private directory must have mode 0700.", code: 4) }
+        guard fstat(handle.fd, &st) == 0, st.st_mode & 0o7777 == 0o700 else { throw NestError("linked-folder private directory must have mode 0700.", code: NestError.Code.unsafePath) }
         // Backup ACL fidelity is explicitly non-blocking. Live mount roots and
         // reservations keep the stricter access-control policy by default.
         guard checkACL else { return }
@@ -226,11 +226,11 @@ enum LinkedFolders {
             defer { acl_free(UnsafeMutableRawPointer(acl)) }
             var entry: acl_entry_t?
             let result = acl_get_entry(acl, Int32(ACL_FIRST_ENTRY.rawValue), &entry)
-            guard result != 0, errno == EINVAL else { throw NestError("ACL-bearing linked-folder private directories are unsupported; retained.", code: 4) }
-        } else if errno != ENOENT && errno != ENOTSUP { throw NestError("Cannot inspect bound linked-folder directory ACL; retained.", code: 4) }
+            guard result != 0, errno == EINVAL else { throw NestError("ACL-bearing linked-folder private directories are unsupported; retained.", code: NestError.Code.unsafePath) }
+        } else if errno != ENOENT && errno != ENOTSUP { throw NestError("Cannot inspect bound linked-folder directory ACL; retained.", code: NestError.Code.unsafePath) }
     }
     static func holding(_ layout: LinkedFolderLayout, parent: DirectoryHandle) throws -> DirectoryHandle {
-        guard let identity = layout.holding else { throw NestError("Unrecorded linked-folder backup wrapper; retained.", code: 4) }
+        guard let identity = layout.holding else { throw NestError("Unrecorded linked-folder backup wrapper; retained.", code: NestError.Code.unsafePath) }
         let handle = try parent.child(URL(fileURLWithPath: layout.holdingPath).lastPathComponent)
         try identity.verify(handle); try requirePrivateDirectory(handle, device: identity.device, checkACL: false)
         return handle
@@ -241,7 +241,7 @@ enum LinkedFolders {
         guard layout.folderID == folder.id, layout.originalPath == folder.path, layout.mountRoot == (layout.version == 2 ? NativeTmpfsPaths.root.path : root.path),
               (folder.device == layout.source.device && folder.inode == layout.source.inode) ||
               (layout.restored?.device == folder.device && layout.restored?.inode == folder.inode) else {
-            throw NestError("linked-folder folder/configuration authority changed; recovery blocked.", code: 4)
+            throw NestError("linked-folder folder/configuration authority changed; recovery blocked.", code: NestError.Code.unsafePath)
         }
         let handle = try DirectoryHandle.open(URL(fileURLWithPath: layout.originalPath).deletingLastPathComponent())
         try layout.parent.verify(handle)
@@ -253,7 +253,7 @@ enum LinkedFolders {
         if layout.version == 2 { try NativeTmpfsPaths.requireRoot(handle); return handle }
         try requirePrivateDirectory(handle, device: layout.root.device)
         var st = stat()
-        guard fstat(handle.fd, &st) == 0, st.st_mode & 0o7777 == 0o700 else { throw NestError("linked-folder root mode changed.", code: 4) }
+        guard fstat(handle.fd, &st) == 0, st.st_mode & 0o7777 == 0o700 else { throw NestError("linked-folder root mode changed.", code: NestError.Code.unsafePath) }
         return handle
     }
     static func verifyLink(_ layout: LinkedFolderLayout, parent: DirectoryHandle, name: String? = nil) throws {
@@ -264,17 +264,17 @@ enum LinkedFolders {
         guard let identity = layout.link, st.st_mode & S_IFMT == S_IFLNK, identity.matches(st),
               st.st_uid == getuid(), count > 0, count < bytes.count - 1,
               String(decoding: bytes.prefix(count).map { UInt8(bitPattern: $0) }, as: UTF8.self) == layout.mountPath else {
-            throw NestError("Managed original-path link changed; data and RAM retained.", code: 4)
+            throw NestError("Managed original-path link changed; data and RAM retained.", code: NestError.Code.unsafePath)
         }
     }
     static func releaseMountpoint(_ layout: LinkedFolderLayout) throws {
-        guard layout.version == 1 else { throw NestError("Native reservation release requires its bounded administrator operation.", code: 6) }
-        guard !Paths.mounts().contains(where: { $0.path == layout.mountPath || $0.path.hasPrefix(layout.mountPath + "/") }) else { throw NestError("Internal mount is still present.", code: 6) }
+        guard layout.version == 1 else { throw NestError("Native reservation release requires its bounded administrator operation.", code: NestError.Code.retained) }
+        guard !Paths.mounts().contains(where: { $0.path == layout.mountPath || $0.path.hasPrefix(layout.mountPath + "/") }) else { throw NestError("Internal mount is still present.", code: NestError.Code.retained) }
         let root = try root(layout), name = URL(fileURLWithPath: layout.mountPath).lastPathComponent
         if try !root.exists(name) { return }
         let child = try root.child(name)
         try layout.mountpoint.verify(child)
-        guard try child.names().isEmpty, unlinkat(root.fd, name, AT_REMOVEDIR) == 0 else { throw NestError("Internal reservation changed or is not empty; retained.", code: 6) }
+        guard try child.names().isEmpty, unlinkat(root.fd, name, AT_REMOVEDIR) == 0 else { throw NestError("Internal reservation changed or is not empty; retained.", code: NestError.Code.retained) }
         try root.sync()
     }
 }
