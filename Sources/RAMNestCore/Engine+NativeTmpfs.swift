@@ -176,7 +176,8 @@ extension Engine {
     }
     @discardableResult func captureNative(_ f: Folder, journal j: inout Journal, quiesce: Bool,
                                          periodic: NativePeriodicSaveRequest? = nil,
-                                         authorization supplied: NativeTmpfsAuthorization? = nil) throws -> String {
+                                         authorization supplied: NativeTmpfsAuthorization? = nil,
+                                         didCapture: ((Snapshot.CaptureEvidence) -> Void)? = nil) throws -> String {
         let authorization = supplied ?? NativeTmpfsAuthorization(helper: helper)
         defer { if supplied == nil { authorization.finish() } }
         try periodic?.validate(folder: f, journal: j)
@@ -190,15 +191,18 @@ extension Engine {
             if let periodic { try periodic.validate(folder: self.folder(f.id.uuidString), journal: store.journal(f.id)) }
         }
         var receipt: [String] = []
-        return try NativeCheckpointTransaction.run(keepFrozen: quiesce, readonly: {
+        var evidence: Snapshot.CaptureEvidence?
+        let revision = try NativeCheckpointTransaction.run(keepFrozen: quiesce, readonly: {
             try validatePeriodic() // Before any administrator prompt.
             receipt = try nativeOperation("freeze", layout: layout, record: record, authorization: authorization)
         }, verify: { _ = try NativeTmpfsControl.observe(next, readonly: true) }, validateMappings: {
             guard let fs = record.filesystem else { throw NestError("Missing native fsid.", code: 6) }
             try NativeSnapshotSafety.validateReceipt(receipt, filesystem: fs)
         }, copy: {
-            try Snapshot.capture(store: store, folder: f, source: NativeTmpfsPaths.data(record.session),
-                                 previous: next.revision, verification: next.fileVerification)
+            let captured = try Snapshot.captureVerified(store: store, folder: f, source: NativeTmpfsPaths.data(record.session),
+                                                       previous: next.revision, verification: next.fileVerification)
+            evidence = captured
+            return captured.revision
         }, commit: { revision in
             try validatePeriodic() // Before promoting a new checkpoint.
             SnapshotRetention.remember(&next); next.priorRevision = next.revision; next.revision = revision
@@ -214,6 +218,8 @@ extension Engine {
             guard try nativeOperation("thaw", layout: layout, record: record, authorization: authorization).isEmpty else { throw NestError("Invalid native thaw receipt.", code: 6) }
             _ = try NativeTmpfsControl.observe(next, readonly: false)
         })
+        if let evidence { didCapture?(evidence) }
+        return revision
     }
 
     func unmountNative(_ ref: String, ignoreBusy: Bool) throws {

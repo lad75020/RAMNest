@@ -320,8 +320,10 @@ extension Engine {
             // This runs AFTER acquiring the volume lock. A delayed old child may
             // not touch the new session, even if it has the same folder UUID.
             try expected.validate(folder: f, journal: j)
-            _ = try captureNative(f, journal: &j, quiesce: false, periodic: expected)
-            j.lastError = nil; try store.write(j, for: f.id); cleanSnapshots(f, &j)
+            var evidence: Snapshot.CaptureEvidence?
+            _ = try captureNative(f, journal: &j, quiesce: false, periodic: expected, didCapture: { evidence = $0 })
+            j.lastError = nil; try store.write(j, for: f.id)
+            cleanSnapshots(f, &j, verifiedRevisions: evidence?.revisions ?? [])
         }
     }
 }

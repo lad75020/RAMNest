@@ -21,6 +21,12 @@ publication, including mode-zero evidence where the established transaction can
 prove it. Parent exact-package validation remains required for those cases.
 
 An invalid prior revision is not reusable copy authority. A new capture may copy
-its current verified source afresh; damaged old data remains retained and cleanup
-still verifies every anchor/candidate before deletion. Corruption is never fixed
+its current verified source afresh; damaged old data remains retained through
+cleanup with a warning and its journal reference intact. Cleanup authenticates
+every retained anchor and exact journal-linked deletion candidate, reusing only
+stable operation-local evidence. Candidates without supplied evidence receive
+independent content verification; stale evidence retains the candidate with a
+warning rather than being refreshed. Bounded namespace/type/size, mode-map,
+ownership and filesystem checks still apply before deletion. Recovery and
+sibling-cleanup pins remain authoritative. Corruption is never fixed
 by rewriting a committed snapshot or weakening provenance checks.

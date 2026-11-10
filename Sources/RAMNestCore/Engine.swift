@@ -227,11 +227,11 @@ public final class Engine: @unchecked Sendable {
         return NativePinStatus(id: folder.id, pid: (try? Control.status(j, id: folder.id).pid) ?? 0,
             mounted: true, used: observed.used, capacity: observed.capacity, active: !observed.readOnly && j.populationVerified)
     }
-    func cleanSnapshots(_ folder: Folder, _ journal: inout Journal) {
+    func cleanSnapshots(_ folder: Folder, _ journal: inout Journal, verifiedRevisions: [Snapshot.RevisionEvidence] = []) {
         guard !session.deferSnapshotCleanup, journal.reviewedRecovery == nil else { return }
         guard journal.phase == .idle || (journal.phase == .mounted && journal.nativeTmpfs != nil), journal.lastError == nil else { return }
         let pinned = journal
-        SnapshotRetention.clean(store: store, folder: folder, journal: &journal, validateSource: {
+        SnapshotRetention.clean(store: store, folder: folder, journal: &journal, verifiedRevisions: verifiedRevisions, validateSource: {
             if pinned.phase == .mounted { _ = try self.requireLive(folder, pinned) }
             else {
                 if let layout = pinned.managedLink {
@@ -448,9 +448,13 @@ public final class Engine: @unchecked Sendable {
             guard j.phase == .mounted else { throw NestError("A volume transaction is pending.", code: 6) }
             _ = try requireLive(f, j)
             guard f.options.sync else { throw NestError("Temporary mode preserves the initial folder. Explicit export can rescue current RAM data.", code: 64) }
-            do { _ = try captureNative(f, journal: &j, quiesce: false); j.lastError = nil; try store.write(j, for: f.id) }
+            var evidence: Snapshot.CaptureEvidence?
+            do {
+                _ = try captureNative(f, journal: &j, quiesce: false, didCapture: { evidence = $0 })
+                j.lastError = nil; try store.write(j, for: f.id)
+            }
             catch { j.lastError = error.localizedDescription; try store.write(j, for: f.id); throw error }
-            cleanSnapshots(f, &j)
+            cleanSnapshots(f, &j, verifiedRevisions: evidence?.revisions ?? [])
             return f
         }
     }
@@ -789,17 +793,19 @@ public final class Engine: @unchecked Sendable {
         try volumeTransaction(ref) { f in
             var j = try store.journal(f.id)
             let selected: String
+            var captured: Snapshot.CaptureEvidence?
             if live, j.nativeTmpfs != nil {
                 guard mountedIdentity(f, j), j.populationVerified else { throw NestError("Native RAM is unavailable or its link changed. Export without --live recovers only a committed disk checkpoint.", code: 6) }
-                selected = try captureNative(f, journal: &j, quiesce: false)
+                selected = try captureNative(f, journal: &j, quiesce: false, didCapture: { captured = $0 })
             }
             else if live { throw NestError("Live export requires a bound native tmpfs tree. Historical disk checkpoints can be exported without --live.", code: 6) }
             else if let candidate = revision ?? j.revision { selected = candidate }
             else { throw NestError("No snapshot exists yet.", code: 6) }
-            let (data, manifest) = try Snapshot.verified(store: store, id: f.id, revision: selected)
+            let verified = try Snapshot.verifiedEvidence(store: store, id: f.id, revision: selected)
+            let (data, manifest) = try verified.validate(store: store, id: f.id, revision: selected)
             try Paths.rejectSymlinks(destination.deletingLastPathComponent().path)
             try Snapshot.copyTree(from: data, to: destination, manifest: manifest,sourceContext:.managedRevision)
-            cleanSnapshots(f, &j)
+            cleanSnapshots(f, &j, verifiedRevisions: [verified] + (captured?.revisions ?? []))
         }
     }
     public func resize(_ ref: String, capacity: UInt64) throws {
